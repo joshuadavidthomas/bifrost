@@ -407,7 +407,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|dispatch_outcome|dispatch_target|member_family|member_family_edge -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, dispatch rows, or method-family rows to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, or method-family rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -430,6 +430,10 @@ query_step_ops! {
     CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site." }
     CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
+    CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
+    SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
+    CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
+    OverloadSelection { label: "overload_selection", signature: "occurrence -> overload_selection", description: "Project the mandatory overload-selection summary row for each reference occurrence: resolved_unique, ambiguous, unresolved, or unknown_shape, with the verdict counts it was computed from. Exactly one row per occurrence, and candidate order can never influence it -- zero applicable candidates stay unresolved and several equal winners stay ambiguous." }
     MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
     DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
     DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
@@ -455,6 +459,7 @@ query_step_ops! {
     GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
     DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
     ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
     ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
 }
 
@@ -599,6 +604,10 @@ macro_rules! rql_forms {
                     | Self::CallShape
                     | Self::CallArgumentGroups
                     | Self::CallArguments
+                    | Self::CallableSignature
+                    | Self::SignatureParameters
+                    | Self::CallableApplicability
+                    | Self::OverloadSelection
                     | Self::MemberSelection
                     | Self::DispatchOutcome
                     | Self::DispatchTargets
@@ -626,6 +635,7 @@ macro_rules! rql_forms {
                     | Self::GeneratedBy
                     | Self::DeclarationStateOf
                     | Self::ImplementationOf
+                    | Self::StubsOf
                     | Self::ExportTarget
                     | Self::CandidateTarget
                     | Self::EdgesOf
@@ -1010,6 +1020,38 @@ rql_forms! {
         description: (QueryStepOp::CallArguments),
         step: CallArguments,
     }
+    CallableSignature {
+        labels: ["callable-signature", "callable_signature"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callable-signature query)",
+        description: (QueryStepOp::CallableSignature),
+        step: CallableSignature,
+    }
+    SignatureParameters {
+        labels: ["signature-parameters", "signature_parameters"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(signature-parameters query)",
+        description: (QueryStepOp::SignatureParameters),
+        step: SignatureParameters,
+    }
+    CallableApplicability {
+        labels: ["callable-applicability", "callable_applicability"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callable-applicability query)",
+        description: (QueryStepOp::CallableApplicability),
+        step: CallableApplicability,
+    }
+    OverloadSelection {
+        labels: ["overload-selection", "overload_selection"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(overload-selection query)",
+        description: (QueryStepOp::OverloadSelection),
+        step: OverloadSelection,
+    }
     MemberSelection {
         labels: ["member-selection", "member_selection"],
         class: Wrapper,
@@ -1227,6 +1269,14 @@ rql_forms! {
         signature: "(implementation-of query)",
         description: (QueryStepOp::ImplementationOf),
         step: ImplementationOf,
+    }
+    StubsOf {
+        labels: ["stubs-of", "stubs_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(stubs-of query)",
+        description: (QueryStepOp::StubsOf),
+        step: StubsOf,
     }
     ExportTarget {
         labels: ["export-target", "export_target"],

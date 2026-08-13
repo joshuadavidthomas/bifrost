@@ -36,17 +36,6 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "0b47fe211ee1b126ff437d52504819ca31b433007d080ed1115e1fc66f1ef433",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "59912940245dfa0a29fb4c972807745583eb59c479dc471851b542a51ab3adca",
       "identity_stability": "strong",
       "status": "accepted",
@@ -91,17 +80,6 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "66782633634da055a433416515223ec7fdd11b79c6219d90cefb2915efc6e057",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "f12287edac77c4a41d87881ee258fb88642e6d418bf0948939940c74c1372a46",
       "identity_stability": "strong",
       "status": "accepted",
@@ -135,29 +113,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "b0b1d46bb2b9b2e424b8dc720970506abccd1c332dd99f5446c3d4c6231b85c0",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "b2c0b0fb48794508698a288aae1248fbda0a703c89191fdbd06aeafe48476cfe",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "c43712f3fa20debb3dbe74e328972578954bf2a27d9b91cb639fac8225c94185",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -175,17 +131,6 @@
       "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-05",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "e99e6c0852879ea8d5123216bfd7201310945f5b51ffa4418f6e5c9fafe86a7f",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
       "expires_at": null
     },
     {
@@ -246,17 +191,6 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "800b7d428a3f7f1223ea7436f86998bbcb03d4e5b7aa11103fb5572ec78b6641",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "9dae272e14e3109eeb7e5aab1374bdb711b4c24ff8a0c2e7d20bdaf1973cde7c",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -773,17 +707,6 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "3417201a43540d26d4a4d217687d8fdea7babe77078f496b083b87683bf9b9bc",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each alias candidate creates a different resolved route set. The sort gives that set a canonical order before return.",
-      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-09",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
       "finding_id": "3429fbbea44dd6806ee5739ea911b57a255fe17a4aa391491a97169179bc1565",
       "identity_stability": "strong",
       "status": "accepted",
@@ -1011,17 +934,6 @@
       "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "7431493255d01a05ccecb6fdeb9ebea8b1668fba329890369f3d4a4952e3d165",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each source file has a different crate-root set. Sorting each set once gives deterministic route seeding.",
-      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-09",
       "expires_at": null
     },
     {
@@ -1378,17 +1290,6 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "b4119620927795b77ffa5d42441a1db6554f09d64299d43b564e854af810cb05",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each included file owns a different route list. Sorting each list once gives deterministic deduplication.",
-      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-09",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
       "finding_id": "b5f626440985f76f763a6972c794633420f6e4a88de88be4bec5ac16aee31bff",
       "identity_stability": "strong",
       "status": "accepted",
@@ -1664,17 +1565,6 @@
     },
     {
       "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "eebaf55364c0853ca40ea4ad254c8cc357ddbc55c0d637b41d0a44dbdfbd6657",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Sorts a loop-local collection once for canonical/deterministic ordering (typically sort+dedup normalization); nothing loop-invariant is re-sorted.",
-      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
       "finding_id": "eef21513911491a9c4a2de41a8bb4feeda6cb69341d12b329f4bdccfc05a5384",
       "identity_stability": "strong",
       "status": "accepted",
@@ -1726,17 +1616,6 @@
       "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.sort-in-loop",
-      "finding_id": "f80b0d975d6b29ad2e524931d9d43c47346f02c89f97ecc3d0d81b7f97006ab4",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each include edge creates a different inherited binding list. Sorting that list once gives deterministic deduplication.",
-      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-09",
       "expires_at": null
     },
     {
@@ -1924,6 +1803,72 @@
       "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
       "accepted_by": "jbellis",
       "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "6c905b718e15056814758f36cd7b3269febb98d304b729dd1817781f07951348",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different framework candidate file selected by its path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "c96d9b41bd33ef172cd036a53dd099b1cc577510a7c11682b11db5641c8c4c1d",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different golden candidate file selected by its path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "46bafe8d230ba861165268b4f8979c2964e26c2dd1a0d72c37b3969bb8a1248e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a different golden candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "a636a431ff5a4d4635c5797b438e22a81370d090bad99231779150447730298a",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a different framework candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "2807c64daa206e64cffc8027d8ae60f2e92fec8f321a833a101893bcb652bcad",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each artifact has a different member list. Sorting each list once gives stable pack output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "8119aa76e62e25759f564b17a51843ebda70e77c636dbdc97d8f9d14afb3267f",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each artifact has a different type list. Sorting each list once gives stable pack output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
       "expires_at": null
     }
   ]

@@ -172,6 +172,15 @@ enum MemberAccessKind {
     ClassConstant,
 }
 
+fn magic_member_names(kind: MemberAccessKind) -> &'static [&'static str] {
+    match kind {
+        MemberAccessKind::InstanceCall => &["__call"],
+        MemberAccessKind::InstanceProperty => &["__get", "__set"],
+        MemberAccessKind::StaticCall => &["__callStatic"],
+        MemberAccessKind::StaticProperty | MemberAccessKind::ClassConstant => &[],
+    }
+}
+
 impl PhpDiagnosticCollector<'_> {
     fn scan_tree(&mut self, root: Node<'_>) {
         let mut scopes = vec![root];
@@ -523,6 +532,20 @@ impl PhpDiagnosticCollector<'_> {
         // uniquely and the packs published its whole inherited surface.
         match self.external.lookup_type(&owner) {
             PhpExternalSymbol::Indexed { id } => {
+                if let Some(magic) = magic_member_names(kind).iter().find(|magic| {
+                    matches!(
+                        self.external.lookup_member(&id, magic),
+                        PhpExternalMember::Indexed | PhpExternalMember::Ambiguous
+                    )
+                }) {
+                    self.push_dynamic_range(
+                        range,
+                        &format!(
+                            "PHP owner `{owner}` resolves members at run time through `{magic}`"
+                        ),
+                    );
+                    return;
+                }
                 match self.external.lookup_member(&id, member_name) {
                     PhpExternalMember::Indexed => {
                         self.report
@@ -616,13 +639,9 @@ impl PhpDiagnosticCollector<'_> {
     }
 
     fn has_magic_member_boundary(&self, owner_fqn: &str, kind: MemberAccessKind) -> bool {
-        let magic = match kind {
-            MemberAccessKind::InstanceCall => Some("__call"),
-            MemberAccessKind::InstanceProperty => Some("__get"),
-            MemberAccessKind::StaticCall => Some("__callStatic"),
-            MemberAccessKind::StaticProperty | MemberAccessKind::ClassConstant => None,
-        };
-        magic.is_some_and(|name| self.owner_or_ancestor_has_member(owner_fqn, name))
+        magic_member_names(kind)
+            .iter()
+            .any(|name| self.owner_or_ancestor_has_member(owner_fqn, name))
     }
 
     fn owner_or_ancestor_has_member(&self, owner_fqn: &str, member: &str) -> bool {

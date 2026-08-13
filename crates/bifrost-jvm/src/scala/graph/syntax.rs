@@ -219,9 +219,37 @@ impl ScalaCallableSiteRole {
     }
 }
 
+/// Why a Scala declaration's parameter lists cannot accept a call site's
+/// ordered argument-list sequence (#1478 M3).
+///
+/// Each variant is produced at the exact branch of
+/// [`scala_call_shape_relation`] that refused, so the reason a row publishes is
+/// the reason the resolver's own filter acted on. This enum is the language's
+/// own vocabulary; the analysis side maps it to the language-neutral
+/// `CallableRejectionReason`, which this crate does not depend on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalaCallShapeMismatch {
+    /// One argument list supplies fewer arguments than the corresponding
+    /// declared list requires.
+    ListArityBelow,
+    /// One argument list supplies more arguments than the corresponding
+    /// declared list accepts.
+    ListArityAbove,
+    /// The site supplies more argument lists than the declaration and its
+    /// declared result can consume, or an ordinary list met a declared list
+    /// that only a contextual argument list can fill.
+    ListShape,
+    /// Only type arguments were written, but the declaration still requires an
+    /// explicit value list.
+    TypeArgumentsOnly,
+    /// Every declared list matched but more than one explicit list is still
+    /// unfilled, which no single further application can complete.
+    UnfillableRemainder,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalaCallShapeRelation {
-    Incompatible,
+    Incompatible(ScalaCallShapeMismatch),
     Complete,
     Partial { next_explicit_arity: CallableArity },
 }
@@ -603,6 +631,20 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
         return Some(ScalaTypeExpressionPath {
             segments: vec![format!("scala.Tuple{}", arguments.len())],
             arguments,
+        });
+    }
+    if node.kind() == "infix_type" {
+        let operator = node.child_by_field_name("operator")?;
+        let operator = node_text(operator, source).trim();
+        if operator.is_empty() {
+            return None;
+        }
+        return Some(ScalaTypeExpressionPath {
+            segments: vec![operator.to_string()],
+            arguments: vec![
+                scala_type_expression_path(node.child_by_field_name("left")?, source)?,
+                scala_type_expression_path(node.child_by_field_name("right")?, source)?,
+            ],
         });
     }
     if matches!(node.kind(), "wildcard_type" | "wildcard") {
@@ -2138,6 +2180,16 @@ pub fn is_semantic_call_argument(node: Node<'_>) -> bool {
     !matches!(node.kind(), "comment" | "block_comment")
 }
 
+/// Which end of one declared list's arity range the written list missed.
+fn scala_list_arity_mismatch(declared: CallableArity, actual: usize) -> ScalaCallShapeMismatch {
+    debug_assert!(!declared.accepts(actual));
+    if actual < declared.required() {
+        ScalaCallShapeMismatch::ListArityBelow
+    } else {
+        ScalaCallShapeMismatch::ListArityAbove
+    }
+}
+
 pub fn scala_call_shape_relation(
     declared: &[ScalaCallableParameterList],
     result: ScalaDeclaredResult,
@@ -2150,7 +2202,7 @@ pub fn scala_call_shape_relation(
         {
             ScalaCallShapeRelation::Complete
         } else {
-            ScalaCallShapeRelation::Incompatible
+            ScalaCallShapeRelation::Incompatible(ScalaCallShapeMismatch::TypeArgumentsOnly)
         };
     }
     if actual.lists.len() == 1
@@ -2173,7 +2225,7 @@ pub fn scala_call_shape_relation(
         if result.accepts_application_lists(remaining) {
             ScalaCallShapeRelation::Complete
         } else {
-            ScalaCallShapeRelation::Incompatible
+            ScalaCallShapeRelation::Incompatible(ScalaCallShapeMismatch::ListShape)
         }
     };
 
@@ -2195,19 +2247,28 @@ pub fn scala_call_shape_relation(
                 if !matches!(
                     declared_list.kind,
                     ScalaParameterListKind::Explicit | ScalaParameterListKind::Contextual
-                ) || !declared_list.arity.accepts(actual_list.arity)
-                {
-                    return ScalaCallShapeRelation::Incompatible;
+                ) {
+                    return ScalaCallShapeRelation::Incompatible(ScalaCallShapeMismatch::ListShape);
+                }
+                if !declared_list.arity.accepts(actual_list.arity) {
+                    return ScalaCallShapeRelation::Incompatible(scala_list_arity_mismatch(
+                        declared_list.arity,
+                        actual_list.arity,
+                    ));
                 }
             }
             ScalaCallArgumentListKind::Contextual => {
                 let Some(declared_list) = declared.get(declared_index) else {
                     return applies_result(actual.lists.len() - position);
                 };
-                if declared_list.kind != ScalaParameterListKind::Contextual
-                    || !declared_list.arity.accepts(actual_list.arity)
-                {
-                    return ScalaCallShapeRelation::Incompatible;
+                if declared_list.kind != ScalaParameterListKind::Contextual {
+                    return ScalaCallShapeRelation::Incompatible(ScalaCallShapeMismatch::ListShape);
+                }
+                if !declared_list.arity.accepts(actual_list.arity) {
+                    return ScalaCallShapeRelation::Incompatible(scala_list_arity_mismatch(
+                        declared_list.arity,
+                        actual_list.arity,
+                    ));
                 }
             }
         }
@@ -2228,10 +2289,77 @@ pub fn scala_call_shape_relation(
         return ScalaCallShapeRelation::Complete;
     };
     if explicit.next().is_some() {
-        return ScalaCallShapeRelation::Incompatible;
+        return ScalaCallShapeRelation::Incompatible(ScalaCallShapeMismatch::UnfillableRemainder);
     }
     ScalaCallShapeRelation::Partial {
         next_explicit_arity: next.arity,
+    }
+}
+
+/// Why one declared alternative does not admit a call site (#1478 M3), or
+/// `None` when it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalaCallableMismatch {
+    /// The site names a different callable namespace: a construction site
+    /// reached an ordinary method, or an ordinary call reached a constructor.
+    Role,
+    /// The declared parameter lists cannot accept the written argument lists.
+    Shape(ScalaCallShapeMismatch),
+    /// The site writes fewer argument lists than the declaration needs, and the
+    /// function arity the site expects of the result refutes the partial
+    /// application.
+    MethodValueArity,
+    /// The site partially applies the callable, which Scala admits only when
+    /// the callable is the sole one in scope. Another same-named callable makes
+    /// the partial application undecidable, so it is not admitted.
+    PartialApplication,
+    /// No argument list is written at the site at all, and the declaration
+    /// requires one.
+    NoCallShape,
+}
+
+/// The single admission decision for one declared shape against one call site.
+///
+/// [`scala_callable_shape_matches`] is exactly this answer read as a boolean,
+/// so the resolver's decision and the reason a row publishes are one
+/// computation rather than two that could drift.
+pub fn scala_callable_shape_mismatch(
+    declared: &[ScalaCallableParameterList],
+    result: ScalaDeclaredResult,
+    actual: Option<&ScalaCallSiteShape>,
+    policy: ScalaCallableUsePolicy,
+    unique_callable: bool,
+) -> Option<ScalaCallableMismatch> {
+    let Some(actual) = actual else {
+        let admits = declared.first().is_none_or(|list| list.arity.total() == 0)
+            || policy == ScalaCallableUsePolicy::OrdinaryMethod && unique_callable;
+        return (!admits).then_some(ScalaCallableMismatch::NoCallShape);
+    };
+    match scala_call_shape_relation(declared, result, actual) {
+        ScalaCallShapeRelation::Incompatible(mismatch) => {
+            Some(ScalaCallableMismatch::Shape(mismatch))
+        }
+        ScalaCallShapeRelation::Complete => None,
+        ScalaCallShapeRelation::Partial {
+            next_explicit_arity,
+        } => {
+            // Fewer application lists than declared is partial application, and
+            // the site's expected function arity refutes it only when that
+            // arity is known (#1853): `xs.map(render("p"))` on an unresolved
+            // receiver proves nothing about the function `map` wants, and an
+            // unproven arity is not a mismatch.
+            let candidate = policy == ScalaCallableUsePolicy::OrdinaryMethod
+                && actual
+                    .method_value_arity
+                    .is_none_or(|arity| next_explicit_arity.accepts(arity));
+            if !candidate {
+                Some(ScalaCallableMismatch::MethodValueArity)
+            } else if unique_callable {
+                None
+            } else {
+                Some(ScalaCallableMismatch::PartialApplication)
+            }
+        }
     }
 }
 
@@ -2242,18 +2370,29 @@ pub fn scala_callable_shape_matches(
     policy: ScalaCallableUsePolicy,
     unique_callable: bool,
 ) -> bool {
-    let Some(actual) = actual else {
-        return declared.first().is_none_or(|list| list.arity.total() == 0)
-            || policy == ScalaCallableUsePolicy::OrdinaryMethod && unique_callable;
-    };
-    if !scala_callable_shape_is_candidate(declared, result, actual, policy) {
-        return false;
+    scala_callable_shape_mismatch(declared, result, actual, policy, unique_callable).is_none()
+}
+
+/// Why one alternative of one declaration does not admit the site, or `None`
+/// when it does.
+pub fn scala_callable_alternative_mismatch(
+    declared_role: ScalaCallableRole,
+    declared_shape: &[ScalaCallableParameterList],
+    declared_result: ScalaDeclaredResult,
+    actual: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    unique_callable: bool,
+) -> Option<ScalaCallableMismatch> {
+    if !site_role.accepts(declared_role) {
+        return Some(ScalaCallableMismatch::Role);
     }
-    match scala_call_shape_relation(declared, result, actual) {
-        ScalaCallShapeRelation::Incompatible => false,
-        ScalaCallShapeRelation::Complete => true,
-        ScalaCallShapeRelation::Partial { .. } => unique_callable,
-    }
+    scala_callable_shape_mismatch(
+        declared_shape,
+        declared_result,
+        actual,
+        site_role.use_policy(),
+        unique_callable,
+    )
 }
 
 pub fn scala_callable_alternative_matches(
@@ -2264,14 +2403,15 @@ pub fn scala_callable_alternative_matches(
     site_role: ScalaCallableSiteRole,
     unique_callable: bool,
 ) -> bool {
-    site_role.accepts(declared_role)
-        && scala_callable_shape_matches(
-            declared_shape,
-            declared_result,
-            actual,
-            site_role.use_policy(),
-            unique_callable,
-        )
+    scala_callable_alternative_mismatch(
+        declared_role,
+        declared_shape,
+        declared_result,
+        actual,
+        site_role,
+        unique_callable,
+    )
+    .is_none()
 }
 
 pub fn scala_callable_alternative_is_candidate(
@@ -2297,7 +2437,7 @@ pub fn scala_callable_shape_is_candidate(
     policy: ScalaCallableUsePolicy,
 ) -> bool {
     match scala_call_shape_relation(declared, result, actual) {
-        ScalaCallShapeRelation::Incompatible => false,
+        ScalaCallShapeRelation::Incompatible(_) => false,
         ScalaCallShapeRelation::Complete => true,
         ScalaCallShapeRelation::Partial {
             next_explicit_arity,
@@ -2385,9 +2525,9 @@ pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-/// Enclosing class/object/trait/enum declarations from the innermost template
-/// to the outermost. This includes local templates that the analyzer does not
-/// publish as global declarations.
+/// Enclosing class/object/trait/enum/anonymous-instance declarations from the
+/// innermost template to the outermost. This includes local templates that the
+/// analyzer does not publish as global declarations.
 pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     let mut declarations = Vec::new();
     let mut current = node;
@@ -2396,7 +2536,11 @@ pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
             && let Some(declaration) = parent.parent()
             && matches!(
                 declaration.kind(),
-                "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+                "class_definition"
+                    | "object_definition"
+                    | "trait_definition"
+                    | "enum_definition"
+                    | "instance_expression"
             )
         {
             declarations.push(declaration);
@@ -2406,9 +2550,9 @@ pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     declarations
 }
 
-pub fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
+pub fn template_self_types(declaration: Node<'_>) -> Vec<Node<'_>> {
     let mut declaration_cursor = declaration.walk();
-    declaration
+    let Some(bound) = declaration
         .named_children(&mut declaration_cursor)
         .find(|child| matches!(child.kind(), "template_body" | "enum_body"))
         .and_then(|body| {
@@ -2422,6 +2566,22 @@ pub fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
             let _binder = children.next()?;
             children.next()
         })
+    else {
+        return Vec::new();
+    };
+    if bound.kind() != "compound_type" {
+        return vec![bound];
+    }
+    let mut cursor = bound.walk();
+    bound
+        .named_children(&mut cursor)
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "annotation" | "structural_type" | "type_arguments"
+            )
+        })
+        .collect()
 }
 
 /// Whether a template directly declares a term with `name`. For local

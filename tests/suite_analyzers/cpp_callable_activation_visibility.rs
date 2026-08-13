@@ -9,7 +9,7 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::searchtools::{
     DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
 };
-use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
+use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder, UsageHitKind};
 use brokk_bifrost::{CodeUnitIndex, CodeUnitType, CppAnalyzer, Language};
 use std::sync::Arc;
 
@@ -262,6 +262,60 @@ void caller(void) {
 }
 
 #[test]
+fn c_declaration_after_a_guarded_array_bound_is_not_guarded() {
+    let damaged_header = r#"extern char option_buffer[
+#ifdef FEATURE_X
+    16 +
+#endif
+    1];
+
+void target(void);
+"#;
+    let guarded_header = r#"#ifdef FEATURE_X
+void target(void);
+#endif
+"#;
+    let source = r#"#include "api.h"
+
+void caller(void) {
+    target();
+}
+
+void target(void) {}
+"#;
+
+    for (name, header, expected_status) in [
+        ("repaired_array_bound", damaged_header, "resolved"),
+        ("real_guard", guarded_header, "no_definition"),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("api.h", header)
+            .file("a.c", source)
+            .build();
+        let analyzer = CppAnalyzer::from_project(project.project().clone());
+        let (status, definitions) = definitions_at(
+            &analyzer,
+            location("a.c", source, "    target();", "target"),
+        );
+        assert_eq!(
+            status,
+            expected_status,
+            "{name}: {definitions:?}; records: {:#?}",
+            analyzer.materialization_records(&project.file("api.h"))
+        );
+        if expected_status == "resolved" {
+            assert_eq!(
+                definitions,
+                vec!["a.c#target"],
+                "only the repaired header prototype can activate the later body"
+            );
+        } else {
+            assert!(definitions.is_empty(), "{name}: {definitions:?}");
+        }
+    }
+}
+
+#[test]
 fn cpp_free_and_member_recursion_resolve() {
     // The C++ analyzer shares the same resolver. A member function body sees
     // its own name through the complete class, a free function through its
@@ -318,13 +372,10 @@ int use() { return fact(5) + Counter().down(3); }
 }
 
 #[test]
-fn c_recursive_call_keeps_the_inverse_surface_of_the_usage_scan() {
+fn c_recursive_call_keeps_editor_and_external_usage_surfaces_distinct() {
     // The usage scan reads the same activation seam, so the recursive call now
-    // resolves to the function there too. A same-file recursive call still
-    // reaches no usage surface: `push_recursive_reference_hit` drops a site
-    // that stands inside the target's own declaration range, which for a
-    // definition-only function is its whole body. That drop is a separate seam
-    // from the activation point, and this fixture pins the surface it leaves.
+    // resolves to the function there too. The editor surface keeps this
+    // self-reference, while the external usage graph excludes it.
     let source = r#"static int fact(int n) {
     if (n <= 1) return 1;
     return n * fact(n - 1);
@@ -371,10 +422,11 @@ int use(void) { return fact(5); }
         "the ordinary call must be an inverse hit: {editor_hits:#?}"
     );
     assert!(
-        editor_hits
-            .iter()
-            .all(|hit| (hit.start_offset, hit.end_offset) != recursive_call),
-        "a same-file recursive call stays outside every usage surface: {editor_hits:#?}"
+        editor_hits.iter().any(|hit| {
+            (hit.start_offset, hit.end_offset) == recursive_call
+                && hit.kind == UsageHitKind::SelfReceiver
+        }),
+        "the recursive call must be an editor self-reference: {editor_hits:#?}"
     );
     assert!(
         result

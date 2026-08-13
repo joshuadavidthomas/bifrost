@@ -1,3 +1,6 @@
+use crate::analyzer::cpp::external::{
+    CppDependencyPackAdapter, resolve_cpp_semantic_pack_dependencies,
+};
 use crate::analyzer::languages::language_support;
 use crate::analyzer::multi_analyzer::build_language_delegate;
 use crate::analyzer::semantic_model::{
@@ -206,12 +209,13 @@ pub enum DependencyPackEcosystem {
     Cargo,
     Ruby,
     Composer,
+    Cpp,
 }
 
 impl DependencyPackEcosystem {
     /// Every ecosystem a host can activate. Hosts iterate this to select the
     /// ecosystems their workspace needs.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Jvm,
         Self::DotNet,
         Self::Npm,
@@ -220,6 +224,7 @@ impl DependencyPackEcosystem {
         Self::Cargo,
         Self::Ruby,
         Self::Composer,
+        Self::Cpp,
     ];
 
     pub fn languages(self) -> &'static [Language] {
@@ -232,6 +237,7 @@ impl DependencyPackEcosystem {
             Self::Cargo => &[Language::Rust],
             Self::Ruby => &[Language::Ruby],
             Self::Composer => &[Language::Php],
+            Self::Cpp => &[Language::Cpp],
         }
     }
 
@@ -247,6 +253,7 @@ impl DependencyPackEcosystem {
             Self::Cargo => "cargo",
             Self::Ruby => "ruby",
             Self::Composer => "composer",
+            Self::Cpp => "cpp",
         }
     }
 
@@ -298,6 +305,7 @@ impl DependencyPackEcosystem {
             Self::Cargo => &["Cargo.toml", "Cargo.lock"],
             Self::Ruby => &["Gemfile", "Gemfile.lock", "gems.locked"],
             Self::Composer => &["composer.json", "composer.lock", "installed.json"],
+            Self::Cpp => &["compile_commands.json"],
         }
     }
 }
@@ -448,6 +456,14 @@ impl WorkspaceAnalyzer {
                             Some(context.cancellation),
                         ),
                         &crate::analyzer::php::PhpDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Cpp => (
+                        resolve_cpp_semantic_pack_dependencies(
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &CppDependencyPackAdapter,
                     ),
                 };
             if discovery.cancelled || !discovery.complete {

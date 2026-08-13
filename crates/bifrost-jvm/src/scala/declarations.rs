@@ -1,3 +1,4 @@
+use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
@@ -40,6 +41,14 @@ fn scala_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName 
     }
 }
 
+fn scala_root_anonymous_name(source: &str, line: usize, column: usize) -> String {
+    let source_id = lower_hex_string(&hash_domain_bytes(
+        b"scala-root-anonymous-owner-v1",
+        source.as_bytes(),
+    ));
+    format!("$anon${source_id}${line}:{column}")
+}
+
 /// The structured segment for a Scala type declaration's own name. A Scala
 /// `object` is spelled with a trailing `$` on its own name (`Foo$`), captured
 /// by a [`SegmentKind::Companion`] segment whose text is the bare name (the `$`
@@ -56,7 +65,10 @@ use crate::scala::imports::{
     scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
     scala_lexical_scope_path,
 };
-use crate::scala::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
+use crate::scala::supertypes::{
+    extract_scala_instance_supertypes, extract_scala_supertypes,
+    scala_full_enum_case_owner_supertype,
+};
 use crate::scala::wildcard_imports::scala_package_prefixes_at;
 
 pub fn parse_scala_file(
@@ -71,6 +83,7 @@ pub fn parse_scala_file(
         parsed: &mut parsed,
     };
     visitor.visit_compilation_unit(tree.root_node(), "");
+    visitor.visit_anonymous_classes(tree.root_node());
     collect_scala_imports(tree.root_node(), source, &mut parsed);
     parsed
 }
@@ -145,13 +158,16 @@ struct ScalaRecoveryOwner {
 
 impl<'a> ScalaVisitor<'a> {
     fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
-        let mut stack = vec![ScalaWork::CompilationUnit {
+        self.run_work_stack(vec![ScalaWork::CompilationUnit {
             children: scala_compilation_children(node),
             index: 0,
             package_name: package_name.to_string(),
             package_prefixes: Vec::new(),
             recovery_owners: Vec::new(),
-        }];
+        }]);
+    }
+
+    fn run_work_stack<'tree>(&mut self, mut stack: Vec<ScalaWork<'tree>>) {
         while let Some(work) = stack.pop() {
             match work {
                 ScalaWork::CompilationUnit {
@@ -180,6 +196,140 @@ impl<'a> ScalaVisitor<'a> {
                     &parent,
                     &mut stack,
                 ),
+            }
+        }
+    }
+
+    fn visit_anonymous_classes(&mut self, root: Node<'_>) {
+        let mut instances = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "instance_expression" && scala_anonymous_template_body(node).is_some()
+            {
+                instances.push(node);
+            }
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
+        }
+        instances.sort_unstable_by_key(|node| (node.start_byte(), usize::MAX - node.end_byte()));
+
+        for instance in instances {
+            self.visit_anonymous_class(instance, root);
+        }
+    }
+
+    fn visit_anonymous_class(&mut self, instance: Node<'_>, root: Node<'_>) {
+        let parent = self
+            .parsed
+            .declarations()
+            .iter()
+            .filter_map(|candidate| {
+                self.parsed
+                    .declaration_ranges(candidate)
+                    .iter()
+                    .filter(|range| {
+                        range.start_byte <= instance.start_byte()
+                            && instance.end_byte() <= range.end_byte
+                    })
+                    .map(|range| (range.end_byte - range.start_byte, candidate.clone()))
+                    .min()
+            })
+            .min()
+            .map(|(_, candidate)| candidate);
+        let package_name = parent
+            .as_ref()
+            .map(|parent| parent.package_name().to_string())
+            .unwrap_or_else(|| self.parsed.package_name.clone());
+        let line = instance.start_position().row;
+        let column = instance.start_position().column;
+        let anonymous_name = format!("anon${line}:{column}");
+        let mut fq = scala_child_fq_base(parent.as_ref(), &package_name);
+        let (fq_name, segment_kind) = match parent.as_ref() {
+            None => (
+                scala_root_anonymous_name(self.source, line, column),
+                SegmentKind::Type,
+            ),
+            Some(_) => (anonymous_name, SegmentKind::Nested),
+        };
+        fq.push(scala_segment(&fq_name, segment_kind));
+        let short_name = parent.as_ref().map_or_else(
+            || fq_name.clone(),
+            |parent| format!("{}$anon${line}:{column}", parent.short_name()),
+        );
+        let anonymous = CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Class,
+            package_name.clone(),
+            short_name,
+            None,
+            true,
+            fq,
+        );
+        self.parsed
+            .add_code_unit(anonymous.clone(), instance, self.source, parent, None);
+
+        let package_prefixes = scala_package_prefixes_at(root, self.source, instance.start_byte());
+        let lexical_scopes = scala_lexical_scope_path(instance);
+        let mut supertypes = extract_scala_instance_supertypes(instance, self.source);
+        for fact in &mut supertypes {
+            fact.lookup_path.set_package_prefixes(&package_prefixes);
+            fact.lookup_path.set_lexical_scopes(&lexical_scopes);
+        }
+        if !supertypes.is_empty() {
+            self.parsed.set_raw_supertypes(
+                anonymous.clone(),
+                supertypes.iter().map(|fact| fact.raw.clone()).collect(),
+            );
+            self.parsed.set_supertype_lookup_paths(
+                anonymous.clone(),
+                supertypes
+                    .iter()
+                    .map(|fact| fact.lookup_path.encode())
+                    .collect(),
+            );
+            self.parsed.add_signature(
+                anonymous.clone(),
+                format!(
+                    "new {}",
+                    supertypes
+                        .iter()
+                        .map(|fact| fact.raw.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" with ")
+                ),
+            );
+        }
+
+        let Some(body) = scala_anonymous_template_body(instance) else {
+            return;
+        };
+        let mut cursor = body.walk();
+        self.process_anonymous_template_body(
+            body.named_children(&mut cursor).collect(),
+            &package_name,
+            &anonymous,
+        );
+    }
+
+    fn process_anonymous_template_body(
+        &mut self,
+        children: Vec<Node<'_>>,
+        package_name: &str,
+        parent: &CodeUnit,
+    ) {
+        for child in children {
+            match child.kind() {
+                "function_definition" | "function_declaration" => {
+                    self.visit_function(child, package_name, Some(parent.clone()))
+                }
+                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
+                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
+                _ => {}
             }
         }
     }
@@ -275,6 +425,40 @@ impl<'a> ScalaVisitor<'a> {
                             index: 0,
                             package_name: current_package.clone(),
                             package_prefixes: package_prefixes.clone(),
+                            recovery_owners: Vec::new(),
+                        });
+                        return;
+                    }
+                }
+                "package_object" => {
+                    let package = scala_package_name(child, self.source);
+                    if package.is_empty() {
+                        continue;
+                    }
+                    let package_name = if current_package.is_empty() {
+                        package
+                    } else {
+                        format!("{current_package}.{package}")
+                    };
+                    let mut nested_package_prefixes = package_prefixes.clone();
+                    nested_package_prefixes.push(package_name.clone());
+                    if self.parsed.package_name.is_empty() {
+                        self.parsed.package_name = package_name.clone();
+                        self.parsed.content_qualifier = package_name.clone();
+                    }
+                    if let Some(body) = child.child_by_field_name("body") {
+                        stack.push(ScalaWork::CompilationUnit {
+                            children,
+                            index,
+                            package_name: current_package,
+                            package_prefixes,
+                            recovery_owners,
+                        });
+                        stack.push(ScalaWork::CompilationUnit {
+                            children: scala_compilation_children(body),
+                            index: 0,
+                            package_name,
+                            package_prefixes: nested_package_prefixes,
                             recovery_owners: Vec::new(),
                         });
                         return;
@@ -960,6 +1144,13 @@ impl<'a> ScalaVisitor<'a> {
 
 fn scala_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
+}
+
+fn scala_anonymous_template_body(node: Node<'_>) -> Option<Node<'_>> {
+    assert_eq!(node.kind(), "instance_expression");
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "template_body")
 }
 
 fn scala_type_declaration_name_node(node: Node<'_>) -> Option<Node<'_>> {

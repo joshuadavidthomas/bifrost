@@ -1968,6 +1968,12 @@ impl<'a> CppVisitor<'a> {
                                 &template_scope,
                                 stack,
                             );
+                            self.parsed.record_materialization(
+                                MaterializationRecord::RecoveredDeclaration {
+                                    recovery: recovered.range,
+                                    unit: code_unit.clone(),
+                                },
+                            );
                             let mut member_scope = template_scope.clone();
                             member_scope.class_unit = Some(code_unit);
                             member_scope.declarations_are_fields = true;
@@ -2058,10 +2064,13 @@ impl<'a> CppVisitor<'a> {
                 // else/elif branches are children of the `preproc_if` node, so
                 // recording the openers covers every branch.
                 if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
+                    let mut range = cpp_declaration_range(node);
+                    if let Some(terminator) = cpp_displaced_preprocessor_terminator(node) {
+                        range.end_byte = terminator.end_byte();
+                        range.end_line = terminator.end_position().row + 1;
+                    }
                     self.parsed.record_materialization(
-                        MaterializationRecord::ConfigurationConditional {
-                            range: cpp_declaration_range(node),
-                        },
+                        MaterializationRecord::ConfigurationConditional { range },
                     );
                 }
                 stack.push(CppWork::Container(CppContainer {
@@ -2788,6 +2797,45 @@ impl<'a> CppVisitor<'a> {
     /// regions recover recursively: the reparsed interior is walked through the
     /// same `visit_function_definition` path, so a sentinel inside the region hits
     /// this recovery again.
+    /// Runs `reparse_walk` and records every declaration it mints as a
+    /// [`MaterializationRecord::RecoveredDeclaration`] interpreting
+    /// `recovery` (issue #1657). A reparsed sentinel region has no single
+    /// recovered envelope unit: the ordinary visitors mint namespaces,
+    /// classes, and members directly from the reparsed tree, so the walk's
+    /// declaration delta is the recovered set. Records are ordered by
+    /// declaration start byte so the parse product stays deterministic.
+    fn record_recovered_declarations(
+        &mut self,
+        recovery: Range,
+        reparse_walk: impl FnOnce(&mut Self),
+    ) {
+        let before = self.parsed.declarations().clone();
+        reparse_walk(self);
+        let mut minted: Vec<CodeUnit> = self
+            .parsed
+            .declarations()
+            .iter()
+            .filter(|unit| !before.contains(*unit))
+            .cloned()
+            .collect();
+        minted.sort_by_cached_key(|unit| {
+            let start = self
+                .parsed
+                .declaration_ranges(unit)
+                .first()
+                .map(|range| range.start_byte)
+                .unwrap_or(usize::MAX);
+            (start, unit.fq_name().to_string())
+        });
+        for unit in minted {
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery,
+                    unit,
+                });
+        }
+    }
+
     fn visit_sentinel_macro_region<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -2852,6 +2900,11 @@ impl<'a> CppVisitor<'a> {
                 &class_scope,
                 &mut class_stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: class_range,
+                    unit: class_unit.clone(),
+                });
             let member_scope = ScopeInfo {
                 package_name: class_scope.package_name.clone(),
                 module: class_scope.module.clone(),
@@ -2891,14 +2944,17 @@ impl<'a> CppVisitor<'a> {
         if !cpp_reparsed_items_are_indexable(root, self.source) {
             return false;
         }
-        self.visit_container(
-            root,
-            &scope.package_name,
-            scope.module.clone(),
-            scope.class_unit.clone(),
-            scope.template_signature.clone(),
-            scope.visible_using_namespaces.clone(),
-        );
+        let recovery = cpp_recovery_window(self.source, start, end);
+        self.record_recovered_declarations(recovery, |visitor| {
+            visitor.visit_container(
+                root,
+                &scope.package_name,
+                scope.module.clone(),
+                scope.class_unit.clone(),
+                scope.template_signature.clone(),
+                scope.visible_using_namespaces.clone(),
+            );
+        });
         if end > node.end_byte() {
             self.consumed_fragment_regions
                 .push((node.start_byte(), end));
@@ -3030,6 +3086,14 @@ impl<'a> CppVisitor<'a> {
             return;
         }
         if in_class_body
+            && let Some(parent) = scope.class_unit.as_ref()
+            && let Some(call) =
+                recovered_macro_qualified_constructor_call(node, parent.identifier(), self.source)
+        {
+            self.visit_recovered_macro_qualified_constructor_definition(node, call, scope);
+            return;
+        }
+        if in_class_body
             && let Some(call) = recovered_macro_qualified_function_call(node, self.source)
         {
             self.visit_recovered_macro_qualified_function_declaration(node, call, scope);
@@ -3073,6 +3137,12 @@ impl<'a> CppVisitor<'a> {
                         scope,
                         stack,
                     );
+                    self.parsed.record_materialization(
+                        MaterializationRecord::RecoveredDeclaration {
+                            recovery: fragmented.class_range,
+                            unit: code_unit.clone(),
+                        },
+                    );
                     let consume_fragment =
                         self.visit_fragmented_export_class_members(outcome, code_unit, scope);
                     // Everything between the fragmented declaration and its displaced
@@ -3088,7 +3158,7 @@ impl<'a> CppVisitor<'a> {
             }
             let uses_initializer_body = recovered.uses_initializer_body;
             let definition_body_present = recovered.body.is_some();
-            self.visit_named_class_like_shape(
+            let class_unit = self.visit_named_class_like_shape(
                 recovered.declaration_node,
                 recovered.name,
                 recovered.body,
@@ -3098,6 +3168,11 @@ impl<'a> CppVisitor<'a> {
                 scope,
                 stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: cpp_declaration_range(node),
+                    unit: class_unit,
+                });
             if uses_initializer_body {
                 return;
             }
@@ -3278,6 +3353,46 @@ impl<'a> CppVisitor<'a> {
         );
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(true)
+            .with_callable_arity(CallableArity::exact(arity))
+            .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source));
+        self.parsed
+            .add_signature_with_metadata(code_unit.clone(), metadata);
+        self.parsed.add_child(parent.clone(), code_unit);
+    }
+
+    fn visit_recovered_macro_qualified_constructor_definition(
+        &mut self,
+        declaration_node: Node<'_>,
+        call: Node<'_>,
+        scope: &ScopeInfo,
+    ) {
+        let Some(parent) = &scope.class_unit else {
+            return;
+        };
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some((mut signature, parameter_labels)) =
+            recovered_macro_qualified_function_parameters(arguments, self.source)
+        else {
+            return;
+        };
+        if let Some(template_signature) = &scope.template_signature {
+            signature = format!("{template_signature}{signature}");
+        }
+        let arity = parameter_labels.len();
+        let function = FunctionInfo {
+            package_name: scope.package_name.clone(),
+            owner_path: Some(parent.short_name().to_string()),
+            name: parent.identifier().to_string(),
+            signature,
+        };
+        let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
+        self.parsed
+            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        let signature_label = normalize_cpp_whitespace(node_text(declaration_node, self.source));
+        let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
+            .with_declaration_only(false)
             .with_callable_arity(CallableArity::exact(arity))
             .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source));
         self.parsed
@@ -3596,6 +3711,25 @@ fn cpp_declaration_range(node: Node<'_>) -> Range {
         end_byte: node.end_byte(),
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
+    }
+}
+
+/// A recovery interval as a [`Range`], for materialization records whose
+/// window is a byte region rather than one parser node (the sentinel-macro
+/// region reparses, issue #941/#1657).
+fn cpp_recovery_window(source: &str, start_byte: usize, end_byte: usize) -> Range {
+    let line_at = |byte: usize| {
+        source.as_bytes()[..byte]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1
+    };
+    Range {
+        start_byte,
+        end_byte,
+        start_line: line_at(start_byte),
+        end_line: line_at(end_byte),
     }
 }
 
@@ -5053,6 +5187,64 @@ fn class_has_displaced_preprocessor_terminator(class_node: Node<'_>) -> bool {
                 })
         })
     })
+}
+
+/// The real `#endif` that tree-sitter consumed inside an error subtree.
+///
+/// A preprocessor directive inside a malformed array bound can cause later
+/// declarations to remain children of the conditional. The non-missing token
+/// still gives the exact structured boundary. Ignore nested conditionals and
+/// select the last error-owned token. Tree-sitter can pair a later outer
+/// `#endif` with this conditional, so the direct terminator is not necessarily
+/// missing.
+pub fn cpp_displaced_preprocessor_terminator<'tree>(
+    conditional: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if !conditional.has_error() {
+        return None;
+    }
+    let has_concrete_direct_terminator = conditional
+        .child_count()
+        .checked_sub(1)
+        .and_then(|index| conditional.child(index))
+        .is_some_and(|child| child.kind() == "#endif" && !child.is_missing());
+    if has_concrete_direct_terminator && conditional.child_by_field_name("alternative").is_some() {
+        // A structured alternative proves that the direct `#endif` closes
+        // this family. An error-owned terminator inside either branch belongs
+        // to a damaged nested conditional, not to this one.
+        return None;
+    }
+    let mut displaced = None;
+    let mut stack = (0..conditional.child_count())
+        .filter_map(|index| conditional.child(index))
+        .map(|child| (child, false))
+        .collect::<Vec<_>>();
+    while let Some((node, inside_error)) = stack.pop() {
+        if !inside_error && node.kind() != "ERROR" && !node.has_error() {
+            continue;
+        }
+        if node.kind() == "#endif" && !node.is_missing() && inside_error {
+            if displaced.is_none_or(|current: Node<'_>| node.end_byte() > current.end_byte()) {
+                displaced = Some(node);
+            }
+            continue;
+        }
+        if node != conditional
+            && matches!(
+                node.kind(),
+                "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif"
+            )
+        {
+            continue;
+        }
+        let inside_error = inside_error || node.kind() == "ERROR";
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index) {
+                stack.push((child, inside_error));
+            }
+        }
+    }
+    displaced
 }
 
 fn displaced_fragmented_class_terminator(parent: Node<'_>, error_index: usize) -> bool {
@@ -7962,6 +8154,11 @@ fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usi
     } else {
         node.end_byte()
     };
+    if class_start.is_none()
+        && let Some(namespace_end) = cpp_sentinel_following_namespace_end(node, source)
+    {
+        end = end.max(namespace_end);
+    }
     let mut sibling = node.next_named_sibling();
     while let Some(current) = sibling {
         if !cpp_is_stray_semicolon(current, source) {
@@ -7971,6 +8168,61 @@ fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usi
         sibling = current.next_named_sibling();
     }
     (start < end).then_some((start, end))
+}
+
+/// Extend a sentinel reparse through a following namespace that tree-sitter
+/// flattened into the sentinel node's sibling list.
+///
+/// Fmt places `FMT_END_EXPORT` immediately before `namespace detail`. The
+/// unknown macro becomes a false function return type and consumes the first
+/// namespace body. A second `namespace detail` then loses its enclosing node:
+/// tree-sitter retains the `namespace`, name, and `{` as direct siblings, but
+/// attaches its declarations to the surrounding error tree. Reparse from that
+/// structured keyword so tree-sitter, rather than a source-text brace scan,
+/// supplies the complete namespace boundary.
+fn cpp_sentinel_following_namespace_end(node: Node<'_>, source: &str) -> Option<usize> {
+    let mut sibling = node.next_sibling();
+    let keyword = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if keyword.kind() != "namespace" {
+        return None;
+    }
+    let name = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if cpp_namespace_name_components(name, source).is_empty() {
+        return None;
+    }
+    let open = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if open.kind() != "{" {
+        return None;
+    }
+
+    let tree = cpp_reparse_region_items(source, keyword.start_byte(), source.len())?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let namespace = root
+        .named_children(&mut cursor)
+        .find(|candidate| candidate.kind() != "comment")?;
+    (namespace.kind() == "namespace_definition"
+        && namespace.start_byte() == keyword.start_byte()
+        && namespace.child_by_field_name("body").is_some())
+    .then_some(namespace.end_byte())
 }
 
 /// Parse the source suffix beginning at a structurally recovered class/template
@@ -8072,6 +8324,50 @@ fn recovered_macro_qualified_field_declarators<'tree>(
             .filter(|declarator| !same_node(*declarator, pseudo_declarator)),
     );
     Some(recovered)
+}
+
+/// Recover a macro-qualified constructor that tree-sitter represents as one
+/// field declaration. The constructor call remains inside the direct recovery
+/// error, while each member initializer becomes a false function declarator.
+/// The class owner proves the constructor name and lets the caller ignore those
+/// initializer declarators.
+fn recovered_macro_qualified_constructor_call<'tree>(
+    node: Node<'tree>,
+    class_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let macro_type = node.child_by_field_name("type")?;
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
+    {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let bitfield = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")?;
+    let error = bitfield
+        .named_child(0)
+        .filter(|child| child.kind() == "ERROR")?;
+    let mut stack = vec![error];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call_expression"
+            && current
+                .child_by_field_name("function")
+                .is_some_and(|function| node_text(function, source) == class_name)
+            && current
+                .child_by_field_name("arguments")
+                .is_some_and(|arguments| arguments.kind() == "argument_list")
+        {
+            return Some(current);
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    None
 }
 
 /// Recover a macro-qualified member function declaration that tree-sitter

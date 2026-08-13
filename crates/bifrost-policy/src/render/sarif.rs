@@ -1335,11 +1335,29 @@ mod tests {
             &evaluation_options(),
         )
         .expect("fixture policy evaluation");
-        let mut run = outcome.report().runs()[0].clone();
+        // The fixture run completes since #1987, so rebuild it with an
+        // inconclusive completion: only a non-complete run carries a
+        // completion notification, and truncated diagnostics require one.
+        let complete = &outcome.report().runs()[0];
+        let mut run = crate::PolicyRun::try_new(
+            complete.policy_id().clone(),
+            complete.policy_hash(),
+            complete.analysis_type(),
+            crate::PolicyRunCompletion::inconclusive(vec![
+                crate::PolicyIncompleteReason::PartialDiscovery,
+            ])
+            .expect("inconclusive completion"),
+            complete.findings().to_vec(),
+            complete.diagnostics().to_vec(),
+            false,
+            complete.work().clone(),
+            &crate::PolicyBudget::default(),
+        )
+        .expect("rebuilt inconclusive run");
         run.replace_diagnostics(run.diagnostics().to_vec(), true);
 
         let notification = SarifNotification::policy_completion(&run)
-            .expect("the unsupported policy produces a completion notification");
+            .expect("the inconclusive policy run produces a completion notification");
         let value = serde_json::to_value(notification).expect("serialize notification");
         assert_eq!(value["properties"]["bifrost.diagnosticsTruncated"], true);
         assert_eq!(

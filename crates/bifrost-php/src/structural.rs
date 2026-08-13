@@ -5,6 +5,7 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
     is_spread_argument_node,
 };
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -315,6 +316,7 @@ impl StructuralSpec for PhpStructuralSpec {
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Method
             && node

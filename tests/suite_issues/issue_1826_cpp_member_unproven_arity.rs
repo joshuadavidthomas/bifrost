@@ -86,6 +86,78 @@ fn definition_signatures(outcome: &DefinitionLookupOutcome) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn location_tool_and_exact_batch_agree_for_the_census_site() {
+    let header = header(
+        r#"class Widget {
+public:
+    bool prepare(int settings, int supprs) { return settings + supprs > 0; }
+};
+"#,
+    );
+    let source = r#"#include "widget.h"
+void Widget::run() {
+    int checkSettings = 1;
+    int supprs = 2;
+    if (!prepare(checkSettings, supprs))
+        return;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget.h", &header)
+        .file("widget.cpp", source)
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let start = source.find("prepare").expect("prepare call");
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current)| current)
+        .chars()
+        .count()
+        + 1;
+    let file = project.file("widget.cpp");
+    let mut exact = resolve_definition_batch_with_source(
+        workspace.analyzer(),
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + "prepare".len()),
+        }],
+        file,
+        Arc::from(source),
+    );
+    let location = brokk_bifrost::searchtools::get_definitions_by_location(
+        workspace.analyzer(),
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "widget.cpp".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+
+    let exact = exact.pop().expect("one exact outcome");
+    assert_eq!(exact.status, DefinitionLookupStatus::Resolved);
+    assert_eq!(location.results[0].status, "resolved");
+    assert_eq!(
+        exact
+            .definitions
+            .iter()
+            .map(|unit| unit.fq_name().to_string())
+            .collect::<Vec<_>>(),
+        location.results[0]
+            .definitions
+            .iter()
+            .filter_map(|definition| definition.fqn.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Fixture p3: a single inline member, no declaration/definition pair at all.
 /// There is nothing to be ambiguous between, yet the answer was `ambiguous`.
 #[test]

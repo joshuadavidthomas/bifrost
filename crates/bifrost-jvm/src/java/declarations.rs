@@ -572,11 +572,13 @@ fn visit_field_declaration(
             .child_by_field_name("type")
             .map(|type_node| normalize_whitespace(node_text(type_node, source)));
         let (is_static, is_final) = java_field_modifiers(node);
+        let has_initializer = child.child_by_field_name("value").is_some();
         parsed.add_signature_with_metadata(
             code_unit,
             SignatureMetadata::new(signature, Vec::new())
                 .with_return_type_text(field_type)
-                .with_field_modifiers(is_static, is_final),
+                .with_field_modifiers(is_static, is_final)
+                .with_field_initializer(has_initializer),
         );
 
         if let Some(value) = child.child_by_field_name("value") {

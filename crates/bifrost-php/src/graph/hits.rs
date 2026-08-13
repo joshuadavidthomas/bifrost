@@ -64,9 +64,10 @@ pub fn push_hit_range(
         start_line: find_line_index_for_offset(line_starts, start),
         end_line: find_line_index_for_offset(line_starts, end),
     };
-    let Some(enclosing) = analyzer.index.enclosing_code_unit(file, &range) else {
-        return;
-    };
+    let enclosing = analyzer
+        .index
+        .enclosing_code_unit(file, &range)
+        .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
     // A reference whose enclosing declaration is a *callable* target is a
     // recursive call (#1638): recorded, then classified `SelfReceiver`, so
     // editor find-references lists it while the external usage surface omits

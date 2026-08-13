@@ -349,15 +349,20 @@ pub(crate) fn project_taint_finding_report_bounded(
             let mut steps = Vec::new();
             let mut witness_bytes = 0usize;
             let mut omitted_steps = 0usize;
+            let mut projection_cause = None::<&'static str>;
             while let Some(step) = public_steps.next() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     cancelled = true;
                     break;
                 }
                 let step_bytes = serialized_json_bytes(&step);
-                if steps.len() == limits.max_steps_per_witness
-                    || step_bytes > limits.max_witness_bytes.saturating_sub(witness_bytes)
-                {
+                if steps.len() == limits.max_steps_per_witness {
+                    projection_cause = Some("projection_step_limit");
+                    omitted_steps = 1usize.saturating_add(public_steps.count());
+                    break;
+                }
+                if step_bytes > limits.max_witness_bytes.saturating_sub(witness_bytes) {
+                    projection_cause = Some("projection_byte_limit");
                     omitted_steps = 1usize.saturating_add(public_steps.count());
                     break;
                 }
@@ -367,10 +372,14 @@ pub(crate) fn project_taint_finding_report_bounded(
             if cancelled {
                 break;
             }
-            let truncated = witness.truncated()
-                || witness.alternatives_truncated()
-                || witness.retention_truncated()
-                || omitted_steps > 0;
+            // Unretained sibling alternatives do not truncate this witness:
+            // its own steps are complete without them. They stay reported
+            // through the dedicated `alternatives_truncated` field.
+            let truncated = witness.truncated() || omitted_steps > 0;
+            let truncation_cause = witness
+                .truncation_cause()
+                .map(|cause| cause.stable_label().to_owned())
+                .or_else(|| projection_cause.map(str::to_owned));
             witnesses_truncated |= truncated;
             witnesses.push(CodeQueryTaintWitness {
                 id: public_taint_witness_id(&finding_id, index, witness.quality()),
@@ -379,7 +388,11 @@ pub(crate) fn project_taint_finding_report_bounded(
                 path: sink.site().path().as_str().to_owned(),
                 language: sink.site().language().config_label(),
                 range: locator_range(workspace, sink.site()),
-                quality: public_taint_quality(witness.quality(), truncated),
+                quality: public_taint_quality(
+                    witness.quality(),
+                    truncated,
+                    truncation_cause.as_deref(),
+                ),
                 steps,
                 retained_bytes: witness_bytes,
                 truncated,
@@ -388,6 +401,7 @@ pub(crate) fn project_taint_finding_report_bounded(
                     .saturating_add(omitted_steps),
                 alternatives_truncated: witness.alternatives_truncated(),
                 retention_truncated: witness.retention_truncated(),
+                truncation_cause,
             });
         }
         if cancelled {
@@ -655,7 +669,11 @@ fn public_taint_witness_id(finding_id: &str, index: usize, quality: PathQuality)
     digest.finish().to_string()
 }
 
-fn public_taint_quality(quality: PathQuality, truncated: bool) -> CodeQuerySemanticEvidence {
+fn public_taint_quality(
+    quality: PathQuality,
+    truncated: bool,
+    truncation_cause: Option<&str>,
+) -> CodeQuerySemanticEvidence {
     CodeQuerySemanticEvidence {
         proof: if quality.is_proven() {
             CodeQuerySemanticProof::Proven
@@ -668,7 +686,10 @@ fn public_taint_quality(quality: PathQuality, truncated: bool) -> CodeQuerySeman
         } else {
             CodeQuerySemanticCompleteness::Partial
         },
-        completeness_reason: truncated.then(|| "taint witness evidence is truncated".to_owned()),
+        completeness_reason: truncated.then(|| match truncation_cause {
+            Some(cause) => format!("taint witness evidence is truncated: {cause}"),
+            None => "taint witness evidence is truncated".to_owned(),
+        }),
     }
 }
 

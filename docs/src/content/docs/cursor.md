@@ -102,11 +102,14 @@ package from the Plugins view and repeat the GitHub install flow. Fully quit
 and reopen Cursor afterward, then confirm that the installed plugin metadata
 reports the expected version.
 
-The plugin needs two Cursor-specific compatibility details: the MCP definition
-resolves its launcher from Cursor's installed plugin directory, and Bifrost
-accepts the absolute native path that Cursor returns from `roots/list`. A
-connected MCP status or visible tool list is not sufficient evidence that both
-boundaries worked; complete the smoke test below.
+The portable package uses root `plugin.json` and `mcp.json` files. It can also
+include optional `skills/` files.
+Cursor still needs its native `.cursor-plugin/plugin.json` and
+`cursor-mcp.json` adapter. The adapter resolves its launcher from Cursor's
+installed plugin directory. Bifrost also accepts the absolute native path that
+Cursor returns from `roots/list`. A connected MCP status or visible tool list is
+not sufficient evidence that both boundaries worked; complete the smoke test
+below.
 
 :::caution[Upgrade from Bifrost 0.8.9]
 Bifrost 0.8.10 is the minimum release with both the Cursor plugin-root launcher

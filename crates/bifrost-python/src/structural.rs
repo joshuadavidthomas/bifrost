@@ -7,6 +7,7 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -327,6 +328,7 @@ impl StructuralSpec for PythonStructuralSpec {
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         _source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Function && python_definition_is_method(node) {
             NormalizedKind::Method

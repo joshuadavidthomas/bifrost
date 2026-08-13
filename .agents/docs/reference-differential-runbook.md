@@ -311,14 +311,32 @@ For every `missing` site:
 Do not infer that a large cluster is one bug merely because source text looks similar. Conversely, do
 not file one issue per symptom when structured tracing proves a shared resolver invariant.
 
+### Language-by-language issue workflow
+
+Work depth-first by corpus language. For language A, create issues for every legitimate root-cause
+family found in that language, then fix and close the issues that are assigned to you before starting
+triage or implementation for language B. Merge each completed fix into `origin/master` as it is
+finished. When the language has no remaining actionable families, publish a concise summary of its
+results, including fixes, skipped issues, escalations, and final corpus status.
+
+Every new issue must begin with the title prefix `FIRD: `. Before changing product code, assign the
+issue to the current `gh` user. If an existing issue is assigned to someone else, record the link and
+disposition in the ledger, then skip it; do not reassign it or work around its ownership.
+
+If a finding has no straightforward, generalized, correct solution under this repository's design
+rules, do not add a hack or workaround. Assign the issue to `DavidBakerEffendi`, add a comment that
+explains the structural limitation and the evidence, record the escalation in the ledger, and proceed
+with the next eligible issue.
+
 ## Reduce and fix a legitimate defect
 
 Before implementation:
 
 1. search open issues for the root-cause family;
-2. if an issue is assigned to somebody else, record it and skip the implementation;
-3. otherwise create or reuse an issue assigned only to the authorized owner; and
-4. ensure assignment is complete before changing product code.
+2. if no suitable issue exists, create one with the `FIRD: ` title prefix;
+3. if an issue is assigned to somebody else, record it and skip the implementation;
+4. otherwise assign it to the current `gh` user; and
+5. ensure assignment is complete before changing product code.
 
 Use `tests/common/inline_project.rs::InlineTestProject` for small behavior-focused analyzer projects.
 Put forward identity regressions in definition tests, targeted inverse regressions in usage-graph tests,
@@ -346,8 +364,9 @@ UV_CACHE_DIR=/tmp/bifrost-uv-cache \
 ```
 
 Run focused behavior suites before the broad gates, then rebuild the release runner from the exact
-clean integrated head and rerun every accepted production witness. Do not wait for CI when a campaign
-explicitly defines the complete local gate as its transition boundary.
+clean integrated head and rerun every accepted production witness. Do not wait for CI: once the
+required local `cargo test` coverage passes, merge the completed fix and continue the depth-first
+language workflow. Investigate CI only if the operator reports that it turned red.
 
 If the execution sandbox denies process-I/O tests, rerun the same full feature-enabled suite outside
 that sandbox. Do not reinterpret a sandbox denial as a passing test or silently narrow the suite.
@@ -363,7 +382,7 @@ Exact probes and a dirty integration-candidate corpus are not closure evidence. 
 5. verify all expected exact witnesses are `consistent` or honestly fail closed as `unproven`/
    `inconclusive` with zero actionable discrepancy;
 6. run formatting, Clippy, focused tests, and the full feature-enabled test suite;
-7. comment on and close only the assigned issues proven fixed by clean production evidence; and
+7. comment on and close only the self-assigned issues proven fixed by clean production evidence; and
 8. verify local HEAD, local `origin/master`, and remote `refs/heads/master` agree.
 
 Do not claim closure by subtracting baseline rows that exact probes fixed. Fixes can change forward
@@ -473,7 +492,8 @@ Before accepting a baseline:
 - [ ] every selected repository has one completed record;
 - [ ] heads, dirtiness, and fingerprints are correct;
 - [ ] every raw missing row has an evidence-backed ledger disposition;
-- [ ] every legitimate root cause has an assigned issue before implementation; and
+- [ ] every legitimate root cause has a `FIRD: ` issue assigned to the current `gh` user before
+  implementation, or an evidence-backed skip/escalation; and
 - [ ] exact production witnesses and structured reductions exist.
 
 Before closure:
@@ -484,5 +504,6 @@ Before closure:
 - [ ] every final residual exhaustively audited;
 - [ ] focused tests, formatting, all-feature Clippy, and `cargo test --features nlp,python` pass;
 - [ ] compact manifest and narrative committed;
-- [ ] fixed assigned issues commented and closed with clean evidence; and
+- [ ] fixed self-assigned issues commented and closed with clean evidence;
+- [ ] each language was completed depth-first and has a published summary; and
 - [ ] local and remote `master` agree.

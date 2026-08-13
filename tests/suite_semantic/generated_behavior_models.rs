@@ -580,6 +580,7 @@ public class Person {
     String name;
     boolean ready;
 }
+
 "#,
         )
         .file(
@@ -695,6 +696,206 @@ class UsePerson {
             .iter()
             .any(|source| source.text.contains("boolean ready;"))
     );
+}
+
+#[test]
+fn lombok_generated_constructors_use_required_field_order_and_exact_arity() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/app/Models.java",
+            r#"package app;
+import lombok.NoArgsConstructor;
+import lombok.RequiredArgsConstructor;
+
+@RequiredArgsConstructor
+class RequiredTwo {
+    final String name;
+    final int count;
+    final String initialized = "ready";
+    static final long GLOBAL = 1L;
+    String mutable;
+    RequiredTwo(boolean authored) {}
+}
+
+@RequiredArgsConstructor
+class RequiredSeven {
+    final String one;
+    final int two;
+    final long three;
+    final boolean four;
+    final double five;
+    final byte six;
+    final Object seven;
+}
+
+@NoArgsConstructor
+class Empty {
+    Empty(boolean authored) {}
+}
+
+class UseModels {
+    void use() {
+        new RequiredTwo("item", 2);
+        new RequiredTwo("unsupported", 2, 3L);
+        new RequiredSeven("one", 2, 3L, true, 5.0, (byte) 6, new Object());
+        new Empty();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    assert!(matches!(
+        activate_lombok(&analyzer, Some("org.projectlombok:lombok"), Some("1.18.42")),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let required_two = modeled_member(&overlay, "app.RequiredTwo", "RequiredTwo");
+    assert_eq!(required_two.len(), 1, "{required_two:#?}");
+    assert_eq!(required_two[0].kind, SemanticModelSymbolKind::Constructor);
+    assert_eq!(
+        required_two[0].signature.as_deref(),
+        Some("RequiredTwo(name: String, count: int)")
+    );
+    assert_eq!(
+        required_two[0].provenance.rule_id.as_deref(),
+        Some("java.lombok.required-args-constructor")
+    );
+    let SemanticModelLocation::Authored(anchor) = &required_two[0].location else {
+        panic!("required constructor must use the authored class anchor");
+    };
+    assert_eq!(anchor.symbol, "app.RequiredTwo");
+
+    let required_seven = modeled_member(&overlay, "app.RequiredSeven", "RequiredSeven");
+    assert_eq!(required_seven.len(), 1, "{required_seven:#?}");
+    assert_eq!(
+        required_seven[0].signature.as_deref(),
+        Some(
+            "RequiredSeven(one: String, two: int, three: long, four: boolean, five: double, six: byte, seven: Object)"
+        )
+    );
+    let empty = modeled_member(&overlay, "app.Empty", "Empty");
+    assert_eq!(empty.len(), 1, "{empty:#?}");
+    assert_eq!(empty[0].signature.as_deref(), Some("Empty()"));
+
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![
+                DefinitionReferenceQuery {
+                    path: "src/app/Models.java".to_owned(),
+                    line: Some(33),
+                    column: Some(13),
+                },
+                DefinitionReferenceQuery {
+                    path: "src/app/Models.java".to_owned(),
+                    line: Some(34),
+                    column: Some(13),
+                },
+                DefinitionReferenceQuery {
+                    path: "src/app/Models.java".to_owned(),
+                    line: Some(35),
+                    column: Some(13),
+                },
+                DefinitionReferenceQuery {
+                    path: "src/app/Models.java".to_owned(),
+                    line: Some(36),
+                    column: Some(13),
+                },
+            ],
+        },
+    );
+    assert_eq!(
+        definitions.results[0].status, "resolved",
+        "{definitions:#?}"
+    );
+    assert_eq!(
+        definitions.results[0].definitions[0]
+            .semantic_model
+            .as_ref()
+            .and_then(|provenance| provenance.rule_id.as_deref()),
+        Some("java.lombok.required-args-constructor")
+    );
+    assert!(
+        definitions.results[1].definitions[0]
+            .semantic_model
+            .is_none(),
+        "a three-argument call must not use the two-argument model: {definitions:#?}"
+    );
+    assert_eq!(
+        definitions.results[2].definitions[0]
+            .semantic_model
+            .as_ref()
+            .and_then(|provenance| provenance.rule_id.as_deref()),
+        Some("java.lombok.required-args-constructor")
+    );
+    assert_eq!(
+        definitions.results[3].definitions[0]
+            .semantic_model
+            .as_ref()
+            .and_then(|provenance| provenance.rule_id.as_deref()),
+        Some("java.lombok.no-args-constructor")
+    );
+
+    let usages = scan_usages_by_reference(
+        analyzer.analyzer(),
+        ScanUsagesByReferenceParams {
+            symbols: vec!["app.RequiredTwo.lombok-required-args-constructor".to_owned()],
+            include_tests: false,
+            paths: None,
+            include_same_owner: true,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(
+        usages.results[0].status,
+        ScanUsagesStatus::Found,
+        "{usages:#?}"
+    );
+    assert!(
+        usages.results[0]
+            .files
+            .iter()
+            .flat_map(|file| &file.hits)
+            .any(|hit| hit.line == 33),
+        "{usages:#?}"
+    );
+}
+
+#[test]
+fn lombok_generated_constructors_require_exact_evidence() {
+    for (import, package, version) in [
+        ("lombok.RequiredArgsConstructor", None, None),
+        (
+            "lombok.RequiredArgsConstructor",
+            Some("org.projectlombok:lombok"),
+            Some("1.18.40"),
+        ),
+        (
+            "other.RequiredArgsConstructor",
+            Some("org.projectlombok:lombok"),
+            Some("1.18.42"),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "src/app/Model.java",
+                format!(
+                    "package app; import {import}; @RequiredArgsConstructor class Model {{ final String value; }}\n"
+                ),
+            )
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let _ = activate_lombok(&analyzer, package, version);
+        assert!(
+            analyzer
+                .analyzer()
+                .semantic_model_overlay()
+                .is_none_or(|overlay| modeled_member(&overlay, "app.Model", "Model").is_empty()),
+            "unexpected constructor match for {import} {package:?} {version:?}"
+        );
+    }
 }
 
 #[test]
@@ -948,6 +1149,7 @@ import lombok.Getter;
     String name;
     public String getName() { return name; }
 }
+
 "#,
         )
         .file(
@@ -968,6 +1170,48 @@ import lombok.Getter;
         },
     );
     assert_eq!(definitions.results[0].status, "resolved");
+    assert!(
+        definitions.results[0].definitions[0]
+            .semantic_model
+            .is_none(),
+        "{definitions:#?}"
+    );
+    assert_eq!(definitions.results[0].definitions[0].start_line, 5);
+}
+
+#[test]
+fn authored_java_constructor_precedes_lombok_model() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/app/Person.java",
+            r#"package app;
+import lombok.RequiredArgsConstructor;
+@RequiredArgsConstructor class Person {
+    final String name;
+    Person(String name) { this.name = name; }
+}
+class UsePerson {
+    Person make() { return new Person("name"); }
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let _ = activate_lombok(&analyzer, Some("org.projectlombok:lombok"), Some("1.18.42"));
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/app/Person.java".to_owned(),
+                line: Some(8),
+                column: Some(32),
+            }],
+        },
+    );
+    assert_eq!(
+        definitions.results[0].status, "resolved",
+        "{definitions:#?}"
+    );
     assert!(
         definitions.results[0].definitions[0]
             .semantic_model

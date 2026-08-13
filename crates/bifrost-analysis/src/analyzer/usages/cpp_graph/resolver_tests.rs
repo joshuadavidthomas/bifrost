@@ -1083,6 +1083,50 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    fn precise_parent_forward_owner_deduplicates_one_logical_class() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = CodeUnit::new(
+            ProjectFile::new(root.clone(), "first.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let second = CodeUnit::new(
+            ProjectFile::new(root.clone(), "second.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let other = CodeUnit::new(
+            ProjectFile::new(root, "other.h"),
+            CodeUnitType::Class,
+            "other",
+            "encoder",
+        );
+
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first.clone(), second.clone()]),
+            Some(second.clone())
+        );
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first, other]),
+            None
+        );
+
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (second.clone(), CppClassDeclarationStrength::Forward),
+                    (second, CppClassDeclarationStrength::Forward),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::ForwardsOnly(forwards) if forwards.len() == 2
+        ));
+    }
+
+    #[test]
     fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
         const SIBLING_COUNT: usize = 113;
         let temp = tempfile::tempdir().expect("temp dir");

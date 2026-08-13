@@ -22,6 +22,7 @@
 /// resolution/receiver indices, re-exported at the paths their framework callers
 /// already use.
 pub(crate) use crate::analyzer::js_ts::receiver_facts::JsTsReceiverFacts;
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::receiver_analysis::{
     JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
 };
@@ -284,9 +285,13 @@ where
         // declaration pass. Receiver analysis can consult the analyzer-cached
         // resolution index, so it is pre-materialized before this parallel scan.
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parse_and_collect(analyzer, file, nodes, &parser_language, |input| {
-            inverted::scan_file(host, analyzer, language, file, nodes, input)
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            ParseSpec::whole(&parser_language),
+            |input| inverted::scan_file(host, analyzer, language, file, nodes, input),
+        )
     })
 }
 
@@ -390,7 +395,7 @@ where
         // Parse on demand and drop the tree when this closure returns; cross-file
         // resolution comes from the analyzer-cached `index`, not retained trees.
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        let parsed = parse_tree_sitter_file(file, &parser_language)?;
+        let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
         let file_prep = inverted::prepare_scoped_file(
             &prep,
             analyzer,

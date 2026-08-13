@@ -3904,6 +3904,28 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+#[test]
+fn csharp_nested_type_precedes_same_named_namespace_type() {
+    let source = "namespace N { class Result {} class Outer<T> { public class Result {} private class Inner { public Result Value => null!; } } }";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("CollectionTally.cs", source)
+        .build();
+    let reference = source
+        .find("Result Value")
+        .expect("nested result type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("CollectionTally.cs", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer`1$Result",
+        "{value}"
+    );
+}
+
 // #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
 // ENCLOSING type declaration after the innermost type and its base chain are
 // exhausted. The nested caller's own base chain is empty here, so only the
@@ -4348,6 +4370,7 @@ namespace App {
         }
     }
 }
+
 "#,
         )
         .build();
@@ -4365,6 +4388,36 @@ namespace App {
     assert_eq!(result["status"], "no_type", "{value}");
     assert_eq!(
         result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_local_function_declaration_name_is_not_a_reference() {
+    let source = r#"namespace App;
+public class Contains {}
+public class Use {
+    public void Run() {
+        static void Contains(int value) {}
+        Contains(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Use.cs", source)
+        .build();
+    let declaration = source
+        .find("Contains(int value)")
+        .expect("local function declaration");
+    let value = lookup(
+        project.root(),
+        &location_reference("Use.cs", source, declaration),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "declaration_or_import_site",
         "{value}"
     );
 }
@@ -13518,6 +13571,154 @@ function render() {
             r#"{{"references":[{{"path":"app.js","line":6,"column":{}}}]}}"#,
             column_of(line, "status")
         ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_unbound_receiver_does_not_match_nested_same_file_member() {
+    let source = r#"
+function convert(json) {
+  const formattedJson = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return typeof settings.encodeUrl === "boolean";
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("tomlToJson.js", source)
+        .build();
+
+    let reference = source
+        .find("settings.encodeUrl")
+        .expect("unbound Bruno receiver")
+        + "settings.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("tomlToJson.js", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn typescript_unbound_receiver_does_not_match_nested_same_file_member() {
+    let source = r#"
+function convert() {
+  const formattedJson: any = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("tomlToJson.ts", source)
+        .build();
+
+    let reference = source
+        .find("settings.encodeUrl")
+        .expect("unbound TypeScript receiver")
+        + "settings.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("tomlToJson.ts", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_unbound_receiver_does_not_match_nested_cross_file_member() {
+    let consumer = r#"
+function convert() {
+  return settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "definitions.js",
+            r#"
+const formattedJson = {};
+formattedJson.settings = {
+  encodeUrl: true
+};
+"#,
+        )
+        .file("consumer.js", consumer)
+        .build();
+
+    let reference = consumer.find("encodeUrl").expect("unbound nested member");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.js", consumer, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_bound_nested_receiver_resolves_exact_chain() {
+    let source = r#"
+function convert() {
+  const formattedJson = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return formattedJson.settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reference = source.rfind("encodeUrl").expect("bound nested member read");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "formattedJson.settings.encodeUrl",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_bound_nested_receiver_read_before_definition_fails_closed() {
+    let source = r#"
+function convert() {
+  const formattedJson = {};
+  consume(formattedJson.settings.encodeUrl);
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reference = source.find("encodeUrl").expect("member read before write");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, reference),
     );
 
     let result = &value["results"][0];
@@ -32176,7 +32377,7 @@ object Uri {
 // Kotlin definition navigation (issue #1238).
 //
 // Fixtures are written multi-line with blank lines between declarations, the
-// way real Kotlin is written: the vendored grammar emits `MISSING
+// way real Kotlin is written: the Kotlin grammar emits `MISSING
 // _automatic_semicolon` recovery nodes for single-line declaration bodies, so a
 // compressed fixture would exercise recovery rather than the shape under test.
 // ---------------------------------------------------------------------------

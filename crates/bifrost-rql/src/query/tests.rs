@@ -1100,6 +1100,140 @@ fn call_shape_projects_typed_group_and_argument_rows() {
 }
 
 #[test]
+fn callable_signature_projects_typed_signature_and_parameter_rows() {
+    let signature =
+        CodeQuery::from_sexp(r#"(callable-signature (enclosing-decl (method (name "run"))))"#)
+            .expect("callable signature RQL");
+    assert_eq!(
+        signature.validate_steps().unwrap(),
+        QueryValueKind::CallableSignature
+    );
+    assert_eq!(signature.schema_version, SCHEMA_VERSION);
+
+    let parameters = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "callable_signature" },
+            { "op": "signature_parameters" }
+        ]
+    }));
+    assert_eq!(
+        parameters.validate_steps().unwrap(),
+        QueryValueKind::SignatureParameter
+    );
+    assert_eq!(
+        parameters.to_canonical_json()["steps"][2]["op"],
+        "signature_parameters"
+    );
+
+    let rql = CodeQuery::from_sexp(
+        r#"(signature-parameters (callable-signature (enclosing-decl (method (name "run")))))"#,
+    )
+    .expect("chained callable signature RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::SignatureParameter
+    );
+
+    // The signature step is declaration-shaped, and the parameter projection
+    // accepts only its own upstream domain.
+    let wrong_upstream = CodeQuery::from_json(&json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "signature_parameters" }]
+    }))
+    .expect_err("signature_parameters must reject a structural upstream");
+    assert!(
+        wrong_upstream
+            .message
+            .contains("requires callable_signature")
+    );
+
+    let wrong_signature_upstream = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_shape" }, { "op": "callable_signature" }]
+    }))
+    .expect_err("callable_signature must reject a call-shape upstream");
+    assert!(
+        wrong_signature_upstream
+            .message
+            .contains("requires declaration")
+    );
+
+    // A signature row reaches its file like every other row domain.
+    let files = parse_ok(json!({
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            { "op": "callable_signature" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+}
+
+/// The two callable-applicability steps are occurrence-shaped and register the
+/// same way every other row domain does: both spellings parse, the value kinds
+/// are their own, an upstream that is not an occurrence is refused at the
+/// exact step, and both rows reach their file.
+#[test]
+fn callable_applicability_and_overload_selection_project_occurrence_rows() {
+    let applicability =
+        CodeQuery::from_sexp(r#"(callable-applicability (occurrences :class reference))"#)
+            .expect("callable applicability RQL");
+    assert_eq!(
+        applicability.validate_steps().unwrap(),
+        QueryValueKind::CallableApplicability
+    );
+    assert_eq!(applicability.schema_version, SCHEMA_VERSION);
+
+    let selection = CodeQuery::from_sexp(r#"(overload-selection (occurrences :class reference))"#)
+        .expect("overload selection RQL");
+    assert_eq!(
+        selection.validate_steps().unwrap(),
+        QueryValueKind::OverloadSelection
+    );
+
+    let underscored = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "occurrences": { "class": "reference" },
+        "steps": [{ "op": "overload_selection" }]
+    }));
+    assert_eq!(
+        underscored.validate_steps().unwrap(),
+        QueryValueKind::OverloadSelection
+    );
+    assert_eq!(
+        underscored.to_canonical_json()["steps"][0]["op"],
+        "overload_selection"
+    );
+
+    // Neither step accepts anything but an occurrence: a call-shape row
+    // describes the site's arguments, not the candidates considered for it.
+    for op in ["callable_applicability", "overload_selection"] {
+        let wrong = CodeQuery::from_json(&json!({
+            "match": { "kind": "call" },
+            "steps": [{ "op": "call_shape" }, { "op": op }]
+        }))
+        .unwrap_err();
+        assert!(
+            wrong.message.contains("requires occurrence"),
+            "{op}: {}",
+            wrong.message
+        );
+    }
+
+    for op in ["callable_applicability", "overload_selection"] {
+        let files = parse_ok(json!({
+            "occurrences": { "class": "reference" },
+            "steps": [{ "op": op }, { "op": "file_of" }]
+        }));
+        assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+    }
+}
+
+#[test]
 fn parses_configured_hierarchy_and_member_steps() {
     let query = parse_ok(json!({
         "match": { "kind": "class" },

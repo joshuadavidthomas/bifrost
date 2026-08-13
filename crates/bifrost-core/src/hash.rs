@@ -6,8 +6,15 @@
 //! Hash iteration order is intentionally unspecified; deterministic output must
 //! be produced with `BTree*` collections or explicit sorting at boundaries.
 
+#[cfg(not(feature = "randomized-hash"))]
 pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+#[cfg(feature = "randomized-hash")]
+pub type HashMap<K, V> = std::collections::HashMap<K, V>;
+
+#[cfg(not(feature = "randomized-hash"))]
 pub type HashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
+#[cfg(feature = "randomized-hash")]
+pub type HashSet<T> = std::collections::HashSet<T>;
 
 pub fn map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
     HashMap::with_capacity_and_hasher(capacity, Default::default())

@@ -445,11 +445,9 @@ fn is_dead_code_candidate(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> boo
     if language == Language::Kotlin && kotlin_implicit_entry_point(analyzer, code_unit) {
         return false;
     }
-    if analyzer
-        .signature_metadata(code_unit)
-        .iter()
-        .any(crate::analyzer::SignatureMetadata::is_declaration_only)
-    {
+    if crate::analyzer::SignatureMetadata::unit_is_declaration_only(
+        &analyzer.signature_metadata(code_unit),
+    ) {
         return false;
     }
     matches!(

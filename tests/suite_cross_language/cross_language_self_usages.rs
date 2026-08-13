@@ -241,3 +241,51 @@ fn python_recursive_method_usage() {
         &[3, 6],
     );
 }
+
+// Issue #1753: free-function declaration names must not leak into the
+// editor reference result when a recursive call is retained.
+
+#[test]
+fn csharp_recursive_free_function_usage() {
+    assert_usage_lines(
+        "free.cs",
+        "static class Free {\n    static void <caret>target(int n) {\n        if (n > 0) target(n - 1);\n    }\n    static void caller() { target(1); }\n}\n",
+        &[2, 4],
+    );
+}
+
+#[test]
+fn php_recursive_free_function_usage() {
+    assert_usage_lines(
+        "free.php",
+        "<?php\nfunction <caret>target($n) {\n    if ($n > 0) { target($n - 1); }\n}\ntarget(1);\n",
+        &[2, 4],
+    );
+}
+
+#[test]
+fn scala_recursive_free_function_usage() {
+    assert_usage_lines(
+        "free.scala",
+        "object Free {\n  def <caret>target(n: Int): Unit = {\n    if n > 0 then target(n - 1)\n  }\n  def caller(): Unit = target(1)\n}\n",
+        &[2, 4],
+    );
+}
+
+#[test]
+fn javascript_recursive_free_function_usage() {
+    assert_usage_lines(
+        "free.js",
+        "function <caret>target(n) {\n  if (n > 0) target(n - 1);\n}\ntarget(1);\n",
+        &[1, 3],
+    );
+}
+
+#[test]
+fn typescript_recursive_free_function_usage() {
+    assert_usage_lines(
+        "free.ts",
+        "function <caret>target(n: number): void {\n  if (n > 0) target(n - 1);\n}\ntarget(1);\n",
+        &[1, 3],
+    );
+}

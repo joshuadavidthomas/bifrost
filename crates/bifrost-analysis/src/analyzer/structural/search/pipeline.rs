@@ -82,6 +82,10 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallShape(_)
                     | PipelineValue::CallArgumentGroup(_)
                     | PipelineValue::CallArgument(_)
+                    | PipelineValue::CallableSignature(_)
+                    | PipelineValue::SignatureParameter(_)
+                    | PipelineValue::CallableApplicability(_)
+                    | PipelineValue::OverloadSelection(_)
                     | PipelineValue::MemberSelection(_)
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
@@ -146,6 +150,10 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallShape(_)
                                 | PipelineValue::CallArgumentGroup(_)
                                 | PipelineValue::CallArgument(_)
+                                | PipelineValue::CallableSignature(_)
+                                | PipelineValue::SignatureParameter(_)
+                                | PipelineValue::CallableApplicability(_)
+                                | PipelineValue::OverloadSelection(_)
                                 | PipelineValue::MemberSelection(_)
                                 | PipelineValue::Occurrence(_)
                                 | PipelineValue::LexicalScope(_)
@@ -218,6 +226,10 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallShape(_)
                         | PipelineValue::CallArgumentGroup(_)
                         | PipelineValue::CallArgument(_)
+                        | PipelineValue::CallableSignature(_)
+                        | PipelineValue::SignatureParameter(_)
+                        | PipelineValue::CallableApplicability(_)
+                        | PipelineValue::OverloadSelection(_)
                         | PipelineValue::MemberSelection(_)
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
@@ -1273,6 +1285,26 @@ pub(super) fn apply_pipeline_step(
                     value.report.site.file.clone(),
                 ))]
             }
+            (PipelineValue::CallableApplicability(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.occurrence.file.clone(),
+                ))]
+            }
+            (PipelineValue::OverloadSelection(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.occurrence.file.clone(),
+                ))]
+            }
+            (PipelineValue::CallableSignature(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::SignatureParameter(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
             (PipelineValue::CallShape(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.report.outcome.file.clone(),
@@ -1751,6 +1783,15 @@ pub(super) fn apply_pipeline_step(
                 Some(value.row.ast_id()),
                 matches!(step, QueryStep::DispatchTargets),
             ),
+            (PipelineValue::Declaration(declaration), QueryStep::CallableSignature) => {
+                callable_signature::callable_signature_expansions_for_declaration(
+                    analyzer,
+                    declaration,
+                )
+            }
+            (PipelineValue::CallableSignature(value), QueryStep::SignatureParameters) => {
+                callable_signature::signature_parameter_expansions(value)
+            }
             (PipelineValue::CallShape(value), QueryStep::CallArgumentGroups) => {
                 call_shape::call_argument_group_expansions(value)
             }
@@ -1979,6 +2020,24 @@ pub(super) fn apply_pipeline_step(
                 cancellation,
                 matches!(step, QueryStep::FamilyEdges),
             ),
+            (PipelineValue::Occurrence(value), QueryStep::CallableApplicability) => {
+                applicability::callable_applicability_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    cancellation,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::OverloadSelection) => {
+                applicability::overload_selection_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    cancellation,
+                    &mut row_exhausted,
+                )
+            }
             (PipelineValue::Occurrence(value), QueryStep::MemberSelection) => {
                 member_selection_expansions(
                     analyzer,
@@ -2195,6 +2254,39 @@ pub(super) fn apply_pipeline_step(
                     .filter_map(|link| link.implementation.as_ref())
                     .filter_map(|implementation| indexed.get(analyzer, implementation))
                     .map(|found| pipeline_expansion(PipelineValue::Declaration(found)))
+                    .collect()
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::StubsOf) => {
+                // The inverse of `implementation-of` (#1660): the linkage is
+                // derived per file, and a stub links only within its own file,
+                // so the implementation's file holds every link that answers.
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::IMPLEMENTATION_QUERY_AXES,
+                    diagnostics,
+                );
+                result
+                    .links
+                    .iter()
+                    .filter(|link| link.implementation.as_ref() == Some(&declaration.unit))
+                    .filter_map(|link| {
+                        result
+                            .states
+                            .iter()
+                            .position(|state| state.unit == link.stub)
+                    })
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
                     .collect()
             }
             (PipelineValue::Export(value), QueryStep::ExportTarget) => {

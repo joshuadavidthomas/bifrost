@@ -127,13 +127,13 @@ fn gc_trigger_math_uses_combined_registry_growth() {
     analyzer
         .register_blobs(&[a, b], "python", generation)
         .unwrap();
-    let skipped = cache_gc::maybe_gc_for_analyzer(&analyzer, &repo).unwrap();
+    let skipped = cache_gc::maybe_gc_for_analyzer(&analyzer, &repo, &root).unwrap();
     assert!(!skipped.ran);
     assert_eq!(cache_gc::total_blob_count_for_test(&db_path).unwrap(), 2);
 
     let c = Oid::hash_object(ObjectType::Blob, b"c").unwrap();
     put_semantic(&semantic, c, [7; 32]);
-    let swept = cache_gc::maybe_gc_for_analyzer(&analyzer, &repo).unwrap();
+    let swept = cache_gc::maybe_gc_for_analyzer(&analyzer, &repo, &root).unwrap();
     assert!(swept.ran);
     assert_eq!(swept.total_blobs_after, 0);
     assert_eq!(cache_gc::total_blob_count_for_test(&db_path).unwrap(), 0);
@@ -192,7 +192,7 @@ fn forced_gc_sweeps_both_families_in_one_pass() {
     put_semantic(&semantic, reachable, [8; 32]);
     put_semantic(&semantic, unreachable, [9; 32]);
 
-    let outcome = cache_gc::force_gc_for_analyzer(&analyzer, &repo).unwrap();
+    let outcome = cache_gc::force_gc_for_analyzer(&analyzer, &repo, &root).unwrap();
     assert!(outcome.ran);
     assert!(analyzer.contains_blob(reachable, "python").unwrap());
     assert!(!analyzer.contains_blob(unreachable, "python").unwrap());

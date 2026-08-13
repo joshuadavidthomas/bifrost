@@ -515,7 +515,7 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
             write!(writer, " :language-kind {}", quoted(kind))?;
         }
         SemanticValueKind::Local
-        | SemanticValueKind::Receiver
+        | SemanticValueKind::Receiver { .. }
         | SemanticValueKind::Return
         | SemanticValueKind::Temporary
         | SemanticValueKind::Constant
@@ -1688,6 +1688,7 @@ mod tests {
             ),
             kind: super::super::ir::SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            discharge: super::super::ir::SemanticGapDischarge::None,
             detail: "bounded target proof".into(),
             source: SourceMappingId::new(2),
             evidence: EvidenceId::new(3),
@@ -1911,7 +1912,7 @@ mod tests {
             },
             SemanticValue {
                 id: super::super::ids::ValueId::new(1),
-                kind: SemanticValueKind::Receiver,
+                kind: SemanticValueKind::Receiver { dispatch: true },
                 source,
                 evidence,
             },
@@ -1981,6 +1982,7 @@ mod tests {
             ),
             kind: super::super::ir::SemanticGapKind::Unsupported,
             budget: None,
+            discharge: super::super::ir::SemanticGapDischarge::None,
             detail,
             source,
             evidence,

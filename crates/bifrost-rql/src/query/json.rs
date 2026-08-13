@@ -605,6 +605,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::Generates
         | QueryStep::GeneratedBy
         | QueryStep::ImplementationOf
+        | QueryStep::StubsOf
         | QueryStep::ExportTarget
         | QueryStep::EdgeTarget
         | QueryStep::SegmentTarget
@@ -612,7 +613,11 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ReceiverEvidence
         | QueryStep::CallShape
         | QueryStep::CallArgumentGroups
-        | QueryStep::CallArguments => {}
+        | QueryStep::CallArguments
+        | QueryStep::CallableSignature
+        | QueryStep::SignatureParameters
+        | QueryStep::CallableApplicability
+        | QueryStep::OverloadSelection => {}
         QueryStep::MemberSelection
         | QueryStep::CandidateHierarchy
         | QueryStep::DispatchOutcome

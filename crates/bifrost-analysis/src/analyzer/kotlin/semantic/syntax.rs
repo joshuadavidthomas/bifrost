@@ -1,6 +1,6 @@
 //! Structured reads of the Kotlin syntax tree needed by semantic lowering.
 //!
-//! The vendored grammar is field-poor: only `if_expression` names its
+//! The Kotlin grammar is field-poor: only `if_expression` names its
 //! condition/consequence/alternative, and only `function_declaration`,
 //! `property_declaration`, and `function_type` name a `receiver`. Everything
 //! else — the callee of a call, the operand of a postfix operator, the binding

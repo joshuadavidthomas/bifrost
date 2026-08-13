@@ -2,8 +2,8 @@ use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    cpp_export_macro_token, cpp_field_declaration_linkage, cpp_template_term, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -11,6 +11,7 @@ use crate::graph_support::CppSource;
 use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
 };
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm,
@@ -26,6 +27,7 @@ use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::cell::OnceCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(any(test, feature = "test-support"))]
@@ -42,6 +44,7 @@ pub enum TargetKind {
     Method,
     GlobalField,
     MemberField,
+    Macro,
 }
 
 pub enum LexicalTypeResolution {
@@ -399,8 +402,7 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner_resolution = type_owner_resolution(analyzer, target)
-                .or_else(|| target_forward_owner_resolution(analyzer, target));
+            let owner_resolution = target_type_owner_resolution(analyzer, target);
             let owner_is_forward_declaration = owner_resolution
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
@@ -428,6 +430,17 @@ impl TargetSpec {
             );
             spec.owner_is_forward_declaration = owner_is_forward_declaration;
             return Some(spec);
+        }
+
+        if target.is_macro() {
+            return Some(Self::new(
+                target.clone(),
+                TargetKind::Macro,
+                None,
+                target.identifier().to_string(),
+                None,
+                None,
+            ));
         }
 
         None
@@ -627,6 +640,7 @@ pub struct OrdinaryTypeImport {
     pub scope_start: usize,
     pub scope_end: usize,
     pub scope_depth: usize,
+    pub block_scope: bool,
     pub lexical_depth: usize,
     pub declaration_namespace: Vec<String>,
     pub namespace_scope: Option<Vec<String>>,
@@ -1501,6 +1515,66 @@ impl<'a> VisibilityIndex<'a> {
         self.macro_environment(file, before_byte)
             .binding(name)
             .is_some()
+    }
+
+    pub fn macro_name_may_be_bound_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+    ) -> bool {
+        self.macro_environment(file, before_byte).may_bind(name)
+    }
+
+    /// Whether the active macro binding at this reference is the requested
+    /// indexed definition. Name equality alone is not enough because two
+    /// headers can define the same macro for different translation units.
+    pub fn macro_binding_matches_target_at(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+        target: &CodeUnit,
+    ) -> bool {
+        let environment = self.macro_environment(file, before_byte);
+        let Some(binding) = environment.binding(name) else {
+            return false;
+        };
+        // A normal header guard makes the replacement text conditional, but
+        // it does not erase the definition site's source and byte identity.
+        // Keep that identity even when expansion details are not exact.
+        if binding.source != *target.source() {
+            return false;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(target.source()) else {
+            return false;
+        };
+        analyzer.ranges(target).iter().any(|range| {
+            let Some(mut node) = node_for_exact_range(prepared.tree().root_node(), range) else {
+                return false;
+            };
+            while !matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+                let Some(parent) = node.parent() else {
+                    return false;
+                };
+                node = parent;
+            }
+            node.start_byte() == binding.declaration_byte
+        })
+    }
+
+    /// Whether this target is an indexed macro visible from this file.
+    ///
+    /// An unresolved conditional can make more than one same-name macro a
+    /// possible active binding. Each possible target can keep the site as an
+    /// unproven hit. A macro in an unrelated translation unit stays excluded.
+    pub fn macro_target_is_visible_candidate(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+        self.visible_identifier_candidates(file, target.identifier())
+            .filter(|candidate| candidate.is_macro())
+            .any(|candidate| {
+                candidate.source() == target.source() && candidate.fq_name() == target.fq_name()
+            })
     }
 
     pub fn object_macro_replacement_at(
@@ -3491,6 +3565,46 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    /// Resolve a base class through its injected class name at the nearest
+    /// inheritance tier. Distinct same-named bases at that tier are ambiguous.
+    pub fn inherited_injected_class_owner(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        enclosing_owner: &CodeUnit,
+        injected_name: &str,
+    ) -> Option<CodeUnit> {
+        let hierarchy = analyzer.type_hierarchy_provider()?;
+        let mut frontier = hierarchy.get_direct_ancestors(enclosing_owner);
+        let mut visited = HashSet::default();
+        while !frontier.is_empty() {
+            let mut level_matches = Vec::new();
+            let mut next_frontier = Vec::new();
+            for raw_owner in frontier {
+                let owner = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)?;
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                if owner.identifier() == injected_name
+                    && !level_matches
+                        .iter()
+                        .any(|existing| same_logical_symbol(existing, &owner))
+                {
+                    level_matches.push(owner.clone());
+                }
+                next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+            if let Some(first) = level_matches.first() {
+                return level_matches
+                    .iter()
+                    .all(|candidate| same_logical_symbol(candidate, first))
+                    .then(|| first.clone());
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
+
     /// The one type the candidates name under `resolution`, or why they do not
     /// name one. The two preserving modes only ever reject candidates that
     /// disagree with each other, which is ambiguity; canonicalization can also
@@ -3853,6 +3967,54 @@ impl<'a> VisibilityIndex<'a> {
                 )
             }
         }
+    }
+
+    /// Return true when a class-owned alias names the requested type as one
+    /// structured qualifier in its target path.
+    ///
+    /// A dependent target such as `Primary<T>::Type` cannot resolve to one
+    /// indexed class. Forward lookup can still retain `Primary` as its bounded
+    /// canonical identity. Inverse lookup needs the same evidence when later
+    /// references use only the alias spelling.
+    pub fn structured_class_alias_path_preserves_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(owner) = type_owner_of(analyzer, alias).filter(CodeUnit::is_class) else {
+            return false;
+        };
+        let Some(StructuredAliasTarget::Named {
+            components, global, ..
+        }) = self.structured_alias_target(analyzer, alias)
+        else {
+            return false;
+        };
+        let lexical_scope = canonical_cpp_scope_components(&owner);
+        (1..components.len()).rev().any(|component_count| {
+            matches!(
+                self.resolve_type_components_lexically_for_target(
+                    analyzer,
+                    visible_from,
+                    &components[..component_count],
+                    global,
+                    &lexical_scope,
+                    target,
+                ),
+                LexicalTypeResolution::Resolved {
+                    ref unit,
+                    ref candidates,
+                    ..
+                } if same_visible_symbol(unit, target)
+                    || self.same_template_member_identity(analyzer, unit, target)
+                    || candidates.iter().any(|candidate| {
+                        same_visible_symbol(candidate, target)
+                            || self.same_template_member_identity(analyzer, candidate, target)
+                    })
+            )
+        })
     }
 
     fn flattened_macro_namespace_alias_target_matches(
@@ -5520,7 +5682,41 @@ fn sort_lookup_units(units: &mut [CodeUnit]) {
             .cmp(&right.fq_name())
             .then_with(|| left.signature().cmp(&right.signature()))
             .then_with(|| left.source().cmp(right.source()))
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| {
+                left.package_segment_count()
+                    .cmp(&right.package_segment_count())
+            })
+            .then_with(|| left.is_synthetic().cmp(&right.is_synthetic()))
+            .then_with(|| stable_fq_name_cmp(left.fq(), right.fq()))
     });
+}
+
+fn stable_fq_name_cmp(left: &FqName, right: &FqName) -> CmpOrdering {
+    let interner = segment_interner();
+    for (&left_id, &right_id) in left.segments().iter().zip(right.segments()) {
+        let (left_text, left_kind) = interner.resolve(left_id);
+        let (right_text, right_kind) = interner.resolve(right_id);
+        let order = left_text
+            .cmp(right_text)
+            .then_with(|| segment_kind_order(left_kind).cmp(&segment_kind_order(right_kind)));
+        if order != CmpOrdering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+const fn segment_kind_order(kind: SegmentKind) -> u8 {
+    match kind {
+        SegmentKind::Path => 0,
+        SegmentKind::Package => 1,
+        SegmentKind::Type => 2,
+        SegmentKind::Companion => 3,
+        SegmentKind::Nested => 4,
+        SegmentKind::Member => 5,
+        SegmentKind::Unknown => 6,
+    }
 }
 
 fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
@@ -5560,7 +5756,8 @@ pub fn cpp_reference_fqn_candidates(reference: &str, kind: TargetKind) -> Vec<St
             TargetKind::FreeFunction
             | TargetKind::Method
             | TargetKind::GlobalField
-            | TargetKind::MemberField => {
+            | TargetKind::MemberField
+            | TargetKind::Macro => {
                 push_cpp_fqn_candidate(&mut candidates, &package, &rest.join("."));
                 if rest.len() > 1 {
                     let owner = rest[..rest.len() - 1].join("$");
@@ -6362,7 +6559,9 @@ pub fn preprocessor_conditional_family_range(
     let node = root.descendant_for_byte_range(start_byte, end_byte)?;
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             return Some((family.start_byte(), family.end_byte()));
         }
@@ -6374,7 +6573,9 @@ pub fn preprocessor_conditional_family_range(
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             if preprocessor_conditional_family_has_terminal_else(family) {
                 return Some(family);
@@ -6425,6 +6626,7 @@ pub fn preprocessor_guard_environment(
             conditional.kind(),
             "preproc_if" | "preproc_ifdef" | "preproc_elif"
         ) && !is_file_covering_include_guard(conditional, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
@@ -6468,6 +6670,14 @@ fn preprocessor_guard_for_descendant(
         guard = guard.negated();
     }
     Some(guard)
+}
+
+fn preprocessor_conditional_contains_descendant(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+) -> bool {
+    cpp_displaced_preprocessor_terminator(conditional)
+        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
 }
 
 pub fn merge_preprocessor_guards(
@@ -6691,6 +6901,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
             && !is_file_covering_include_guard(conditional, source)
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
                 return false;
@@ -7921,8 +8132,12 @@ fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a st
 }
 
 fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    let descendant = node;
     while let Some(parent) = node.parent() {
-        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+        if is_preprocessor_conditional(parent)
+            && !is_file_covering_include_guard(parent, source)
+            && preprocessor_conditional_contains_descendant(parent, descendant)
+        {
             return true;
         }
         node = parent;
@@ -8623,10 +8838,57 @@ pub struct QualifiedOwnerComponents<'tree> {
     pub global: bool,
 }
 
+/// True when each structured qualifier on the callable-name path has a real
+/// `::` token. A macro-prefixed return type can make tree-sitter insert a
+/// zero-width missing separator and parse `TYPE Result<T> method()` as the
+/// false qualified declarator `Result<T>::method`.
+pub fn qualified_name_has_concrete_scope_separators(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    let mut found_separator = false;
+    while let Some(current) = stack.pop() {
+        if !matches!(
+            current.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            continue;
+        }
+        let mut current_has_separator = false;
+        for index in 0..current.child_count() {
+            let Some(child) = current.child(index) else {
+                continue;
+            };
+            if child.kind() == "::" {
+                if child.is_missing() {
+                    return false;
+                }
+                current_has_separator = true;
+                found_separator = true;
+            }
+        }
+        if !current_has_separator {
+            return false;
+        }
+        for field in ["scope", "name"] {
+            if let Some(child) = current.child_by_field_name(field)
+                && matches!(
+                    child.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                )
+            {
+                stack.push(child);
+            }
+        }
+    }
+    found_separator
+}
+
 pub fn qualified_owner_components<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<QualifiedOwnerComponents<'tree>> {
+    if !qualified_name_has_concrete_scope_separators(node) {
+        return None;
+    }
     let mut nodes = cpp_name_component_nodes(node)?;
     nodes.pop()?;
     if nodes.is_empty() {
@@ -9652,6 +9914,7 @@ pub fn matches_kind_for_lookup(unit: &CodeUnit, kind: TargetKind) -> bool {
         | TargetKind::MemberField => true,
         TargetKind::FreeFunction => unit.is_function(),
         TargetKind::GlobalField => unit.is_field(),
+        TargetKind::Macro => unit.is_macro(),
     }
 }
 
@@ -9912,6 +10175,16 @@ fn type_owner_resolution(
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
 }
 
+fn target_type_owner_resolution(
+    analyzer: &CppGraphSource<'_>,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    match type_owner_resolution(analyzer, code_unit) {
+        Some(owner) if !owner.is_forward_declaration => Some(owner),
+        Some(_) | None => target_forward_owner_resolution(analyzer, code_unit),
+    }
+}
+
 /// Recover method identity for an indexed out-of-line definition when the
 /// analyzer has retained only its unique include-visible class forward
 /// declaration. This is deliberately target-only: canonical declaration
@@ -10022,13 +10295,13 @@ fn precise_parent_resolution(
                     unit: owner,
                     is_forward_declaration: false,
                 }),
-                FullOwnerResolution::None if forwards.len() == 1 => {
-                    forwards.into_iter().next().map(|unit| ResolvedTypeOwner {
+                FullOwnerResolution::None => {
+                    unique_logical_forward_owner(forwards).map(|unit| ResolvedTypeOwner {
                         unit,
                         is_forward_declaration: true,
                     })
                 }
-                FullOwnerResolution::None | FullOwnerResolution::Ambiguous => None,
+                FullOwnerResolution::Ambiguous => None,
             }
         }
         DirectOwnerResolution::None => {
@@ -10255,6 +10528,19 @@ pub fn collapse_owner_candidates(
     } else {
         DirectOwnerResolution::None
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn unique_logical_forward_owner_for_test(forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    unique_logical_forward_owner(forwards)
+}
+
+fn unique_logical_forward_owner(mut forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    let first = forwards.pop()?;
+    forwards
+        .iter()
+        .all(|forward| same_logical_symbol(forward, &first))
+        .then_some(first)
 }
 
 pub fn cpp_class_declaration_strength(
@@ -10573,6 +10859,162 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_lookup_units_totally_orders_every_identity_field() {
+        let file = ProjectFile::new(std::env::temp_dir(), "issue_1876.cpp");
+        let base = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let different_kind = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Field,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let synthetic = base.with_synthetic(true);
+
+        let interner = segment_interner();
+        let mut member_fq = FqName::new();
+        member_fq.push(interner.intern("scope", SegmentKind::Package));
+        member_fq.push(interner.intern("value", SegmentKind::Member));
+        let different_package_boundary = CodeUnit::from_fq(
+            file.clone(),
+            CodeUnitType::Function,
+            member_fq,
+            0,
+            Some("()".to_string()),
+            false,
+        );
+
+        let mut unknown_fq = FqName::new();
+        unknown_fq.push(interner.intern("scope", SegmentKind::Package));
+        unknown_fq.push(interner.intern("value", SegmentKind::Unknown));
+        let different_segment_kind = CodeUnit::from_fq(
+            file,
+            CodeUnitType::Function,
+            unknown_fq,
+            1,
+            Some("()".to_string()),
+            false,
+        );
+
+        let input = vec![
+            base,
+            different_kind,
+            synthetic,
+            different_package_boundary,
+            different_segment_kind,
+        ];
+        let mut expected = input.clone();
+        sort_lookup_units(&mut expected);
+        assert!(expected.windows(2).all(|pair| {
+            let mut ordered = pair.to_vec();
+            sort_lookup_units(&mut ordered);
+            ordered == pair && pair[0] != pair[1]
+        }));
+
+        let mut reversed = input.clone();
+        reversed.reverse();
+        sort_lookup_units(&mut reversed);
+        assert_eq!(reversed, expected);
+
+        let mut rotated = input;
+        rotated.rotate_left(2);
+        sort_lookup_units(&mut rotated);
+        assert_eq!(rotated, expected);
+    }
+
+    #[test]
+    fn displaced_preprocessor_terminator_bounds_the_real_guard() {
+        let damaged = "#ifndef API_H\n#define API_H\nextern char option_buffer[\n#ifdef FEATURE_X\n    16 +\n#endif\n    1];\n\nvoid target(void);\n#endif\n";
+        let guarded = "#ifdef FEATURE_X\nvoid target(void);\n#endif\n";
+        let parse = |source: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("C++ grammar");
+            parser.parse(source, None).expect("fixture tree")
+        };
+
+        let tree = parse(damaged);
+        let root = tree.root_node();
+        let target = damaged.find("target").expect("target byte");
+        let declaration = root
+            .descendant_for_byte_range(target, target + "target".len())
+            .and_then(|mut node| {
+                loop {
+                    if node.kind() == "declaration" {
+                        break Some(node);
+                    }
+                    node = node.parent()?;
+                }
+            })
+            .expect("declaration after the displaced terminator");
+        let conditional = declaration
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("damaged inner conditional");
+        let outer = conditional
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary outer include guard");
+        let terminator = cpp_displaced_preprocessor_terminator(conditional)
+            .expect("structured displaced #endif");
+        assert_eq!(node_text(terminator, damaged), "#endif");
+        assert!(terminator.end_byte() <= declaration.start_byte());
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+        assert!(cpp_displaced_preprocessor_terminator(outer).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            outer,
+            declaration
+        ));
+
+        let tree = parse(guarded);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary conditional");
+        let declaration = conditional
+            .named_children(&mut conditional.walk())
+            .find(|node| node.kind() == "declaration")
+            .expect("guarded declaration");
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+
+        let damaged_alternative = format!(
+            "#ifndef NO_FEATURE\nvoid enabled(void) {{}}\n#else\nvoid disabled(void) {{\n{}\n}}\n#endif\n",
+            "UNUSED(value)\n".repeat(64)
+        );
+        let tree = parse(&damaged_alternative);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("outer conditional with an alternative");
+        assert!(conditional.has_error());
+        assert!(conditional.child_by_field_name("alternative").is_some());
+        assert!(
+            conditional
+                .child(conditional.child_count() - 1)
+                .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
+        );
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+    }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
         let mut parser = Parser::new();

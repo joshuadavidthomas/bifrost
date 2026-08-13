@@ -36,10 +36,12 @@ use brokk_bifrost_cpp::graph_support::CppSource;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     BareCallTargetResolution as CppBareCallTargetResolution,
+    BlockUsingCallTargetResolution as CppBlockUsingCallTargetResolution,
     LexicalScopeResolution as CppLexicalScopeResolution,
     enclosing_lexical_scope_components as cpp_enclosing_lexical_scope_components,
     initialized_ordinary_type_imports as cpp_initialized_effective_using_imports,
     resolve_bare_call_target as cpp_resolve_bare_call_target,
+    resolve_block_using_call_target as cpp_resolve_block_using_call_target,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
     CallArityEvidence, CppTemplateResolutionError,
@@ -186,7 +188,8 @@ pub(crate) fn dead_code_bulk_eligibility(
         | TargetKind::FreeFunction
         | TargetKind::Method
         | TargetKind::GlobalField
-        | TargetKind::MemberField => CppDeadCodeBulkEligibility::NeedsPrecise,
+        | TargetKind::MemberField
+        | TargetKind::Macro => CppDeadCodeBulkEligibility::NeedsPrecise,
     }
 }
 

@@ -286,7 +286,7 @@ fn is_excluded_reference_candidate(
 
     match language {
         Language::Cpp => cpp_is_range_for_binding_name(node),
-        Language::Go => is_go_declaration_name(node),
+        Language::Go => go_is_declaration_or_import_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
         Language::Rust => is_rust_associated_type_declaration_name(node),
         Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
@@ -304,11 +304,23 @@ fn is_js_ts_export_alias(node: Node<'_>) -> bool {
             .is_some_and(|alias| alias == node)
 }
 
-fn is_go_declaration_name(node: Node<'_>) -> bool {
+/// Whether a Go identifier occupies a declaration or import binding role.
+///
+/// The reference frontier excludes these roles directly. The census keeps its
+/// raw identifier superset, then the differential engine uses this helper to
+/// remove declaration sites that have no indexed CodeUnit name range (#969).
+pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         (matches!(
             parent.kind(),
-            "field_declaration" | "type_alias" | "type_spec" | "import_spec" | "package_clause"
+            "field_declaration"
+                | "type_alias"
+                | "type_spec"
+                | "import_spec"
+                | "package_clause"
+                | "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "type_parameter_declaration"
         ) && node_is_field(parent, node, "name"))
             || (parent.kind() == "package_clause"
                 && matches!(node.kind(), "identifier" | "package_identifier"))
@@ -742,7 +754,7 @@ type Repository struct {
 type Query struct{}
 type Alias = Query
 
-func use(repository Repository) Alias {
+func use(repository Repository) (result Alias) {
     return repository.Query
 }
 "#;
@@ -753,6 +765,7 @@ func use(repository Repository) Alias {
             field_declaration,
             source.find("Query struct").expect("query type"),
             source.find("Alias =").expect("type alias"),
+            source.find("result Alias").expect("named result"),
         ];
         for declaration in declarations {
             assert!(
@@ -768,6 +781,7 @@ func use(repository Repository) Alias {
                 .find("repository Repository")
                 .expect("parameter type")
                 + "repository ".len(),
+            source.find("result Alias").expect("result type") + "result ".len(),
             source.rfind("Query").expect("member reference"),
         ];
         for reference in references {

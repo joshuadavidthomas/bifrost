@@ -206,6 +206,20 @@ class DerivedWidget extends Widget {
 }
 "#;
 
+const MAGIC_WIDGET_BASE_SRC: &str = r#"<?php
+namespace Vendor\Widget;
+
+class MagicWidgetBase {
+    public function __call(string $name, array $arguments): mixed { return null; }
+}
+"#;
+
+const MAGIC_WIDGET_SRC: &str = r#"<?php
+namespace Vendor\Widget;
+
+class MagicWidget extends MagicWidgetBase {}
+"#;
+
 /// A subclass whose base belongs to a package this fixture never installs.
 const ORPHAN_WIDGET_SRC: &str = r#"<?php
 namespace Vendor\Widget;
@@ -238,6 +252,8 @@ fn widget_package() -> PackageSpec {
             ("src/Sizeable.php", TRAIT_SRC),
             ("src/SizedWidget.php", SIZED_WIDGET_SRC),
             ("src/DerivedWidget.php", DERIVED_WIDGET_SRC),
+            ("src/MagicWidgetBase.php", MAGIC_WIDGET_BASE_SRC),
+            ("src/MagicWidget.php", MAGIC_WIDGET_SRC),
             ("src/OrphanWidget.php", ORPHAN_WIDGET_SRC),
             ("legacy/Vendor_Widget_Legacy.php", LEGACY_SRC),
             ("helpers.php", HELPERS_SRC),
@@ -454,6 +470,41 @@ class App {
                 ) && proof.boundary == BoundaryStatus::ExternalIndexed
         )),
         "{:#?}",
+        report.outcomes()
+    );
+}
+
+#[test]
+fn a_vendor_magic_call_reports_dynamic_behavior_instead_of_a_false_error() {
+    let fixture = ComposerFixture::new(
+        &[widget_package()],
+        &[(
+            "src/App.php",
+            r#"<?php
+namespace App;
+
+use Vendor\Widget\MagicWidget;
+
+class App {
+    public function run(MagicWidget $widget): void {
+        $widget->runtimeMethod();
+    }
+}
+"#,
+        )],
+    );
+    let (analyzer, _project) = fixture.activated();
+
+    let report = fixture.report_for(&analyzer, "src/App.php");
+
+    assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+    assert!(
+        has_incomplete_reason(&report, |reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::DynamicBehavior { detail }
+                if detail.contains("__call")
+        )),
+        "the vendor hook must be the typed reason for the incomplete result: {:#?}",
         report.outcomes()
     );
 }

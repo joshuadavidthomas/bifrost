@@ -25,9 +25,9 @@ use super::{
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
     ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
-    SemanticWork,
+    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue,
+    SemanticValueKind, SemanticWork,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -978,6 +978,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
                             exact_external_target: None,
+                            unmaterialized_external_target: None,
                             proof: candidate.proof,
                             completeness,
                             provenance,
@@ -1843,13 +1844,36 @@ fn materialize_exit_profile(
         .map(|(reachable, reaches_exit)| reachable && reaches_exit)
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    // An implicit-exception gap whose abort paths run no user code cannot
+    // move a value into or past the NORMAL exit: the missing edges only
+    // remove abort paths, so they cannot weaken the normal profile (#1952).
+    // The exceptional profile always keeps the gap: whether this procedure
+    // can reach its exceptional exit decides whether a caller's handler is
+    // reachable at all, and the missing edges are exactly that reachability.
+    let abort_user_code =
+        crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(semantics);
     let is_return_gap = |gap: &SemanticGap| {
+        // A gap that declares a call-resolution discharge asks a question the
+        // resolution and binding path always answers: an unresolved call
+        // surfaces as a dispatch boundary, and a resolved callee that defers
+        // evaluation carries its own procedure-level gap into its exit
+        // profile and bindings (#1989). It must not weaken this caller's
+        // exit profile a second time.
+        if gap.discharge == SemanticGapDischarge::CallResolution {
+            return false;
+        }
         let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
         let scoped_to_return_path = match gap.subject {
             SemanticGapSubject::Procedure => true,
             _ => path_mask.get(gap.point.index()).copied() == Some(true),
         };
-        return_affecting && scoped_to_return_path
+        return_affecting
+            && scoped_to_return_path
+            && !(kind == ReturnTransferKind::Normal
+                && crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+                    gap,
+                    abort_user_code,
+                ))
     };
     let is_matched_return_gap =
         |gap: &SemanticGap| is_return_gap(gap) && gap_affects_matched_return(gap, kind);
@@ -2632,6 +2656,7 @@ mod tests {
             impacts,
             kind: SemanticGapKind::Unproven,
             budget: None,
+            discharge: SemanticGapDischarge::None,
             detail: "caller-side evaluation is incomplete".into(),
             source: call.source,
             evidence: call.evidence,
@@ -3351,8 +3376,11 @@ end
             .expect("TypeScript exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
-        assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
-        assert_eq!(dispatch.coverage(), CandidateCoverage::Open);
+        // The resolver proved the imported target as the complete receiverless
+        // target set, which discharges the adapter's blanket rebinding gap
+        // (#1952): the outcome is complete, and no unresolved boundary remains.
+        assert!(matches!(&outcome, SemanticOutcome::Complete { .. }));
+        assert_eq!(dispatch.coverage(), CandidateCoverage::Exhaustive);
         assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
         assert!(matches!(
             &dispatch.candidates()[0].proof,
@@ -3371,11 +3399,7 @@ end
                 .as_str(),
             "target.ts"
         );
-        assert!(dispatch.boundaries().iter().any(|boundary| {
-            boundary.kind == DispatchBoundaryKind::Unresolved
-                && matches!(&boundary.proof, ProofStatus::Unproven(_))
-                && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
-        }));
+        assert!(dispatch.boundaries().is_empty(), "{dispatch:#?}");
     }
 
     #[test]
@@ -4090,12 +4114,27 @@ void raii_caller() {
             validate_call_transfer_set(&caller, semantic_call, &mismatched_exceptional).is_err(),
             "exceptional continuations must match the semantic call"
         );
+        // The resolved receiverless call retains no boundary of its own since
+        // the resolver-proven target set discharges the blanket rebinding gap
+        // (#1952), so fabricate one with a foreign origin to prove the
+        // validator still rejects boundary origins from another call.
+        assert!(transfer_set.boundaries.is_empty(), "{transfer_set:#?}");
         let mut mismatched_boundary = transfer_set.clone();
-        mismatched_boundary
-            .boundaries
-            .first_mut()
-            .expect("TypeScript open-world boundary")
-            .origin = other_call;
+        mismatched_boundary.boundaries = vec![CallBoundary {
+            origin: other_call,
+            dispatch: DispatchBoundary {
+                kind: DispatchBoundaryKind::Unresolved,
+                exact_external_target: None,
+                unmaterialized_external_target: None,
+                proof: ProofStatus::Unproven("fabricated foreign-origin boundary".into()),
+                completeness: EvidenceCompleteness::Partial(
+                    "fabricated foreign-origin boundary".into(),
+                ),
+                provenance: Box::new([]),
+            },
+            model: CallToReturnModel::NormalAndExceptional,
+        }]
+        .into_boxed_slice();
         assert!(
             validate_call_transfer_set(&caller, semantic_call, &mismatched_boundary).is_err(),
             "boundary origins must identify the requested call"
@@ -4216,10 +4255,26 @@ void raii_caller() {
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("target procedure");
         let semantics = target.semantics();
-        let return_gaps = semantics
+        // The exit profile discharges implicit-abort gaps when no abort path
+        // runs user code (#1952); the expected reasons below apply the same
+        // rule. The raw gap set still retains the exceptional-flow gap, which
+        // the direct assertions on `all_gaps` pin.
+        let abort_user_code =
+            crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(semantics);
+        let all_gaps = semantics
             .gaps()
             .iter()
             .filter(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+            .collect::<Vec<_>>();
+        let return_gaps = all_gaps
+            .iter()
+            .copied()
+            .filter(|gap| {
+                !crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+                    gap,
+                    abort_user_code,
+                )
+            })
             .collect::<Vec<_>>();
         assert!(
             return_gaps.iter().any(|gap| {
@@ -4229,11 +4284,11 @@ void raii_caller() {
             "async lowering must retain its suspension gap: {return_gaps:#?}"
         );
         assert!(
-            return_gaps.iter().any(|gap| {
+            all_gaps.iter().any(|gap| {
                 gap.capability == SemanticCapability::ExceptionalControlFlow
                     && gap.kind == SemanticGapKind::Unsupported
             }),
-            "assignment must retain its exceptional-flow gap: {return_gaps:#?}"
+            "assignment must retain its exceptional-flow gap: {all_gaps:#?}"
         );
         let aggregate_reason = return_gaps
             .iter()
@@ -4287,7 +4342,17 @@ void raii_caller() {
             profile.matched_return_affecting_gap_reason(),
             Some(matched_reason.as_str())
         );
-        let expected_text_bytes = aggregate_reason.len().saturating_add(matched_reason.len());
+        // The profile charges the matched reason only when it differs from the
+        // aggregate; after the implicit-abort discharge (#1952) the two can
+        // coincide.
+        let expected_text_bytes =
+            aggregate_reason
+                .len()
+                .saturating_add(if matched_reason == aggregate_reason {
+                    0
+                } else {
+                    matched_reason.len()
+                });
         assert_eq!(outcome.work().owned_text_bytes, expected_text_bytes);
         assert_eq!(budget.used(), outcome.work());
 

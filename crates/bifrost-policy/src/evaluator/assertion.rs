@@ -1015,6 +1015,37 @@ fn evaluate_relational_assertion_policy(
     let mut query_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut executed = Vec::with_capacity(binding_queries.len());
     let mut total_work: Option<CodeQueryExecutionWork> = None;
+
+    /// Whether this row states that the producer suppressed the row *set* it
+    /// heads, which is a different question from whether one of its fields is
+    /// unknown.
+    ///
+    /// A relational assertion counts rows, so it is sensitive to a set that is
+    /// empty because nobody could read it rather than because it is genuinely
+    /// empty. A call shape whose coverage is not `exact` is exactly that case:
+    /// the derivation deliberately emits zero argument-group and zero argument
+    /// rows for it (#1478 Milestone 1) so that a macro-expanded argument list
+    /// can never be byte-identical to a real zero-argument call. Counting those
+    /// absent rows and passing an exact cardinality would report the confident
+    /// answer the coverage field exists to prevent, so the run is inconclusive
+    /// instead.
+    ///
+    /// This is deliberately *not* the same judgement as the match-selector
+    /// path's per-row `selected_site_quality`. A row whose own coverage is
+    /// partial about the world it describes -- an open member-selection
+    /// candidate set, an undecided candidate verdict, an `unknown_shape`
+    /// overload summary -- still publishes exact values in its own fields and
+    /// still emits every row it heads, and poisoning a whole run because one
+    /// site in the file was undecidable would make almost every relational
+    /// policy inconclusive. A policy that must exclude undecided rows filters
+    /// them with `:where`, which is what the winning-tier sugar lowers to.
+    fn suppressed_row_set(item: &CodeQueryResultItem) -> bool {
+        match &item.value {
+            CodeQueryResultValue::CallShape { value } => value.coverage != "exact",
+            _ => false,
+        }
+    }
+
     for query in &binding_queries {
         // A binding that expands into a semantic row family (the #1477
         // dispatch rows) needs the generation-bound workspace oracles. Use
@@ -1038,6 +1069,9 @@ fn evaluate_relational_assertion_policy(
             &outcome.result.completion(),
             outcome.result.truncated,
         ));
+        if outcome.result.results.iter().any(suppressed_row_set) {
+            run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        }
         run_failures.extend(failure_reasons(&outcome.result.completion()));
         query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
         total_work = Some(match total_work {

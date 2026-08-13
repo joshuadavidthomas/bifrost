@@ -350,4 +350,61 @@ fun caller(service: Service) { service.run() }
     assert_eq!(member.owner.fq_name(), "Service");
     assert_eq!(member.hierarchy_depth, 0);
     assert_eq!(member.dispatch_tier, MemberDispatchTier::InherentOrDirect);
+
+    // The deferral now points at real evidence (#1478 M3): the same check that
+    // discarded the candidate said which end of its declared arity range the
+    // call missed.
+    let callable = row
+        .callable
+        .expect("a candidate the applicability check refused states why");
+    assert_eq!(callable.verdict.label(), "inapplicable");
+    assert_eq!(
+        callable.reason.map(|reason| reason.label()),
+        Some("arity_below_required"),
+        "a zero-argument call cannot reach a one-parameter method: {rows:?}"
+    );
+}
+
+/// The winner carries the verdict from the very check that admitted it, and a
+/// property is undecidable rather than applicable: what a property holds
+/// decides whether it can be called, not the property's own declaration.
+#[test]
+fn the_selected_overload_carries_the_verdict_that_admitted_it() {
+    let rows = member_candidates(
+        r#"class Service {
+    fun run(first: Int) {}
+}
+fun caller(service: Service) { service.run(1) }
+"#,
+        "run",
+        1,
+    );
+    let selected = rows
+        .iter()
+        .find(|row| row.is_selected() && fq_name(row) == "Service.run")
+        .unwrap_or_else(|| panic!("the accepting overload is selected: {rows:?}"));
+    let callable = selected
+        .callable
+        .expect("a candidate the applicability check admitted states so");
+    assert_eq!(callable.verdict.label(), "applicable");
+    assert_eq!(callable.reason, None, "an admitted candidate has no reason");
+
+    let property = member_candidates(
+        r#"class Service {
+    val run: (Int) -> Unit = {}
+}
+fun caller(service: Service) { service.run(1) }
+"#,
+        "run",
+        1,
+    );
+    let selected = property
+        .iter()
+        .find(|row| row.is_selected() && fq_name(row) == "Service.run")
+        .unwrap_or_else(|| panic!("the property is selected: {property:?}"));
+    assert_eq!(
+        selected.callable.map(|callable| callable.verdict.label()),
+        Some("unknown"),
+        "a property's own declaration does not decide the call shape: {property:?}"
+    );
 }

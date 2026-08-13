@@ -1549,6 +1549,7 @@ mod tests {
                     end_byte: 9,
                 }),
                 subtree_end: 1,
+                call_site: None,
             }],
             CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),
@@ -1586,6 +1587,7 @@ mod tests {
                         end_byte: start_byte + "Shared".len(),
                     }),
                     subtree_end: index as u32 + 1,
+                    call_site: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -1829,6 +1831,7 @@ mod tests {
                     end_byte: identifier.len(),
                 }),
                 subtree_end: 1,
+                call_site: None,
             }],
             CompactRows::from_parts(vec![0, 0], Vec::new()),
             CompactRows::from_parts(vec![0, 0], Vec::new()),

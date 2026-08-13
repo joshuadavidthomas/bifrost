@@ -35,14 +35,14 @@ pub fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let start = node.start_byte();
-    if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
+    if is_member_field_own_declarator(node, ctx) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
-    if !same_logical_symbol(&enclosing, &ctx.spec.target) {
+    if !same_logical_symbol(&enclosing, &ctx.spec.target) || is_target_declaration_name(node, ctx) {
         return;
     }
     insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);

@@ -527,6 +527,44 @@ mod tests {
         ));
     }
 
+    /// The inverse linkage step (#1660): an implementation answers with
+    /// exactly its own declaration-only stub state rows, walking the same
+    /// link rows `implementation-of` walks forward.
+    #[test]
+    fn stubs_of_executes_end_to_end() {
+        let fixture = Fixture::new(
+            Language::Python,
+            "over.py",
+            "from typing import overload\n\
+             @overload\n\
+             def parse(value: int) -> int: ...\n\
+             @overload\n\
+             def parse(value: str) -> str: ...\n\
+             def parse(value):\n    return value\n",
+        );
+        let result = fixture.run("(stubs-of (enclosing-decl (function)))");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let stubs: Vec<_> = result
+            .results
+            .iter()
+            .map(|row| match &row.value {
+                CodeQueryResultValue::DeclarationState { value } => {
+                    (value.fq_name.clone(), value.declaration_only)
+                }
+                other => panic!("expected declaration-state rows: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            stubs,
+            vec![
+                ("over.parse".to_string(), true),
+                ("over.parse".to_string(), true),
+            ],
+            "{:?}",
+            result.results
+        );
+    }
+
     /// The unclaimed-language abstention arrives as a typed diagnostic, never
     /// as a silently empty complete answer.
     #[test]

@@ -70,6 +70,10 @@ pub enum QueryValueKind {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    CallableSignature,
+    SignatureParameter,
+    CallableApplicability,
+    OverloadSelection,
     MemberSelection,
     DispatchOutcome,
     DispatchTarget,
@@ -111,6 +115,10 @@ impl QueryValueKind {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::CallableSignature => "callable_signature",
+            Self::SignatureParameter => "signature_parameter",
+            Self::CallableApplicability => "callable_applicability",
+            Self::OverloadSelection => "overload_selection",
             Self::MemberSelection => "member_selection",
             Self::DispatchOutcome => "dispatch_outcome",
             Self::DispatchTarget => "dispatch_target",
@@ -266,6 +274,10 @@ pub enum QueryStep {
     CallShape,
     CallArgumentGroups,
     CallArguments,
+    CallableSignature,
+    SignatureParameters,
+    CallableApplicability,
+    OverloadSelection,
     MemberSelection,
     DispatchOutcome,
     DispatchTargets,
@@ -291,6 +303,7 @@ pub enum QueryStep {
     GeneratedBy,
     DeclarationStateOf(DeclarationStateFilter),
     ImplementationOf,
+    StubsOf,
     ExportTarget,
 }
 
@@ -752,6 +765,10 @@ impl QueryStep {
             Self::CallShape => QueryStepOp::CallShape,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
+            Self::CallableSignature => QueryStepOp::CallableSignature,
+            Self::SignatureParameters => QueryStepOp::SignatureParameters,
+            Self::CallableApplicability => QueryStepOp::CallableApplicability,
+            Self::OverloadSelection => QueryStepOp::OverloadSelection,
             Self::MemberSelection => QueryStepOp::MemberSelection,
             Self::DispatchOutcome => QueryStepOp::DispatchOutcome,
             Self::DispatchTargets => QueryStepOp::DispatchTargets,
@@ -771,6 +788,7 @@ impl QueryStep {
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
             Self::ImplementationOf => QueryStepOp::ImplementationOf,
+            Self::StubsOf => QueryStepOp::StubsOf,
             Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
             Self::EdgesOf(_) => QueryStepOp::EdgesOf,
@@ -826,6 +844,10 @@ impl QueryStep {
             QueryStepOp::CallShape => Some(Self::CallShape),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
+            QueryStepOp::CallableSignature => Some(Self::CallableSignature),
+            QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
+            QueryStepOp::CallableApplicability => Some(Self::CallableApplicability),
+            QueryStepOp::OverloadSelection => Some(Self::OverloadSelection),
             QueryStepOp::MemberSelection => Some(Self::MemberSelection),
             QueryStepOp::DispatchOutcome => Some(Self::DispatchOutcome),
             QueryStepOp::DispatchTargets => Some(Self::DispatchTargets),
@@ -855,6 +877,7 @@ impl QueryStep {
                 Some(Self::DeclarationStateOf(DeclarationStateFilter::default()))
             }
             QueryStepOp::ImplementationOf => Some(Self::ImplementationOf),
+            QueryStepOp::StubsOf => Some(Self::StubsOf),
             QueryStepOp::ExportTarget => Some(Self::ExportTarget),
         }
     }
@@ -906,6 +929,10 @@ impl QueryStep {
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
+                | QueryValueKind::CallableSignature
+                | QueryValueKind::SignatureParameter
+                | QueryValueKind::CallableApplicability
+                | QueryValueKind::OverloadSelection
                 | QueryValueKind::MemberSelection
                 | QueryValueKind::DispatchOutcome
                 | QueryValueKind::DispatchTarget
@@ -975,6 +1002,18 @@ impl QueryStep {
             }
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
+            }
+            (Self::CallableSignature, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::CallableSignature)
+            }
+            (Self::SignatureParameters, QueryValueKind::CallableSignature) => {
+                Some(QueryValueKind::SignatureParameter)
+            }
+            (Self::CallableApplicability, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::CallableApplicability)
+            }
+            (Self::OverloadSelection, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::OverloadSelection)
             }
             (Self::MemberSelection, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::MemberSelection)
@@ -1047,6 +1086,7 @@ impl QueryStep {
                 Self::ImplementationOf,
                 QueryValueKind::Declaration | QueryValueKind::DeclarationState,
             ) => Some(QueryValueKind::Declaration),
+            (Self::StubsOf, QueryValueKind::Declaration) => Some(QueryValueKind::DeclarationState),
             (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
             (Self::EdgesOf(_), QueryValueKind::Declaration) => Some(QueryValueKind::ReferenceEdge),
             (Self::EdgesFrom(_), QueryValueKind::Occurrence) => Some(QueryValueKind::ReferenceEdge),
@@ -1122,6 +1162,9 @@ pub(super) fn validate_query_steps(
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
+            QueryStep::CallableSignature => "declaration",
+            QueryStep::SignatureParameters => "callable_signature",
+            QueryStep::CallableApplicability | QueryStep::OverloadSelection => "occurrence",
             QueryStep::MemberSelection => "occurrence",
             QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
                 "structural_match, call_site, reference_site, or occurrence"
@@ -1147,6 +1190,7 @@ pub(super) fn validate_query_steps(
             QueryStep::GeneratedBy => "declaration or declaration_state",
             QueryStep::DeclarationStateOf(_) => "declaration",
             QueryStep::ImplementationOf => "declaration_state or declaration",
+            QueryStep::StubsOf => "declaration",
             QueryStep::ExportTarget => "export",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {

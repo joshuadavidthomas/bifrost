@@ -27,6 +27,7 @@ pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;
 pub mod imports;
+pub mod local_bindings;
 pub mod mixins;
 pub mod queries;
 pub mod structural;

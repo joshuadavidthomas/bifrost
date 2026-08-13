@@ -4,7 +4,7 @@ use std::sync::Barrier;
 use std::time::Instant;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, PathQuality,
+    DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SolverBudget,
     SolverTermination, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey,
     SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
@@ -3427,22 +3427,11 @@ fn real_summary_solver_executes_the_same_client_contract() {
             )
     }));
     let report = collect_summary_findings(&fixture.protocol, &fixture.bindings, &result).unwrap();
-    assert!(!report.analysis_complete());
-    assert_eq!(report.findings().len(), 1);
-    assert_eq!(
-        report.findings()[0].certainty(),
-        TypestateFindingCertainty::Inconclusive
-    );
-    assert!(matches!(
-        report.findings()[0].kind(),
-        TypestateFindingKind::TerminalExpectation { .. }
-    ));
-    assert!(!report.findings()[0].evidence().analysis_complete());
-    assert_eq!(report.findings()[0].witnesses().len(), 1);
-    assert_eq!(
-        report.findings()[0].witnesses()[0].witness().quality(),
-        PathQuality::UNPROVEN_PARTIAL
-    );
+    // The receiverless calls resolve to proven free functions since #1952,
+    // so the analysis closes and the satisfied terminal expectation no longer
+    // reports the inconclusive placeholder finding.
+    assert!(report.analysis_complete());
+    assert!(report.findings().is_empty(), "{:#?}", report.findings());
 }
 
 #[test]
@@ -3457,7 +3446,9 @@ fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
             Language::TypeScript,
             "src/main.ts",
             TYPE_SCRIPT_CONFORMANCE_SOURCE,
-            false,
+            // Receiverless free-function dispatch resolves completely since
+            // #1952, matching Java's already-complete lifecycle.
+            true,
         ),
         (
             Language::Java,
@@ -3843,7 +3834,8 @@ fn recursive_helper_summary_carries_typestate_back_to_the_caller() {
         }),
         "close must transition the recursively returned used state to closed: {exit_facts:#?}",
     );
-    assert!(!summary.is_complete());
+    // Recursive free-function dispatch resolves completely since #1952.
+    assert!(summary.is_complete());
 }
 
 #[test]
@@ -4108,10 +4100,13 @@ fn must_mode_does_not_promote_event_specific_markers_without_universal_proof() {
         .collect::<Vec<_>>();
 
     assert!(!error_findings.is_empty());
+    // The straight-line fixture's dispatch resolves completely since #1952,
+    // so the error transitions carry universal proof and promote to Must.
     assert!(
         error_findings
             .iter()
-            .all(|finding| { finding.certainty() == TypestateFindingCertainty::Inconclusive })
+            .all(|finding| { finding.certainty() == TypestateFindingCertainty::Must }),
+        "{error_findings:#?}"
     );
 }
 

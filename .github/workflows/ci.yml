@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   ci-impact:
@@ -425,7 +425,9 @@ jobs:
         run: node scripts/ci-timing.mjs --label agent-plugin-launcher -- node --test plugins/bifrost-agent/test/launcher.test.mjs
 
       - name: Validate manifests
-        run: node scripts/ci-timing.mjs --label agent-plugin-manifests -- node scripts/check-codex-plugin-manifest.mjs
+        run: |
+          node scripts/ci-timing.mjs --label agent-plugin-v1 -- node scripts/check-agent-plugins-v1.mjs
+          node scripts/ci-timing.mjs --label agent-plugin-manifests -- node scripts/check-codex-plugin-manifest.mjs
 
   external-fixture:
     name: ${{ matrix.name }} fixture provenance

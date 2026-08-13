@@ -7,6 +7,7 @@
 //! `parse_and_collect` are the shared, language-agnostic driver.
 
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
@@ -80,9 +81,13 @@ where
     let scan = PythonEdgeScan::new(nodes, targets);
     with_python_graph_source(analyzer, |graph| {
         build_edge_output(&files, keep_file, |file| {
-            parse_and_collect(analyzer, file, nodes, &language, |input| {
-                scan.scan_file(&graph, py, file, input)
-            })
+            parse_and_collect(
+                analyzer,
+                file,
+                nodes,
+                ParseSpec::whole(&language),
+                |input| scan.scan_file(&graph, py, file, input),
+            )
         })
     })
 }

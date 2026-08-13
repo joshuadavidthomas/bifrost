@@ -16,6 +16,9 @@ use crate::analyzer::semantic::ContentIdentity;
 use crate::compact_graph::CompactRows;
 use crate::text_utils::compute_line_starts;
 use bincode::Options;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallShapeCoverage, CallSiteFacts,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -31,7 +34,13 @@ use std::fmt;
 /// models), so their merge is version 5.
 /// Version 6 adds source-backed facts parsed from opaque regions, initially
 /// Python deferred annotation strings (#1570).
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 6;
+/// Version 7 adds the per-call-site classification a language spec reads from
+/// its own grammar node: refined call kind, argument-shape coverage, and
+/// whether the site continues its callee's argument-list sequence (#1478).
+/// Version 8 makes TypeScript's bodiless callable declarations facts:
+/// `function_signature`, `method_signature`, and `abstract_method_signature`
+/// normalize as callables, so declaration-only stubs are addressable (#1658).
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -64,6 +73,14 @@ struct SnapshotNode {
     parent: Option<u32>,
     name: Option<SnapshotSpan>,
     subtree_end: u32,
+    call_site: Option<SnapshotCallSite>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SnapshotCallSite {
+    call_kind: Option<u8>,
+    coverage: u8,
+    continues_callee_groups: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -185,6 +202,58 @@ fn decode_role(code: u8) -> Result<Role, StructuralSnapshotError> {
     }
 }
 
+fn call_kind_code(kind: CallKind) -> u8 {
+    use CallKind::*;
+    match kind {
+        Function => 0,
+        Method => 1,
+        Constructor => 2,
+        Extractor => 3,
+        Infix => 4,
+        Operator => 5,
+        MethodValue => 6,
+    }
+}
+
+fn decode_call_kind(code: u8) -> Result<CallKind, StructuralSnapshotError> {
+    use CallKind::*;
+    match code {
+        0 => Ok(Function),
+        1 => Ok(Method),
+        2 => Ok(Constructor),
+        3 => Ok(Extractor),
+        4 => Ok(Infix),
+        5 => Ok(Operator),
+        6 => Ok(MethodValue),
+        _ => Err(StructuralSnapshotError::invalid(format!(
+            "unknown call kind code {code}"
+        ))),
+    }
+}
+
+fn call_coverage_code(coverage: CallShapeCoverage) -> u8 {
+    use CallShapeCoverage::*;
+    match coverage {
+        Exact => 0,
+        Partial => 1,
+        UnknownMacroDerived => 2,
+        UnknownDynamic => 3,
+    }
+}
+
+fn decode_call_coverage(code: u8) -> Result<CallShapeCoverage, StructuralSnapshotError> {
+    use CallShapeCoverage::*;
+    match code {
+        0 => Ok(Exact),
+        1 => Ok(Partial),
+        2 => Ok(UnknownMacroDerived),
+        3 => Ok(UnknownDynamic),
+        _ => Err(StructuralSnapshotError::invalid(format!(
+            "unknown call shape coverage code {code}"
+        ))),
+    }
+}
+
 fn occurrence_role_code(role: OccurrenceRole) -> u8 {
     use OccurrenceRole::*;
     match role {
@@ -274,6 +343,13 @@ pub struct NormalizedNode {
     /// stored in pre-order, so descendants are exactly
     /// `(self_id + 1)..subtree_end`.
     pub subtree_end: u32,
+    /// What the language spec's grammar says about this call site (#1478):
+    /// refined call kind, argument-shape coverage, and whether the site
+    /// continues its callee's argument-list sequence. Always `None` for a
+    /// node that is not a [`NormalizedKind::Call`], and `None` for a call
+    /// whose adapter does not refine call sites — the derivation layer then
+    /// keeps the receiver-derived baseline rather than guessing.
+    pub call_site: Option<CallSiteFacts>,
 }
 
 impl NormalizedNode {
@@ -346,6 +422,11 @@ impl FileFacts {
                     parent: node.parent,
                     name: node.name.map(encode_span).transpose()?,
                     subtree_end: node.subtree_end,
+                    call_site: node.call_site.map(|facts| SnapshotCallSite {
+                        call_kind: facts.call_kind.map(call_kind_code),
+                        coverage: call_coverage_code(facts.coverage),
+                        continues_callee_groups: facts.continues_callee_groups,
+                    }),
                 })
             })
             .collect::<Result<Vec<_>, StructuralSnapshotError>>()?;
@@ -450,9 +531,20 @@ impl FileFacts {
                     "structural node {id} name is outside its node span"
                 )));
             }
+            let call_site = node
+                .call_site
+                .map(|facts| {
+                    Ok::<_, StructuralSnapshotError>(CallSiteFacts {
+                        call_kind: facts.call_kind.map(decode_call_kind).transpose()?,
+                        coverage: decode_call_coverage(facts.coverage)?,
+                        continues_callee_groups: facts.continues_callee_groups,
+                    })
+                })
+                .transpose()?;
             nodes.push(NormalizedNode {
                 kind: decode_kind(node.kind)?,
                 construct: node.construct,
+                call_site,
                 range: Range {
                     start_byte: span.start_byte,
                     end_byte: span.end_byte,
@@ -652,6 +744,7 @@ mod tests {
             parent: None,
             name: None,
             subtree_end: 1,
+            call_site: None,
         }
     }
 
@@ -673,6 +766,7 @@ mod tests {
                     end_byte: 1,
                 }),
                 subtree_end: 2,
+                call_site: None,
             },
             NormalizedNode {
                 kind: NormalizedKind::Identifier,
@@ -689,6 +783,7 @@ mod tests {
                     end_byte: 4,
                 }),
                 subtree_end: 2,
+                call_site: None,
             },
         ];
         let mut roles = CompactRowsBuilder::with_capacity(2, 2);
@@ -880,6 +975,7 @@ mod tests {
                 parent: None,
                 name: None,
                 subtree_end: 1,
+                call_site: None,
             }],
             role_offsets: vec![0, 0],
             roles: vec![],
@@ -898,6 +994,7 @@ mod tests {
                 parent: None,
                 name: None,
                 subtree_end: 1,
+                call_site: None,
             }],
             role_offsets: vec![0, 2],
             roles: vec![SnapshotRoleTarget {
@@ -939,6 +1036,7 @@ mod tests {
                 parent: None,
                 name: None,
                 subtree_end: 1,
+                call_site: None,
             }],
             role_offsets: vec![0, 0],
             roles: vec![],
@@ -978,6 +1076,7 @@ mod tests {
                 parent: None,
                 name: Some(SnapshotSpan { start: 3, end: 7 }),
                 subtree_end: 1,
+                call_site: None,
             }],
             role_offsets: vec![0, 0],
             roles: vec![],

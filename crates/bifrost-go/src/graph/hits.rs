@@ -1,7 +1,7 @@
-use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
 };
+use brokk_bifrost_core::analyzer::{CodeUnit, Range};
 use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
 use tree_sitter::Node;
 
@@ -16,9 +16,10 @@ pub(crate) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         start_line: find_line_index_for_offset(ctx.line_starts, start),
         end_line: find_line_index_for_offset(ctx.line_starts, end),
     };
-    let Some(enclosing) = ctx.code_units.enclosing_code_unit(ctx.file, &range) else {
-        return;
-    };
+    let enclosing = ctx
+        .code_units
+        .enclosing_code_unit(ctx.file, &range)
+        .unwrap_or_else(|| CodeUnit::file_scope(ctx.file.clone()));
     // A reference whose enclosing declaration is a *callable* target is a
     // recursive call (#1638): recorded, then classified `SelfReceiver`, so
     // editor find-references lists it while the external usage surface omits
@@ -68,9 +69,10 @@ pub(crate) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         start_line: find_line_index_for_offset(ctx.line_starts, start),
         end_line: find_line_index_for_offset(ctx.line_starts, end),
     };
-    let Some(enclosing) = ctx.code_units.enclosing_code_unit(ctx.file, &range) else {
-        return;
-    };
+    let enclosing = ctx
+        .code_units
+        .enclosing_code_unit(ctx.file, &range)
+        .unwrap_or_else(|| CodeUnit::file_scope(ctx.file.clone()));
     if enclosing == ctx.spec.target {
         return;
     }

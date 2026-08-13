@@ -76,11 +76,13 @@ pub(crate) fn call_dispatch_equivalence_source(
 }
 
 /// A dispatch arm that has no workspace procedure target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CallDispatchBoundaryKind {
     /// Resolution proved that the referenced declaration crosses the indexed
-    /// workspace boundary, but cannot name an external body.
-    External,
+    /// workspace boundary, but cannot name an external body. The dotted callee
+    /// text is retained when the resolver produced one, so a fully-qualified
+    /// unmaterialized external callee can still bind an activated summary (#1978).
+    External(Option<Box<str>>),
     /// The exact resolver status is retained rather than collapsed into an
     /// empty target list.
     Unresolved(DefinitionLookupStatus),
@@ -950,8 +952,14 @@ fn apply_dispatch_outcome_with_flags(
         mut definitions,
         lexical_definition: _,
         diagnostics,
-        reference: _,
+        reference,
     } = outcome;
+    // The dotted syntactic callee text (`java.net.URLDecoder.decode`) is the only
+    // identity an unmaterialized external callee leaves behind, so retain it on
+    // the external boundary instead of dropping it (#1978).
+    let external_callee_text: Option<Box<str>> = reference
+        .as_ref()
+        .map(|reference| Box::<str>::from(reference.text.as_str()));
     let unproven_target_identity = structure_unavailable || unproven_link_unit;
     let partial_external_boundary = diagnostics
         .iter()
@@ -974,7 +982,9 @@ fn apply_dispatch_outcome_with_flags(
         lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
     }
     if partial_external_boundary {
-        lookup.boundaries.push(CallDispatchBoundaryKind::External);
+        lookup.boundaries.push(CallDispatchBoundaryKind::External(
+            external_callee_text.clone(),
+        ));
     }
     if partial_unresolved_import {
         lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
@@ -1030,16 +1040,43 @@ fn apply_dispatch_outcome_with_flags(
                 .push(CallDispatchBoundaryKind::Unresolved(status));
         }
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
-        DefinitionLookupStatus::UnresolvableImportBoundary => {
-            lookup.boundaries.push(CallDispatchBoundaryKind::External)
+        DefinitionLookupStatus::UnresolvableImportBoundary => lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::External(external_callee_text)),
+        // #1978: a fully-qualified callee with no workspace or classpath
+        // definition (`java.net.URLDecoder.decode`) is external, not merely
+        // unresolvable. Java classifies it `NoDefinition` rather than
+        // `UnresolvableImportBoundary`, so route only that fully-qualified subset
+        // to the external boundary that can carry an activated summary. Every
+        // other `NoDefinition` -- an unqualified or single-segment callee -- keeps
+        // its unresolved boundary, so the classification blast radius is limited
+        // to fully-qualified external callees.
+        DefinitionLookupStatus::NoDefinition => {
+            match external_callee_text.filter(|text| is_fully_qualified_callee(text)) {
+                Some(text) => lookup
+                    .boundaries
+                    .push(CallDispatchBoundaryKind::External(Some(text))),
+                None => lookup
+                    .boundaries
+                    .push(CallDispatchBoundaryKind::Unresolved(status)),
+            }
         }
-        DefinitionLookupStatus::NoDefinition
-        | DefinitionLookupStatus::UnsupportedLanguage
+        DefinitionLookupStatus::UnsupportedLanguage
         | DefinitionLookupStatus::InvalidLocation
         | DefinitionLookupStatus::NotFound => lookup
             .boundaries
             .push(CallDispatchBoundaryKind::Unresolved(status)),
     }
+}
+
+/// Whether `callee_text` is a fully-qualified external callee whose owner is a
+/// dotted FQN present verbatim (`java.net.URLDecoder.decode`), the only shape in
+/// scope for unmaterialized external summary binding (#1978). An unqualified
+/// (`trim`) or single-segment (`URLDecoder.decode`) callee needs import or type
+/// resolution and is excluded.
+fn is_fully_qualified_callee(callee_text: &str) -> bool {
+    crate::analyzer::semantic::split_qualified_member(callee_text)
+        .is_some_and(|(owner, _member)| owner.contains('.'))
 }
 
 fn call_hits(
@@ -1516,7 +1553,7 @@ mod tests {
         );
         assert_eq!(
             lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External],
+            vec![CallDispatchBoundaryKind::External(Some("work".into()))],
             "{lookup:#?}"
         );
     }
@@ -2189,7 +2226,7 @@ object Calls {
         assert_eq!(
             partial_ambiguous.boundaries,
             vec![
-                CallDispatchBoundaryKind::External,
+                CallDispatchBoundaryKind::External(None),
                 CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
             ]
         );
@@ -2230,7 +2267,7 @@ object Calls {
         );
         assert_eq!(
             external.boundaries,
-            vec![CallDispatchBoundaryKind::External]
+            vec![CallDispatchBoundaryKind::External(None)]
         );
 
         for status in [

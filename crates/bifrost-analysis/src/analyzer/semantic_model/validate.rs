@@ -1191,6 +1191,7 @@ impl Validator {
             CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
                 CaptureCardinality::Many
             }
+            CaptureSource::OwnedUninitializedFinalFields => CaptureCardinality::Group,
             CaptureSource::Argument { .. } | CaptureSource::AnnotationArgument { .. } => {
                 CaptureCardinality::Optional
             }
@@ -1225,7 +1226,8 @@ impl Validator {
             | CaptureSource::EnclosingDeclaration
             | CaptureSource::OwningType
             | CaptureSource::OwnedFields
-            | CaptureSource::OwnedMutableFields => true,
+            | CaptureSource::OwnedMutableFields
+            | CaptureSource::OwnedUninitializedFinalFields => true,
         };
         if !compatible {
             self.error(
@@ -1262,6 +1264,19 @@ impl Validator {
             );
             self.template_type(
                 &format!("{path}.parameters[{index}].type"),
+                &parameter.r#type,
+                captures,
+            );
+        }
+        for (index, parameter) in signature.repeated_parameters.iter().enumerate() {
+            self.template(
+                &format!("{path}.repeated_parameters[{index}].name"),
+                &parameter.name,
+                captures,
+                TemplatePosition::LanguageName,
+            );
+            self.template_type(
+                &format!("{path}.repeated_parameters[{index}].type"),
                 &parameter.r#type,
                 captures,
             );
@@ -1772,5 +1787,6 @@ fn capture_cardinality_name(cardinality: CaptureCardinality) -> &'static str {
         CaptureCardinality::One => "one",
         CaptureCardinality::Optional => "optional",
         CaptureCardinality::Many => "many",
+        CaptureCardinality::Group => "group",
     }
 }

@@ -10,16 +10,18 @@ use sha2::{Digest, Sha256};
 
 use super::WorkspaceSemanticOracle;
 use crate::analyzer::semantic::{
-    CallSiteHandle, CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator,
-    DeclarationSegment, DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind,
-    DispatchCandidate, DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness,
-    EvidenceHandle, ExactExternalProcedureTarget, OracleLimits, OracleRelationArena,
-    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError,
+    CallSiteHandle, CallableTarget, CallableTargetResolution, CancellationToken, CandidateCoverage,
+    ContentIdentity, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
+    DispatchBoundary, DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility,
+    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
+    ExactExternalProcedureTarget, OracleLimits, OracleRelationArena, OracleRelationId,
+    OracleRelationOwner, OracleRelationRecord, OracleRelationSubject, ProcedureHandle,
+    ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded,
+    SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome, SemanticProviderError,
     SemanticRequest, SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceSpan,
-    StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+    StableDigest, UnmaterializedExternalTarget, WorkspaceMountId, WorkspaceRelativePath,
+    split_qualified_member, unmaterialized_external_mount, unmaterialized_external_path,
 };
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
@@ -167,6 +169,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             .semantics()
             .call_site(call.id())
             .ok_or_else(|| SemanticProviderError::internal("semantic call-site handle is stale"))?;
+        let call_language = call.procedure().artifact().key().language();
         let call_dispatch_gap =
             scoped_call_dispatch_gap(call.procedure().semantics(), semantic_call);
         let procedure_call_gap = scoped_procedure_dispatch_gap(call.procedure());
@@ -258,7 +261,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         let mut boundaries = lookup
             .boundaries
             .iter()
-            .map(low_level_boundary)
+            .map(|boundary| low_level_boundary(boundary, call_language, Some(semantic_call)))
             .collect::<Vec<_>>();
         let mut target_groups =
             dispatch_target_groups(self.workspace.analyzer(), lookup.targets).into_iter();
@@ -508,6 +511,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                             semantic_call.receiver.is_some(),
                         )
                     }),
+                    unmaterialized_external_target: None,
                     proof: proof_from_usage(group.proof),
                     completeness: EvidenceCompleteness::Partial(
                         "equivalent callable declarations have no published workspace body".into(),
@@ -552,8 +556,19 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
-        let call_dispatch_gap =
-            call_dispatch_gap.filter(|gap| !closed_dispatch_discharges_gap(&candidates, gap));
+        let call_dispatch_gap = call_dispatch_gap.filter(|gap| {
+            !closed_dispatch_discharges_gap(&candidates, gap)
+                && !proven_static_target_discharges_gap(
+                    call.procedure(),
+                    &semantic_call.declared_targets,
+                    semantic_call.receiver.is_none(),
+                    &candidates,
+                    &boundaries,
+                    lookup.status == Some(DefinitionLookupStatus::Resolved),
+                    materialization_quality,
+                    gap,
+                )
+        });
         let gap_exceeded = call_dispatch_gap
             .and_then(|gap| gap.budget)
             .or_else(|| procedure_call_gap.and_then(|gap| gap.budget));
@@ -716,6 +731,89 @@ fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &Semant
                 .dispatch_extensibility
                 == DispatchExtensibility::Closed
         })
+}
+
+/// Whether a statically proven target set discharges an avoidable per-call
+/// dynamic-dispatch gap (#1952).
+///
+/// Several adapters publish a blanket `Unknown` dynamic-dispatch gap on every
+/// call site -- "complete target coverage requires lexical and value-flow
+/// refinement" -- including calls whose target is statically known. The gap is
+/// answered, and must not open the run, in exactly two proven situations:
+/// the adapter itself proved `declared_targets` and dispatch retained that
+/// target with proven, complete evidence; or the workspace resolver performed
+/// the demanded whole-program refinement and proved a clean result (lookup
+/// resolved, every retained candidate proven and complete, no boundary, no
+/// truncation). `Unsupported`, `Ambiguous`, and `ExceededBudget` gaps keep
+/// standing: they assert something a proven target set does not answer.
+#[allow(clippy::too_many_arguments)]
+fn proven_static_target_discharges_gap(
+    caller: &ProcedureHandle,
+    declared_targets: &CallableTargetResolution,
+    receiverless: bool,
+    candidates: &[DispatchCandidate],
+    boundaries: &[DispatchBoundary],
+    lookup_resolved: bool,
+    materialization_quality: DispatchQuality,
+    gap: &SemanticGap,
+) -> bool {
+    if gap.capability != SemanticCapability::DynamicDispatch
+        || !matches!(
+            gap.kind,
+            SemanticGapKind::Unknown | SemanticGapKind::Unproven
+        )
+        || candidates.is_empty()
+    {
+        return false;
+    }
+    let proven_complete = |candidate: &DispatchCandidate| {
+        matches!(candidate.proof, ProofStatus::Proven)
+            && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+    };
+    if let CallableTargetResolution::Proven(target) = declared_targets
+        && candidates.iter().all(|candidate| {
+            proven_complete(candidate)
+                && candidate_matches_declared_target(caller, candidate, target)
+        })
+    {
+        return true;
+    }
+    // The resolver-proven arm accepts only receiverless calls whose retained
+    // candidates are free functions: a plain function call's target set is
+    // exactly what the whole-program resolver proved. Receiver dispatch and
+    // member candidates (virtual methods, including implicit-object calls
+    // that carry no explicit receiver value) can gain overrides the proven
+    // candidates do not enumerate; those discharge only through the
+    // closed-extensibility rule.
+    receiverless
+        && lookup_resolved
+        && boundaries.is_empty()
+        && materialization_quality == DispatchQuality::Complete
+        && candidates.iter().all(|candidate| {
+            proven_complete(candidate)
+                && matches!(
+                    candidate.target().semantics().kind(),
+                    ProcedureKind::Function | ProcedureKind::LocalFunction
+                )
+        })
+}
+
+fn candidate_matches_declared_target(
+    caller: &ProcedureHandle,
+    candidate: &DispatchCandidate,
+    target: &CallableTarget,
+) -> bool {
+    match target {
+        CallableTarget::Local(id) => {
+            candidate.target().artifact().key() == caller.artifact().key()
+                && candidate.target().id() == *id
+        }
+        CallableTarget::Unmaterialized(locator) | CallableTarget::External(locator) => {
+            let candidate_locator = candidate.target().semantics().locator();
+            candidate_locator.path() == locator.path()
+                && candidate_locator.declaration() == locator.declaration()
+        }
+    }
 }
 
 fn finish_dispatch_interruption(
@@ -1009,9 +1107,11 @@ fn cancelled_lookup_outcome(
         });
     }
 
+    let cancelled_language = call.procedure().artifact().key().language();
+    let cancelled_semantic_call = call.procedure().semantics().call_site(call.id());
     let mut boundaries = low_level_boundaries
         .iter()
-        .map(low_level_boundary)
+        .map(|boundary| low_level_boundary(boundary, cancelled_language, cancelled_semantic_call))
         .collect::<Vec<_>>();
     let resolved_target_groups =
         dispatch_target_groups(workspace.analyzer(), resolved_targets.to_vec());
@@ -1107,6 +1207,7 @@ fn unmaterialized_target_boundary(
             &target.representative,
         )?),
         exact_external_target: None,
+        unmaterialized_external_target: None,
         proof: proof_from_usage(target.proof),
         completeness: EvidenceCompleteness::Partial(reason.into()),
         provenance: Box::new([]),
@@ -1375,20 +1476,48 @@ pub(crate) fn exact_source_for_procedure(
     Ok(Some((file, source)))
 }
 
-fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
+fn low_level_boundary(
+    boundary: &CallDispatchBoundaryKind,
+    language: SemanticLanguage,
+    semantic_call: Option<&SemanticCallSite>,
+) -> DispatchBoundary {
     match boundary {
-        CallDispatchBoundaryKind::External => DispatchBoundary {
-            kind: DispatchBoundaryKind::External(None),
-            exact_external_target: None,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Partial(
-                "external declaration body is outside the indexed workspace".into(),
-            ),
-            provenance: Box::new([]),
-        },
+        // #1978: when the resolver retained a fully-qualified callee text for an
+        // external boundary, synthesize its canonical identity so an activated
+        // authored summary can bind it even though it never materializes.
+        CallDispatchBoundaryKind::External(callee_text) => {
+            match callee_text.as_deref().zip(semantic_call).and_then(
+                |(text, semantic_call)| {
+                    synthetic_unmaterialized_external(text, language, semantic_call)
+                },
+            ) {
+                Some(target) => DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(Some(target.locator().clone())),
+                    exact_external_target: None,
+                    unmaterialized_external_target: Some(target),
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Partial(
+                        "external callee body is outside the indexed workspace; an activated summary supplies its transfers"
+                            .into(),
+                    ),
+                    provenance: Box::new([]),
+                },
+                None => DispatchBoundary {
+                    kind: DispatchBoundaryKind::External(None),
+                    exact_external_target: None,
+                    unmaterialized_external_target: None,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Partial(
+                        "external declaration body is outside the indexed workspace".into(),
+                    ),
+                    provenance: Box::new([]),
+                },
+            }
+        }
         CallDispatchBoundaryKind::Unresolved(status) => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(
                 format!("exact dispatch status is {}", status.as_str()).into(),
             ),
@@ -1400,6 +1529,7 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
         CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(
                 "C/C++ include evidence does not prove one link-unit target identity".into(),
             ),
@@ -1412,10 +1542,67 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
     }
 }
 
+/// Build the canonical identity for a fully-qualified external callee that never
+/// materializes to a workspace or classpath artifact (#1978).
+///
+/// Only fully-qualified callees are in scope: the owner must itself be a dotted
+/// FQN present verbatim in the callee text (`java.net.URLDecoder.decode`).
+/// Instance-method transforms whose owner needs type resolution (`s.trim()`) and
+/// import-qualified calls (`URLDecoder.decode`) are deliberately excluded; they
+/// need type or import resolution that this cut does not perform.
+fn synthetic_unmaterialized_external(
+    callee_text: &str,
+    language: SemanticLanguage,
+    semantic_call: &SemanticCallSite,
+) -> Option<UnmaterializedExternalTarget> {
+    let (owner_fqn, member) = split_qualified_member(callee_text)?;
+    if !owner_fqn.contains('.') {
+        return None;
+    }
+    let arity = u32::try_from(semantic_call.arguments.len()).ok()?;
+    let has_receiver = semantic_call.receiver.is_some();
+    let anchor = zero_source_anchor();
+    let owner_segment =
+        DeclarationSegment::named(DeclarationSegmentKind::Type, owner_fqn, anchor, 0).ok()?;
+    // Arity and receiver shape enter the synthetic declaration, so the locator
+    // distinguishes different-arity overloads of one `owner.member`. Same-arity
+    // overloads that differ only by parameter type cannot be told apart for an
+    // unmaterialized callee, whose parameter types are unrecoverable.
+    let member_kind = if has_receiver {
+        DeclarationSegmentKind::Method
+    } else {
+        DeclarationSegmentKind::Function
+    };
+    let member_segment = DeclarationSegment::named(member_kind, member, anchor, arity).ok()?;
+    let declaration = DeclarationLocator::new(vec![owner_segment, member_segment]).ok()?;
+    let locator = SemanticLocator::new(
+        unmaterialized_external_mount(),
+        unmaterialized_external_path(),
+        language,
+        declaration,
+        SemanticRole::Procedure,
+        anchor,
+    );
+    Some(UnmaterializedExternalTarget::new(
+        owner_fqn,
+        member,
+        arity,
+        has_receiver,
+        locator,
+    ))
+}
+
+fn zero_source_anchor() -> SourceAnchor {
+    let position = SourcePosition::new(0, 0, 0);
+    let span = SourceSpan::new(position, position).expect("zero-width sentinel span is ordered");
+    SourceAnchor::new(span, 0)
+}
+
 fn truncated_dispatch_boundary() -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
         exact_external_target: None,
+        unmaterialized_external_target: None,
         proof: ProofStatus::Unproven("dispatch candidate set was truncated".into()),
         completeness: EvidenceCompleteness::Partial(
             "not every dispatch candidate was retained".into(),
@@ -1549,6 +1736,7 @@ fn apply_dynamic_dispatch_gap(
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
             completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
             provenance: Box::new([]),
@@ -1583,6 +1771,7 @@ fn apply_procedure_call_gap(
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
             completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
             provenance: Box::new([]),
@@ -2204,8 +2393,8 @@ fn compare_locator_fields(left: &SemanticLocator, right: &SemanticLocator) -> Or
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapId, SemanticGapImpact,
-        SemanticGapImpacts,
+        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapDischarge, SemanticGapId,
+        SemanticGapImpact, SemanticGapImpacts,
     };
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
@@ -2545,6 +2734,7 @@ mod tests {
         let boundary = |kind| DispatchBoundary {
             kind,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
             provenance: Box::new([]),
@@ -2657,7 +2847,7 @@ mod tests {
             CancelledLookupArtifacts {
                 resolved_targets: &[],
                 low_level_boundaries: &[
-                    CallDispatchBoundaryKind::External,
+                    CallDispatchBoundaryKind::External(None),
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
                 ],
                 call_dispatch_gap: None,
@@ -2937,6 +3127,7 @@ mod tests {
         let mut boundaries = vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
             completeness: EvidenceCompleteness::Partial("open dispatch".into()),
             provenance: Box::new([]),
@@ -2996,7 +3187,7 @@ mod tests {
             CancelledLookupArtifacts {
                 resolved_targets: &[],
                 low_level_boundaries: &[
-                    CallDispatchBoundaryKind::External,
+                    CallDispatchBoundaryKind::External(None),
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
                 ],
                 call_dispatch_gap: None,
@@ -3049,6 +3240,7 @@ mod tests {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             source: call_row.source,
             evidence: gap_evidence,
@@ -3140,6 +3332,7 @@ mod tests {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target discovery is unsupported".into(),
             source: call_row.source,
             evidence: shared_evidence,
@@ -3148,6 +3341,7 @@ mod tests {
             id: SemanticGapId::new(1),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             ..unsupported_gap.clone()
         };
@@ -3156,6 +3350,7 @@ mod tests {
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
                 exact_external_target: None,
+                unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
                 completeness: EvidenceCompleteness::Partial("open dispatch".into()),
                 provenance: Box::new([]),
@@ -3163,6 +3358,7 @@ mod tests {
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Truncated,
                 exact_external_target: None,
+                unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("dispatch limit reached".into()),
                 completeness: EvidenceCompleteness::Partial("targets were omitted".into()),
                 provenance: Box::new([]),
@@ -3201,6 +3397,7 @@ mod tests {
         let mut boundaries = vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unmaterialized(locator),
             exact_external_target: None,
+            unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
             provenance: Box::new([]),

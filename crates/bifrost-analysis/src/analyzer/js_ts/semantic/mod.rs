@@ -148,6 +148,23 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
             });
             specs[index].captures_receiver &= can_capture_receiver;
         }
+        // A surviving capture ultimately reads the receiver of the nearest
+        // non-lambda ancestor, so that owner must publish its receiver formal
+        // even when its own body never reads `this` directly.
+        for index in 0..specs.len() {
+            if !specs[index].captures_receiver {
+                continue;
+            }
+            let Some(parent) = specs[index].lexical_parent else {
+                continue;
+            };
+            let parent = parent.index();
+            if specs[parent].kind != ProcedureKind::Lambda
+                && procedure_owns_receiver(specs[parent].kind, specs[parent].properties)
+            {
+                specs[parent].owns_receiver = true;
+            }
+        }
         if cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,

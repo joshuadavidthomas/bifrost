@@ -522,11 +522,7 @@ fn resolve_direct_named_exported_fqn(
         }
         let module_unit = resolve_module_code_unit(python, &module)?;
         let file = module_unit.source();
-        let local = python
-            .top_level_declarations(file)
-            .into_iter()
-            .filter(|unit| unit.identifier() == export_name)
-            .collect::<Vec<_>>();
+        let local = local_export_declarations(python, file, &export_name);
         let binder = python.import_binder_of(file);
         let binding = binder.bindings.get(&export_name);
         if !local.is_empty() && binding.is_some() {
@@ -655,7 +651,12 @@ fn local_export_declarations(
     index
         .top_level_declarations(file)
         .into_iter()
-        .filter(|unit| unit.identifier() == local_name)
+        .filter(|unit| {
+            unit.identifier() == local_name
+                && index
+                    .parent_of(unit)
+                    .is_some_and(|parent| parent.is_module() && parent.source() == file)
+        })
         .collect()
 }
 
@@ -995,9 +996,18 @@ pub fn resolve_python_relative_module(
     source_file: &ProjectFile,
     module_expr: &str,
 ) -> Option<String> {
+    resolve_python_relative_module_from_package(&python_current_package(source_file), module_expr)
+}
+
+/// Resolve a structured Python module expression against an already-known
+/// package identity. Dependency-pack producers know module identities without
+/// owning a workspace [`ProjectFile`], so they use this entry point.
+pub fn resolve_python_relative_module_from_package(
+    current_package: &str,
+    module_expr: &str,
+) -> Option<String> {
     let level = module_expr.chars().take_while(|ch| *ch == '.').count();
     let suffix = module_expr[level..].trim_matches('.');
-    let current_package = python_current_package(source_file);
     let mut parts: Vec<_> = current_package
         .split('.')
         .filter(|part| !part.is_empty())

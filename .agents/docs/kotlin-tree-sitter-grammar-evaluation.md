@@ -1,15 +1,17 @@
 # Kotlin Tree-sitter grammar evaluation
 
-Status: selected for Bifrost issue #1235 on 2026-07-28.
+Status: selected for Bifrost issue #1235 on 2026-07-28. Bifrost migrated the
+selected grammar to `brokk-tree-sitter-kotlin` 0.4.0 on 2026-08-11.
 
 ## Decision
 
-Bifrost will use an immutable vendored snapshot of
+Bifrost originally used an immutable vendored snapshot of
 `fwcd/tree-sitter-kotlin@c8ac3d2627240160b999a2c100de3babbdb8f419`.
 The snapshot is MIT-licensed, exposes a `tree_sitter_language::LanguageFn`,
 declares Tree-sitter language ABI 14, and includes a stateful C external
-scanner. Bifrost compiles it directly with private native symbols and loads it
-through the existing `tree-sitter = 0.25.10` runtime.
+scanner. Bifrost now uses the exact `brokk-tree-sitter-kotlin = 0.4.0`
+registry release. That release tracks upstream revision
+`1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1` and uses private native symbols.
 
 The alternative was
 `tree-sitter-grammars/tree-sitter-kotlin@3dea6dfa9c0129deb7c4315afbda806c85c41667`,
@@ -26,13 +28,11 @@ modern `LanguageFn` binding and recent grammar work. Bifrost therefore vendors
 the exact source snapshot instead of depending on a stale release or an
 unpublishable Cargo git dependency.
 
-Vendoring is explicitly temporary. Upstream release request
+Vendoring was explicitly temporary. Upstream release request
 [`fwcd/tree-sitter-kotlin#242`](https://github.com/fwcd/tree-sitter-kotlin/issues/242)
-is the exit-condition tracker. When upstream publishes `0.4.0` or a later
-compatible release, Bifrost should replace the snapshot with an exact registry
-dependency after replaying this report's acceptance corpus and verifying that
-a second Kotlin grammar dependency cannot substitute native symbols at link
-time. The published `0.3.8` crate is not a drop-in interim dependency: it pins
+was the exit-condition tracker. The Brokk fork now publishes the selected
+grammar with isolated symbols. Bifrost uses that exact registry dependency.
+The upstream `0.3.8` crate is not a drop-in dependency: it pins
 Tree-sitter below 0.23 and returns that runtime's `Language`, whereas Bifrost
 uses Tree-sitter 0.25.10 and this source revision exposes `LanguageFn`.
 
@@ -43,11 +43,8 @@ uses Tree-sitter 0.25.10 and this source revision exposes `LanguageFn`.
 | `fwcd/tree-sitter-kotlin` | `c8ac3d2627240160b999a2c100de3babbdb8f419` | source version 0.4.0; current crate release trails at 0.3.8 | MIT | Copyright (c) 2019 fwcd | 14 | Stateful C scanner; serializes a delimiter/interpolation-prefix stack |
 | `tree-sitter-grammars/tree-sitter-kotlin` | `3dea6dfa9c0129deb7c4315afbda806c85c41667` | `tree-sitter-kotlin-ng` 1.1.0 | MIT | Copyright (c) 2024 Amaan Qureshi | 14 | Stateless C scanner |
 
-Both licenses are compatible with Bifrost's reviewed policy. Because the
-selected C sources are incorporated directly rather than resolved as a Cargo
-package, their MIT text is retained in `vendor/tree-sitter-kotlin/LICENSE` and
-is copied into `SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt` by the native-source
-notice generator.
+Both licenses are compatible with Bifrost's reviewed policy. Cargo now resolves
+the selected source through `brokk-tree-sitter-kotlin` and its MIT license.
 
 The selected repository's upstream `highlights.scm` and `tags.scm` are retained
 unchanged under `resources/treesitter/kotlin/`, not under `vendor/`. They are
@@ -163,6 +160,5 @@ approximation of `.crate` impact, then use `scripts/check-crate-package.sh` for
 the actual post-integration archive.
 
 The disposable probe is not retained as production code. Its enduring
-contracts are the focused tests in `src/analyzer/kotlin/language.rs`, the exact
-source digests in `vendor/tree-sitter-kotlin/BIFROST_PROVENANCE.md`, and the
-package/notice gates.
+contracts are the focused Kotlin language tests, the exact registry dependency,
+and the package and notice gates.

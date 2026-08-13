@@ -20,10 +20,10 @@ use super::{
     MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
     ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
     SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
-    SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
-    SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
-    SourceSpan, ValueFlowKind, ValueId,
+    SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
+    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
+    SourceMappingKind, SourcePosition, SourceSpan, ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -1207,6 +1207,30 @@ impl<'a> ProcedureLoweringSession<'a> {
         kind: SemanticGapKind,
         detail: impl Into<Box<str>>,
     ) -> Result<SemanticGapId, ProcedureLoweringError> {
+        self.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            subject,
+            capability,
+            additional_impacts,
+            kind,
+            SemanticGapDischarge::None,
+            detail,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_gap_with_impacts_and_discharge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        subject: SemanticGapSubject,
+        capability: SemanticCapability,
+        additional_impacts: SemanticGapImpacts,
+        kind: SemanticGapKind,
+        discharge: SemanticGapDischarge,
+        detail: impl Into<Box<str>>,
+    ) -> Result<SemanticGapId, ProcedureLoweringError> {
         let metadata = self.metadata(point)?;
         let impacts = SemanticGapImpacts::for_gap(capability, subject).union(additional_impacts);
         let id = SemanticGapId::try_from_index(self.next_gap)
@@ -1219,6 +1243,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             impacts,
             kind,
             budget: None,
+            discharge,
             detail: detail.into(),
             source: metadata.source,
             evidence: metadata.evidence,

@@ -59,7 +59,34 @@ pub(crate) fn extract_scala_supertypes(
     declaration: Node<'_>,
     source: &str,
 ) -> Vec<ScalaSupertypeFact> {
-    scala_supertype_lookup_nodes(declaration)
+    supertype_facts(scala_supertype_lookup_nodes(declaration), source)
+}
+
+pub(crate) fn extract_scala_instance_supertypes(
+    instance: Node<'_>,
+    source: &str,
+) -> Vec<ScalaSupertypeFact> {
+    assert_eq!(instance.kind(), "instance_expression");
+    let mut parents = Vec::new();
+    let mut cursor = instance.walk();
+    for child in instance.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "arguments" | "template_body" | "block" | "indented_block"
+        ) {
+            continue;
+        }
+        collect_parent_type_roots(child, &mut parents);
+    }
+    let nodes = parents
+        .into_iter()
+        .filter_map(|parent| supertype_lookup_node(parent).map(|lookup| (parent, lookup)))
+        .collect();
+    supertype_facts(nodes, source)
+}
+
+fn supertype_facts(nodes: Vec<(Node<'_>, Node<'_>)>, source: &str) -> Vec<ScalaSupertypeFact> {
+    nodes
         .into_iter()
         .map(|(parent, lookup_node)| ScalaSupertypeFact {
             raw: node_text(parent, source).to_string(),
@@ -274,6 +301,39 @@ mod tests {
             vec![
                 ("Base".to_string(), "Base".to_string()),
                 ("ImportedTrait".to_string(), "ImportedTrait".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn anonymous_instance_supertypes_preserve_constructor_and_mixins() {
+        let source = "val value = new pkg.Base[Int](1) with First with other.Second {}";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let instance = loop {
+            let node = stack.pop().expect("instance expression");
+            if node.kind() == "instance_expression" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            children.reverse();
+            stack.extend(children);
+        };
+        let facts = extract_scala_instance_supertypes(instance, source)
+            .into_iter()
+            .map(|fact| (fact.raw, fact.lookup_path.segments.join(".")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            vec![
+                ("pkg.Base[Int](1)".to_string(), "pkg.Base".to_string()),
+                ("First".to_string(), "First".to_string()),
+                ("other.Second".to_string(), "other.Second".to_string()),
             ]
         );
     }

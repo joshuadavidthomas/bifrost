@@ -347,6 +347,13 @@ impl CallableArity {
         arity >= self.required && (self.repeated || arity <= self.total)
     }
 
+    /// How many arguments a call must supply. Lower than [`Self::total`]
+    /// exactly when the declaration has defaults or otherwise omittable
+    /// parameters, which is what makes an arity a range rather than a count.
+    pub fn required(self) -> usize {
+        self.required
+    }
+
     pub fn total(self) -> usize {
         self.total
     }
@@ -465,6 +472,8 @@ pub struct SignatureMetadata {
     field_is_static: bool,
     #[serde(default)]
     field_is_final: bool,
+    #[serde(default)]
+    field_has_initializer: bool,
     #[serde(default)]
     cpp_field_linkage: Option<CppFieldLinkage>,
     /// Whether this class-like declaration is a Kotlin `companion object`.
@@ -1702,6 +1711,7 @@ impl SignatureMetadata {
             extension_receiver_is_unconstrained_type_parameter: false,
             field_is_static: false,
             field_is_final: false,
+            field_has_initializer: false,
             cpp_field_linkage: None,
             companion_object: false,
             callable_is_static: false,
@@ -1834,6 +1844,11 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_field_initializer(mut self, has_initializer: bool) -> Self {
+        self.field_has_initializer = has_initializer;
+        self
+    }
+
     pub fn with_cpp_field_linkage(mut self, linkage: CppFieldLinkage) -> Self {
         self.cpp_field_linkage = Some(linkage);
         self
@@ -1940,6 +1955,10 @@ impl SignatureMetadata {
         self.field_is_final
     }
 
+    pub fn field_has_initializer(&self) -> bool {
+        self.field_has_initializer
+    }
+
     pub const fn cpp_field_linkage(&self) -> Option<CppFieldLinkage> {
         self.cpp_field_linkage
     }
@@ -1954,6 +1973,17 @@ impl SignatureMetadata {
 
     pub fn is_declaration_only(&self) -> bool {
         self.declaration_only
+    }
+
+    /// Whether a unit whose signature rows are `metadata` is declaration-only
+    /// as a whole: it has signature rows and none of them is runnable.
+    ///
+    /// Python keeps each `@overload` stub as its own unit, so its one row
+    /// decides alone. TypeScript merges every overload signature and the
+    /// implementation of one callable into a single unit, so a unit with any
+    /// runnable row is runnable even though its stub rows are not.
+    pub fn unit_is_declaration_only(metadata: &[Self]) -> bool {
+        !metadata.is_empty() && metadata.iter().all(Self::is_declaration_only)
     }
 
     pub fn callable_arity(&self) -> Option<CallableArity> {
@@ -2502,6 +2532,20 @@ impl CodeUnit {
 
     pub fn short_name(&self) -> &str {
         &self.0.rendered_name.display[self.0.rendered_name.short_start..]
+    }
+
+    /// The extractor-provided text of the final structured name segment.
+    ///
+    /// Unlike [`Self::short_name`], this never includes an enclosing type chain.
+    /// Consumers that need a member's own name must use this structured value
+    /// instead of splitting a rendered language spelling.
+    pub fn terminal_name(&self) -> &str {
+        let terminal = self
+            .0
+            .fq
+            .last()
+            .expect("a CodeUnit qualified name always has a terminal segment");
+        segment_interner().resolve(terminal).0
     }
 
     pub fn fq(&self) -> &FqName {

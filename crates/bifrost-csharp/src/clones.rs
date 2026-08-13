@@ -5,7 +5,7 @@
 //! the analysis-owned `CloneCandidateData`. Everything that knows what a C#
 //! token *is* lives here.
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 const CSHARP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["identifier"];
 const CSHARP_CLONE_AST_STRING_TYPES: &[&str] = &["string_literal"];
@@ -103,9 +103,5 @@ fn normalize_csharp_clone_ast_label(node: Node<'_>, source: &str) -> String {
 }
 
 pub fn parse_csharp_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .expect("failed to load csharp parser");
-    parser.parse(source, None)
+    crate::preprocessor::parse_csharp(source)
 }

@@ -55,7 +55,7 @@ use super::syntax::{
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
     scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
     stable_identifier_reference, stable_type_prefix_reference, template_direct_term_member_named,
-    template_self_type, terminal_invocation_owner_name,
+    template_self_types, terminal_invocation_owner_name,
 };
 use crate::scala::declarations::scala_class_parameter_field_keyword;
 use crate::scala::graph_support::{
@@ -8085,7 +8085,10 @@ fn record_reference(
             return;
         }
     }
+    let named_argument_label =
+        node.kind() == "identifier" && named_argument_invocation_owner(node).is_some();
     if let Some(name) = reference_lookup_name(node, ctx.source)
+        && !named_argument_label
         && !ctx.sink.may_match_name(name)
     {
         return;
@@ -8577,6 +8580,38 @@ fn record_reference(
                 record_local_stable_imported_member(node, name, ctx, bindings);
                 return;
             }
+            if let Some(owner_node) =
+                named_argument_invocation_owner(node).and_then(terminal_invocation_owner_name)
+            {
+                let owner_name = node_text(owner_node, ctx.source).trim();
+                let declaring_callables =
+                    named_argument_callable_targets(owner_node, owner_name, name, ctx, bindings);
+                if let Some(ScalaResolvedReference::Exact(owner)) =
+                    ctx.visible_type_reference(owner_node, owner_name)
+                {
+                    let callable_matches_owner = declaring_callables.iter().any(|callable| {
+                        ctx.scala.structural_parent_of(callable).as_ref() == Some(&owner)
+                    });
+                    let owner_declares_member = !ctx
+                        .types
+                        .exact_member_declarations(ctx.scala, &owner, name)
+                        .is_empty();
+                    if !declaring_callables.is_empty()
+                        && (!callable_matches_owner || !owner_declares_member)
+                    {
+                        for callable in declaring_callables {
+                            ctx.record_exact_callable(callable, node);
+                        }
+                        return;
+                    }
+                    ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
+                } else {
+                    for callable in declaring_callables {
+                        ctx.record_exact_callable(callable, node);
+                    }
+                }
+                return;
+            }
             if is_declaration_name(node) {
                 return;
             }
@@ -8596,17 +8631,6 @@ fn record_reference(
                 return;
             }
             if is_scala_case_pattern_binder(node) {
-                return;
-            }
-            if let Some(owner_node) =
-                named_argument_invocation_owner(node).and_then(terminal_invocation_owner_name)
-            {
-                let owner_name = node_text(owner_node, ctx.source).trim();
-                if let Some(ScalaResolvedReference::Exact(owner)) =
-                    ctx.visible_type_reference(owner_node, owner_name)
-                {
-                    ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
-                }
                 return;
             }
             // The enclosing `call_expression` owns callable-shape resolution.
@@ -9509,33 +9533,17 @@ fn record_unqualified_type_application(
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
-    if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
-        return false;
-    }
-    let class_fqn = ctx.visible_type(function, name);
-    let object_fqn = ctx
-        .lexically_visible_object(function.start_byte(), name)
-        .or_else(|| ctx.resolver.resolve_object(name));
-    if class_fqn.is_none() && object_fqn.is_none() {
-        return false;
-    }
     let application_role =
         if is_extractor_reference(function) || is_infix_pattern_operator(function) {
             TypeApplicationRole::Extractor
         } else {
             TypeApplicationRole::BareApplication
         };
-    let call_shape = call_site_shape_for_reference(function);
-    let resolution = ctx.types.resolve_type_application(
-        ctx.scala,
-        &ctx.resolver,
-        class_fqn.as_deref(),
-        object_fqn.as_deref(),
-        name,
-        call_shape.as_ref(),
-        application_role,
-        Some(ctx.source_file),
-    );
+    let Some((resolution, call_shape)) =
+        resolve_unqualified_type_application(function, name, application_role, ctx, bindings)
+    else {
+        return false;
+    };
     if let Some(target) = resolution.type_target {
         ctx.record_exact(target.clone(), ScalaReferenceRole::Type, function);
         let exact_companions = ctx.types.exact_companion_objects(ctx.scala, &target);
@@ -9580,6 +9588,72 @@ fn record_unqualified_type_application(
         );
     }
     true
+}
+
+fn resolve_unqualified_type_application(
+    function: Node<'_>,
+    name: &str,
+    role: TypeApplicationRole,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Option<(TypeApplicationResolution, Option<ScalaCallSiteShape>)> {
+    if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
+        return None;
+    }
+    let class_fqn = ctx.visible_type(function, name);
+    let object_fqn = ctx
+        .lexically_visible_object(function.start_byte(), name)
+        .or_else(|| ctx.resolver.resolve_object(name));
+    if class_fqn.is_none() && object_fqn.is_none() {
+        return None;
+    }
+    let call_shape = call_site_shape_for_reference(function);
+    let resolution = ctx.types.resolve_type_application(
+        ctx.scala,
+        &ctx.resolver,
+        class_fqn.as_deref(),
+        object_fqn.as_deref(),
+        name,
+        call_shape.as_ref(),
+        role,
+        Some(ctx.source_file),
+    );
+    Some((resolution, call_shape))
+}
+
+fn named_argument_callable_targets(
+    function: Node<'_>,
+    owner_name: &str,
+    label: &str,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Vec<CodeUnit> {
+    if function.kind() != "identifier" {
+        return Vec::new();
+    }
+    let Some((resolution, _)) = resolve_unqualified_type_application(
+        function,
+        owner_name,
+        TypeApplicationRole::BareApplication,
+        ctx,
+        bindings,
+    ) else {
+        return Vec::new();
+    };
+    let mut targets = resolution
+        .callable_targets
+        .into_iter()
+        .filter(|callable| {
+            ctx.types
+                .signature_metadata_for(ctx.scala, callable)
+                .iter()
+                .flat_map(|metadata| metadata.parameters())
+                .any(|parameter| parameter.label() == label)
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn record_qualified_stable_reference(
@@ -10469,11 +10543,12 @@ fn record_lexically_visible_call(
             BareMemberResolution::Unresolved => return true,
             BareMemberResolution::NoMatch => {}
         }
-        if let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-            && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
-        {
-            return true;
+        for self_type in template_self_types(declaration) {
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
+                && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
+            {
+                return true;
+            }
         }
     }
     false
@@ -10542,11 +10617,12 @@ fn record_lexically_visible_parameterless_method(
             BareMemberResolution::Unresolved => return true,
             BareMemberResolution::NoMatch => {}
         }
-        if let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-            && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
-        {
-            return true;
+        for self_type in template_self_types(declaration) {
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
+                && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
+            {
+                return true;
+            }
         }
     }
     false
@@ -11539,30 +11615,30 @@ fn lexically_visible_unqualified_member_return_type(
             MemberReturnResolution::NoMatch => {}
             resolution => return resolution,
         }
-        let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-        else {
-            continue;
-        };
-        let mut declarations = ctx
-            .scala
-            .definitions(&self_owner)
-            .filter(CodeUnit::is_class);
-        let Some(declaration) = declarations.next() else {
-            continue;
-        };
-        if declarations.next().is_some() {
-            return MemberReturnResolution::Unresolved;
-        }
-        match ctx.types.unqualified_member_return_type(
-            ctx.scala,
-            &ctx.resolver,
-            &declaration,
-            member,
-            call_arities,
-        ) {
-            MemberReturnResolution::NoMatch => {}
-            resolution => return resolution,
+        for self_type in template_self_types(declaration) {
+            let Some(self_owner) = resolve_receiver_type_node(self_type, ctx) else {
+                continue;
+            };
+            let mut declarations = ctx
+                .scala
+                .definitions(&self_owner)
+                .filter(CodeUnit::is_class);
+            let Some(declaration) = declarations.next() else {
+                continue;
+            };
+            if declarations.next().is_some() {
+                return MemberReturnResolution::Unresolved;
+            }
+            match ctx.types.unqualified_member_return_type(
+                ctx.scala,
+                &ctx.resolver,
+                &declaration,
+                member,
+                call_arities,
+            ) {
+                MemberReturnResolution::NoMatch => {}
+                resolution => return resolution,
+            }
         }
     }
     MemberReturnResolution::NoMatch

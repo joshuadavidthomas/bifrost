@@ -209,7 +209,7 @@ const SCALA: &[(&str, &str)] = &[(
     "class Foo {\n  def target(): Unit = {}\n  def caller(): Unit = this.target()\n  def uncalled(): Unit = {}\n}\n",
 )];
 
-// Written multi-line with blank lines between declarations: the vendored Kotlin
+// Written multi-line with blank lines between declarations: the Kotlin
 // grammar emits `MISSING _automatic_semicolon` recovery for a single-line class
 // body, which would silently index nothing.
 const KOTLIN: &[(&str, &str)] = &[(
