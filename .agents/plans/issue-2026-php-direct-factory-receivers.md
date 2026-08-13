@@ -10,11 +10,11 @@ After this change, PHP find-references and whole-workspace usage graphs will und
 
 - [x] (2026-08-13 16:30Z) Read `.agents/PLANS.md`, issue #2026, the shared PHP receiver evaluator, both PHP graph walkers, and adjacent factory/chain tests.
 - [x] (2026-08-13 16:30Z) Confirmed the shared failure: `instance_receiver_type_fq_name` has no direct free-function or scoped-call base case, while two assignment-only helpers duplicate that return-type logic.
-- [ ] Add one shared structured direct-call return evaluator and route receiver and assignment inference through it.
-- [ ] Add targeted and whole-workspace behavior coverage with positive free/scoped/relative calls and typed/dynamic near misses.
-- [ ] Run focused PHP tests, formatting, dependency checks, and PHP/PHP-analysis clippy.
-- [ ] Rebuild the release differential runner and replay representative Ramsey, php-code-coverage, MathPHP, and Respect witnesses.
-- [ ] Update this plan with outcomes, commit, push, comment exact evidence on #2026, and close the issue.
+- [x] (2026-08-13 17:15Z) Added `direct_call_return_type_fq_name` and routed direct receiver roots plus both assignment seeders through it.
+- [x] (2026-08-13 17:15Z) Added targeted and whole-workspace behavior coverage with positive free/scoped/relative calls and typed/dynamic near misses.
+- [x] (2026-08-13 17:20Z) Passed formatting, focused PHP regressions, the workspace dependency check, and PHP/PHP-analysis clippy.
+- [x] (2026-08-13 17:25Z) Rebuilt the release differential runner and replayed representative Ramsey, php-code-coverage, MathPHP, and Respect witnesses; all four are consistent exact inverse hits with zero actionable findings.
+- [ ] Commit, push, comment exact evidence on #2026, and close the issue.
 
 ## Surprises & Discoveries
 
@@ -26,6 +26,9 @@ After this change, PHP find-references and whole-workspace usage graphs will und
 
 - Observation: `PhpGraphSource::facts` provides a unique callable-FQN return answer that should precede physical declaration fallback.
   Evidence: `PhpCallableFacts::callable_return_type_fqn` represents the usage-facts index's collapsed answer, while `declared_callable_return_type_fq_name` can recover a return from one physical declaration and its signature.
+
+- Observation: The shared evaluator also made parenthesized factory assignments consistent between the two inverse surfaces.
+  Evidence: the targeted assignment helper already recursed through `parenthesized_expression`; the inverted helper did not. Reusing the direct-call helper exposed and closed that parity gap without a separate interpretation.
 
 ## Decision Log
 
@@ -47,7 +50,16 @@ After this change, PHP find-references and whole-workspace usage graphs will und
 
 ## Outcomes & Retrospective
 
-Implementation is not complete. The intended outcome is zero actionable findings on representative direct-factory receiver sites, exact targeted hits on every positive member token, exact whole-workspace caller-to-member edges, and no claim for untyped/dynamic or wrong-return-type factories.
+The implementation now gives direct free-function, explicit scoped, `self`, and parenthesized factory results the same structured receiver typing as assigned factory results. Targeted usages return exactly the four `Product.consume` member ranges in the regression fixture. Whole-workspace edges reach `Product.consume` for the four positive callers, reach only `Other.consume` for typed decoys, and make no claim for untyped or dynamic factories.
+
+Focused validation passed: the two new issue tests, the three adjacent PHP receiver/assignment regressions, `scripts/check-workspace-dependencies.mjs`, and clippy for `brokk-bifrost-php` plus `brokk-bifrost-analysis`. Four release-runner exact replays completed with `classification=consistent`, `inverse_hit.exact_range=true`, and `inverse_precision_unbacked_hits=0`:
+
+- Ramsey UUID `fromBytes`, SHA-256 `faba998dd8e8c2429114f1090aae80dca99537cd9fcdbcff8aa44739e69ce851`.
+- MathPHP `getMatrix`, SHA-256 `e625a993695daff7689761af7cd6d1ae237b87b914cec28f55befa6d9cfcb10b`.
+- php-code-coverage `asFloat`, SHA-256 `40f5cc6d16d589b68af0cd9b1d22359bc8fce79de8ac474c4630e0fdc04e1287`.
+- Respect Validation `asAdjacentOf`, SHA-256 `eef498039a718a3e5d25d2bd8bfe28f5c84ab754b8b0d52186a9dd96e8b2b952`.
+
+The change deliberately leaves dynamic callable receivers and calls without a proven declared return type unknown. No source-text fallback or new dependency was introduced.
 
 ## Context and Orientation
 
@@ -127,3 +139,5 @@ Names may change during implementation if the existing module vocabulary suggest
 No new crate or third-party dependency is required. `brokk-bifrost-php` already owns `PhpSource`, `PhpGraphSource`, `PhpCallableFacts`, `PhpFileContext`, the PHP tree-sitter grammar helpers, namespace callable resolution, and the two graph walkers. `brokk-bifrost-analysis` remains responsible only for constructing `PhpGraphSource` and exposing integration surfaces. The change must preserve the dependency rule that language code does not depend upward on `brokk-bifrost-analysis`.
 
 Revision note (2026-08-13 16:30Z): Created this self-contained plan after confirming #2026's direct-call receiver gap, the duplicated assignment-only implementations, the callable-facts precedence, and the targeted plus whole-workspace acceptance surfaces.
+
+Revision note (2026-08-13 17:25Z): Recorded the completed shared implementation, the parenthesized-assignment parity discovery, focused validation, and four exact production replay hashes.

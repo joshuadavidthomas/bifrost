@@ -26,14 +26,15 @@
 //! own fqns), so `$this`/`self`/unqualified references attribute to the right
 //! class without re-deriving the namespace. Type references in `extends`/
 //! `implements`/cast position (bare `name`/`qualified_name`, not `named_type`),
-//! and receivers that need return-type inference (method chains) or whose type we
-//! cannot determine, are a recall gap — not a wrong edge.
+//! and receivers whose type cannot be established from structured declarations
+//! remain a recall gap rather than producing a guessed edge.
 
 use super::resolver::node_text;
 use super::syntax::{
-    assignment_parts, declared_callable_return_type_fq_name, declared_instance_callable,
-    declared_instance_field, instance_receiver_type_fq_name, is_local_scope, object_creation_type,
-    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
+    assignment_parts, declared_instance_callable, declared_instance_field,
+    direct_call_return_type_fq_name, instance_receiver_type_fq_name, is_local_scope,
+    object_creation_type, seed_parameter_types, static_member_parts, static_scope_type_fq_name,
+    variable_identifier,
 };
 use crate::aliases::{
     PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
@@ -373,8 +374,8 @@ fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_>) -> Option<String> {
 }
 
 /// The fqn of an instance-call receiver's type. `$this` is the enclosing class; a
-/// typed local/parameter resolves to its seeded type. Receivers we cannot type
-/// (chained calls, untyped locals) are skipped — a recall gap, not a wrong edge.
+/// typed local/parameter resolves to its seeded type. Structured field and call
+/// chains preserve declared receiver types; untyped locals are skipped.
 fn receiver_type_fqn(
     object: Node<'_>,
     scan: &PhpScan<'_>,
@@ -433,42 +434,19 @@ fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_>) -> Opti
     match right.kind() {
         "object_creation_expression" => object_creation_type(right)
             .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
-        "function_call_expression" => {
-            let function = right.child_by_field_name("function")?;
-            if !matches!(function.kind(), "name" | "qualified_name") {
-                return None;
-            }
-            let candidates = resolve_php_function(node_text(function, scan.source), &scan.ctx)?;
-            let fqn = scan.bound_callable(&candidates);
-            declared_callable_return_type_fqn(scan, &fqn)
-        }
-        "scoped_call_expression" => {
-            let scope = right.child_by_field_name("scope")?;
-            let name = right.child_by_field_name("name")?;
-            let method = node_text(name, scan.source);
-            if method.is_empty() {
-                return None;
-            }
-            let owner = scope_class_fqn(scope, scan)?;
-            declared_callable_return_type_fqn(scan, &format!("{owner}.{method}"))
-        }
+        "function_call_expression" | "scoped_call_expression" => direct_call_return_type_fq_name(
+            scan.php,
+            scan.analyzer,
+            right,
+            scan.source,
+            &scan.ctx,
+            scan.enclosing_class(right.start_byte()),
+        ),
+        "parenthesized_expression" => right
+            .named_child(0)
+            .and_then(|inner| assignment_receiver_type_fqn(inner, scan)),
         _ => None,
     }
-}
-
-fn declared_callable_return_type_fqn(scan: &PhpScan<'_>, callable_fqn: &str) -> Option<String> {
-    if let Some(return_type) = scan.analyzer.facts.callable_return_type_fqn(callable_fqn) {
-        return Some(return_type);
-    }
-    let mut definitions = scan
-        .php
-        .definitions(callable_fqn)
-        .filter(|unit| unit.is_function());
-    let callable = definitions.next()?;
-    if definitions.next().is_some() {
-        return None;
-    }
-    declared_callable_return_type_fq_name(scan.php, scan.analyzer, &callable)
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the
