@@ -274,7 +274,7 @@ impl FqName {
     /// Canonical rendering for language-neutral lookup and display surfaces.
     #[allow(dead_code)]
     pub fn display(&self, interner: &SegmentInterner) -> String {
-        self.render(interner, None)
+        self.render(interner, None).text
     }
 
     /// Native display: language-specific separators (`::` between adjacent C++
@@ -282,28 +282,98 @@ impl FqName {
     /// [`SegmentKind::Type`] segments) for surfaces that render native
     /// spellings.
     pub fn display_native(&self, lang: Language, interner: &SegmentInterner) -> String {
+        self.render(interner, Some(lang)).text
+    }
+
+    /// The native rendering together with the byte span each segment occupies
+    /// in it, so a caller that needs several projections of one name (its
+    /// package prefix, its declaration tail, its terminal identifier, its
+    /// owner's identifier) reads them as slices of a single string instead of
+    /// rendering the name once per projection.
+    ///
+    /// Every projection is a *contiguous span* of the full rendering: a
+    /// prefix's rendering is the full rendering truncated at that prefix's last
+    /// segment, and a suffix's rendering is the full rendering from that
+    /// suffix's first segment, because [`separator`] decides each join from the
+    /// two adjacent kinds alone. [`RenderedFqName`] is that fact made
+    /// mechanical -- see `rendered_spans_match_per_projection_rendering`, which
+    /// pins it against the projection-by-projection rendering it replaces.
+    pub fn render_native(&self, lang: Language, interner: &SegmentInterner) -> RenderedFqName {
         self.render(interner, Some(lang))
     }
 
-    fn render(&self, interner: &SegmentInterner, native: Option<Language>) -> String {
-        let mut out = String::new();
+    fn render(&self, interner: &SegmentInterner, native: Option<Language>) -> RenderedFqName {
+        let mut text = String::new();
+        let mut spans: SmallVec<[(u32, u32); 8]> = SmallVec::with_capacity(self.segments.len());
         let mut prev: Option<SegmentKind> = None;
         for &id in &self.segments {
-            let (text, kind) = interner.resolve(id);
+            let (segment_text, kind) = interner.resolve(id);
             if let Some(prev_kind) = prev {
-                out.push_str(separator(prev_kind, kind, native));
+                text.push_str(separator(prev_kind, kind, native));
             }
-            out.push_str(text);
+            let start = text.len();
+            text.push_str(segment_text);
             // A Scala `object` segment is spelled with a trailing `$` *suffix*
             // on its own name (`LocalScheduler$`, `Outer$.Inner$`), joined to
             // neighbours with an ordinary `.`. The `$` is part of this segment,
             // not a separator, so it is emitted here rather than by `separator`.
             if kind == SegmentKind::Companion {
-                out.push('$');
+                text.push('$');
             }
+            spans.push((start as u32, text.len() as u32));
             prev = Some(kind);
         }
-        out
+        RenderedFqName { text, spans }
+    }
+}
+
+/// A rendered [`FqName`] plus the byte span of each of its segments, produced
+/// by [`FqName::render_native`].
+pub struct RenderedFqName {
+    text: String,
+    /// `(start, end)` byte offsets of each segment's own text in `text`. `end`
+    /// includes a [`SegmentKind::Companion`] segment's trailing `$`, which is
+    /// part of that segment's spelling rather than a join.
+    spans: SmallVec<[(u32, u32); 8]>,
+}
+
+impl RenderedFqName {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Byte offset at which segment `index`'s own text starts.
+    pub fn segment_start(&self, index: usize) -> usize {
+        self.spans[index].0 as usize
+    }
+
+    /// Byte offset just past segment `index`'s own text.
+    pub fn segment_end(&self, index: usize) -> usize {
+        self.spans[index].1 as usize
+    }
+
+    /// End offset of `FqName::prefix(len)`'s rendering: `text[..prefix_end(len)]`
+    /// is byte-identical to rendering that prefix on its own.
+    pub fn prefix_end(&self, len: usize) -> usize {
+        match len {
+            0 => 0,
+            len => self.segment_end(len.min(self.spans.len()) - 1),
+        }
+    }
+
+    /// Start offset of `FqName::suffix_from(len)`'s rendering:
+    /// `text[suffix_start(len)..]` is byte-identical to rendering that suffix on
+    /// its own.
+    pub fn suffix_start(&self, len: usize) -> usize {
+        if len >= self.spans.len() {
+            self.text.len()
+        } else {
+            self.segment_start(len)
+        }
     }
 }
 
@@ -399,20 +469,65 @@ pub fn absent_segment_separators(lang: Language) -> &'static [&'static str] {
 /// `SegmentId` space.
 const SHARD_COUNT: usize = 16;
 
+/// Entries in a shard's first entry chunk. Each subsequent chunk doubles, so
+/// the chunk table is a small fixed array and a shard still reaches the whole
+/// `SegmentId` space it owns.
+const FIRST_ENTRY_CHUNK_LEN: usize = 64;
+
+/// Chunks per shard. `FIRST_ENTRY_CHUNK_LEN * (2^24 - 1)` is a little over one
+/// billion entries per shard, well past the `u32::MAX / SHARD_COUNT` ceiling
+/// [`SegmentInterner::encode`] can address at all.
+const ENTRY_CHUNK_COUNT: usize = 24;
+
+/// An interned `(leaked text, kind)` pair. The text is leaked once on first
+/// insert so [`SegmentInterner::resolve`] can hand back a `&str` that outlives
+/// any borrow of the interner; the interner is grow-only for the process
+/// lifetime, so this is bounded by the segment vocabulary.
+type Entry = (&'static str, SegmentKind);
+
+/// One shard's grow-only entry table: a fixed chunk directory whose chunks are
+/// allocated on demand and never moved.
+type EntryChunks = [OnceLock<Box<[OnceLock<Entry>]>>; ENTRY_CHUNK_COUNT];
+
+/// The chunk and in-chunk offset holding a shard's `local`th entry. Chunk `c`
+/// holds `FIRST_ENTRY_CHUNK_LEN << c` entries starting at
+/// `FIRST_ENTRY_CHUNK_LEN * ((1 << c) - 1)`.
+fn entry_slot(local: usize) -> (usize, usize) {
+    let chunk = (local / FIRST_ENTRY_CHUNK_LEN + 1).ilog2() as usize;
+    (chunk, local - FIRST_ENTRY_CHUNK_LEN * ((1 << chunk) - 1))
+}
+
+fn entry_chunk_len(chunk: usize) -> usize {
+    FIRST_ENTRY_CHUNK_LEN << chunk
+}
+
 struct Shard {
     /// `text -> [(kind, id)]`. Keyed by owned `String` so lookups on the hot
-    /// (hit) path borrow a `&str` without allocating.
+    /// (hit) path borrow a `&str` without allocating. Guarded by the shard's
+    /// `RwLock`; only [`SegmentInterner::intern`] touches it.
     by_text: HashMap<String, SmallVec<[(SegmentKind, SegmentId); 2]>>,
-    /// Local index -> `(leaked text, kind)`. The text is leaked once on first
-    /// insert so [`SegmentInterner::resolve`] can hand back a `&str` that
-    /// outlives any lock guard; the interner is grow-only for the process
-    /// lifetime, so this is bounded by the segment vocabulary.
-    entries: Vec<(&'static str, SegmentKind)>,
+    /// Number of entries published in `entries`. Guarded by the same lock, so
+    /// the next local index is decided by whichever writer holds it.
+    len: usize,
 }
 
 /// Sharded, concurrent interner of `(text, kind)` pairs.
+///
+/// [`Self::resolve`] takes no lock. A `SegmentId` names a fixed slot in a
+/// grow-only chunked table, and the chunk a slot lives in never moves once
+/// allocated, so a read is two acquire loads and an index -- not the
+/// read-modify-write pair an `RwLock` read guard costs on every acquire and
+/// release. That matters because resolve runs once per segment per rendering,
+/// on every thread that touches a name (issue #1928 measured 6.55% of a
+/// chromium probe phase inside it).
 pub struct SegmentInterner {
     shards: [RwLock<Shard>; SHARD_COUNT],
+    /// Per-shard entry table. Written only under the shard's write lock; read
+    /// without any lock. `OnceLock` is what makes that safe: a chunk is
+    /// published whole, and a slot is published only after its entry is
+    /// written, which happens-before the id naming that slot escapes the
+    /// writer.
+    entries: [EntryChunks; SHARD_COUNT],
 }
 
 impl SegmentInterner {
@@ -421,9 +536,10 @@ impl SegmentInterner {
             shards: std::array::from_fn(|_| {
                 RwLock::new(Shard {
                     by_text: HashMap::default(),
-                    entries: Vec::new(),
+                    len: 0,
                 })
             }),
+            entries: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
         }
     }
 
@@ -435,10 +551,17 @@ impl SegmentInterner {
     }
 
     fn encode(shard: usize, local: usize) -> SegmentId {
-        SegmentId((local * SHARD_COUNT + shard) as u32)
+        let id = local * SHARD_COUNT + shard;
+        assert!(
+            id <= u32::MAX as usize,
+            "segment interner exhausted its id space (shard={shard}, local={local})"
+        );
+        SegmentId(id as u32)
     }
 
     pub fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
+        #[cfg(any(test, feature = "test-support"))]
+        counters::record_intern();
         let shard_idx = Self::shard_of(text);
         // Fast path: an existing entry can be found under a read lock.
         {
@@ -460,10 +583,19 @@ impl SegmentInterner {
                 }
             }
         }
-        let local = shard.entries.len();
+        let local = shard.len;
         let id = Self::encode(shard_idx, local);
         let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
-        shard.entries.push((leaked, kind));
+        let (chunk, offset) = entry_slot(local);
+        let slots = self.entries[shard_idx][chunk].get_or_init(|| {
+            (0..entry_chunk_len(chunk))
+                .map(|_| OnceLock::new())
+                .collect()
+        });
+        slots[offset]
+            .set((leaked, kind))
+            .expect("a segment entry slot is filled exactly once");
+        shard.len = local + 1;
         shard
             .by_text
             .entry(text.to_owned())
@@ -473,12 +605,21 @@ impl SegmentInterner {
     }
 
     pub fn resolve(&self, id: SegmentId) -> (&str, SegmentKind) {
+        #[cfg(any(test, feature = "test-support"))]
+        counters::record_resolve();
         let shard_idx = (id.0 as usize) % SHARD_COUNT;
-        let local = (id.0 as usize) / SHARD_COUNT;
-        let shard = self.shards[shard_idx].read().unwrap();
-        let (text, kind) = shard.entries[local];
+        let (chunk, offset) = entry_slot((id.0 as usize) / SHARD_COUNT);
+        // Both `expect`s are unreachable for an id this interner issued: the
+        // chunk and the slot are filled before the id escapes `intern`. An id
+        // from a *different* interner is the only way to reach them, and that
+        // is a caller bug rather than a state to recover from.
+        let (text, kind) = *self.entries[shard_idx][chunk]
+            .get()
+            .expect("SegmentId names an allocated entry chunk")[offset]
+            .get()
+            .expect("SegmentId names a filled entry slot");
         // `text` is `&'static str`; returning it under `&self`'s lifetime is a
-        // safe subtyping shrink, and it outlives the dropped read guard.
+        // safe subtyping shrink.
         (text, kind)
     }
 
@@ -508,6 +649,41 @@ impl SegmentInterner {
 pub fn segment_interner() -> &'static SegmentInterner {
     static INTERNER: OnceLock<SegmentInterner> = OnceLock::new();
     INTERNER.get_or_init(SegmentInterner::new)
+}
+
+/// Per-thread counts of interner traffic, so a test can pin how much identity
+/// work a construction path does (issue #1928) without timing anything.
+///
+/// Thread-local rather than global: the counted work happens on the calling
+/// thread, and a per-thread count stays exact whether the suite runs each test
+/// in its own process or many tests as threads of one.
+#[cfg(any(test, feature = "test-support"))]
+pub mod counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static RESOLVE_CALLS: Cell<u64> = const { Cell::new(0) };
+        static INTERN_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_resolve() {
+        RESOLVE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    pub(super) fn record_intern() {
+        INTERN_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    /// `(resolve calls, intern calls)` made by this thread since the last
+    /// [`reset`].
+    pub fn counts() -> (u64, u64) {
+        (RESOLVE_CALLS.with(Cell::get), INTERN_CALLS.with(Cell::get))
+    }
+
+    pub fn reset() {
+        RESOLVE_CALLS.with(|calls| calls.set(0));
+        INTERN_CALLS.with(|calls| calls.set(0));
+    }
 }
 
 #[cfg(test)]
@@ -892,10 +1068,11 @@ mod tests {
 
         let mut interned_entries: usize = 0;
         let mut interned_text_bytes: usize = 0;
-        for shard in &interner.shards {
-            let shard = shard.read().unwrap();
-            interned_entries += shard.entries.len();
-            for (text, _) in &shard.entries {
+        for (shard_idx, shard) in interner.shards.iter().enumerate() {
+            let len = shard.read().unwrap().len;
+            interned_entries += len;
+            for local in 0..len {
+                let (text, _) = interner.resolve(SegmentInterner::encode(shard_idx, local));
                 interned_text_bytes += text.len();
             }
         }
@@ -918,6 +1095,118 @@ mod tests {
         assert!(
             interned_text_bytes < legacy_bytes,
             "interned unique text ({interned_text_bytes}) should be well under summed legacy bytes ({legacy_bytes})"
+        );
+    }
+
+    /// The contract [`RenderedFqName`] rests on: every prefix and suffix span
+    /// it reports is byte-identical to rendering that prefix or suffix on its
+    /// own. Checked over shapes covering every separator rule (`/` between
+    /// paths, `::` between C++ packages, `$` before a nested segment, `$`
+    /// suffixed onto a companion, and the default `.`), in every language whose
+    /// rules can differ.
+    #[test]
+    fn rendered_spans_match_per_projection_rendering() {
+        use SegmentKind::*;
+        let interner = SegmentInterner::new();
+        let shapes: [&[(&str, SegmentKind)]; 6] = [
+            &[("only", Member)],
+            &[
+                ("github.com", Path),
+                ("foo", Path),
+                ("Baz", Type),
+                ("m", Member),
+            ],
+            &[
+                ("cutlass", Package),
+                ("gemm", Package),
+                ("Op", Type),
+                ("layout", Member),
+            ],
+            &[
+                ("ns", Package),
+                ("Outer", Type),
+                ("Inner", Nested),
+                ("m", Member),
+            ],
+            &[("Outer", Companion), ("Inner", Companion), ("bar", Member)],
+            &[("a", Unknown), ("b", Unknown), ("C", Unknown)],
+        ];
+        for shape in shapes {
+            let name = fq(&interner, shape);
+            for language in [Language::None, Language::Cpp, Language::Scala, Language::Go] {
+                let rendered = name.render_native(language, &interner);
+                assert_eq!(
+                    rendered.text(),
+                    name.display_native(language, &interner),
+                    "{shape:?} in {language:?}"
+                );
+                for split in 0..=name.len() {
+                    assert_eq!(
+                        &rendered.text()[..rendered.prefix_end(split)],
+                        name.prefix(split).display_native(language, &interner),
+                        "prefix {split} of {shape:?} in {language:?}"
+                    );
+                    assert_eq!(
+                        &rendered.text()[rendered.suffix_start(split)..],
+                        name.suffix_from(split).display_native(language, &interner),
+                        "suffix {split} of {shape:?} in {language:?}"
+                    );
+                }
+                for index in 0..name.len() {
+                    assert_eq!(
+                        &rendered.text()
+                            [rendered.segment_start(index)..rendered.segment_end(index)],
+                        name.prefix(index + 1)
+                            .suffix_from(index)
+                            .display_native(language, &interner),
+                        "segment {index} of {shape:?} in {language:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The chunked entry table must resolve every id across several chunk
+    /// boundaries, not just the first chunk. The first three chunks hold
+    /// `64 + 128 + 256` entries, so this crosses two boundaries per shard even
+    /// after ids spread over 16 shards.
+    #[test]
+    fn resolve_crosses_entry_chunk_boundaries() {
+        let interner = SegmentInterner::new();
+        let ids: Vec<_> = (0..4096)
+            .map(|index| interner.intern(&format!("segment_{index}"), SegmentKind::Member))
+            .collect();
+        for (index, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                interner.resolve(id),
+                (format!("segment_{index}").as_str(), SegmentKind::Member)
+            );
+        }
+        // Re-interning finds the same ids, so the by_text index and the entry
+        // table stayed in step across every growth step.
+        for (index, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                interner.intern(&format!("segment_{index}"), SegmentKind::Member),
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn entry_slots_tile_the_local_index_space() {
+        let mut expected_chunk = 0;
+        let mut expected_offset = 0;
+        for local in 0..100_000 {
+            assert_eq!(entry_slot(local), (expected_chunk, expected_offset));
+            expected_offset += 1;
+            if expected_offset == entry_chunk_len(expected_chunk) {
+                expected_chunk += 1;
+                expected_offset = 0;
+            }
+        }
+        assert!(
+            expected_chunk < ENTRY_CHUNK_COUNT,
+            "the chunk table must cover the ids the interner can issue"
         );
     }
 

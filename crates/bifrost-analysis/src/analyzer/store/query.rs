@@ -84,13 +84,25 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
         let rows: Vec<_> = rows.into_iter().collect();
         let mut inspected = 0usize;
         let mut files = HashSet::default();
+        // The live paths a row resolves to depend on nothing but its blob and
+        // its storage language, and a workspace holds tens of declarations per
+        // blob -- so this is memoized for the same reason the name-projection
+        // pass memoizes its own (issue #1199). Deriving it per row instead cost
+        // a `Vec`, a rebase, and an allocated storage-language key per path per
+        // row, twice over, which issue #1928 measured as malloc/free and path
+        // re-parsing dominating a chromium probe phase.
+        let mut paths_by_row: HashMap<(Oid, &str), Vec<ProjectFile>> = HashMap::default();
         for (row, _) in &rows {
             if !continue_query() {
                 return LimitedQueryRows::incomplete(Vec::new(), inspected);
             }
             inspected = inspected.saturating_add(1);
             if self.snapshot.contains_oid(row.blob_oid) {
-                files.extend(self.paths_for_row(row));
+                files.extend(
+                    self.paths_for_row_memoized(row, &mut paths_by_row)
+                        .iter()
+                        .cloned(),
+                );
             }
         }
 
@@ -103,17 +115,17 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
         }
 
         let mut out = Vec::new();
-        for (row, payload) in rows {
+        for (row, payload) in &rows {
             if !continue_query() {
                 return LimitedQueryRows::incomplete(out, inspected);
             }
             inspected = inspected.saturating_add(1);
-            for file in self.paths_for_row(&row) {
+            for file in self.paths_for_row_memoized(row, &mut paths_by_row) {
                 if !continue_query() {
                     return LimitedQueryRows::incomplete(out, inspected);
                 }
-                if !stale.contains(&file) {
-                    out.push((self.code_unit_for_row(&row, &file), payload.clone()));
+                if !stale.contains(file) {
+                    out.push((self.code_unit_for_row(row, file), payload.clone()));
                 }
             }
         }
@@ -205,6 +217,16 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
             .into_iter()
             .filter(|file| self.adapter.storage_language_key_for_file(file) == row.lang)
             .collect()
+    }
+
+    /// [`Self::paths_for_row`] answered once per `(blob, storage language)`.
+    fn paths_for_row_memoized<'r, 'm>(
+        &self,
+        row: &'r CandidateRow,
+        memo: &'m mut HashMap<(Oid, &'r str), Vec<ProjectFile>>,
+    ) -> &'m [ProjectFile] {
+        memo.entry((row.blob_oid, row.lang.as_str()))
+            .or_insert_with(|| self.paths_for_row(row))
     }
 
     fn rebase_to_project_root(&self, file: &ProjectFile) -> Option<ProjectFile> {

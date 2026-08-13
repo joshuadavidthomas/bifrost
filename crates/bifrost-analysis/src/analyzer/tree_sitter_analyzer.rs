@@ -389,7 +389,14 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// different language) and must not serve each other's rows.
     /// Multi-key adapters (e.g. TypeScript, which splits `.ts`/`.tsx`
     /// into distinct storage keys) override this.
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+    /// The storage language key a file's rows live under.
+    ///
+    /// `&'static str` rather than `String`: every key is a language config
+    /// label chosen from a fixed set, and this is asked once per candidate row
+    /// per live path on the query paths, where allocating a key only to compare
+    /// it to a stored one was a measurable share of a chromium probe phase
+    /// (issue #1928). A caller that needs ownership says so.
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
         // An include-claimed file (#1837) has an extension no language owns, so
         // the file-derived key would be `Language::None` and its rows would
         // land under a storage key this adapter never serves a generation for.
@@ -397,11 +404,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         // which is sound exactly while one language infers claims -- the
         // invariant `LanguageAdapter::infer_claimed_files` documents.
         if self.claims_included_files() && crate::analyzer::common::has_unclaimed_extension(file) {
-            return self.language().config_label().to_string();
+            return self.language().config_label();
         }
-        crate::analyzer::common::language_for_file(file)
-            .config_label()
-            .to_string()
+        crate::analyzer::common::language_for_file(file).config_label()
     }
     /// Whether this adapter infers additional analyzable files from the imports
     /// of the files its extension list already selects (#1837).
@@ -2574,10 +2579,10 @@ where
         }
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
         let lang = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations.get(&lang).copied()?;
+        let generation = self.store_context.generations.get(lang).copied()?;
         Some(StructuralSnapshotKey {
             oid,
-            lang,
+            lang: lang.to_string(),
             generation,
         })
     }
@@ -3464,7 +3469,7 @@ where
             let key = Self::transient_cache_key(oid, file);
             match state.dirty_imports(&key) {
                 Some(imports) => out.push((file.clone(), imports)),
-                None => entries.push((file.clone(), oid, storage_key)),
+                None => entries.push((file.clone(), oid, storage_key.to_string())),
             }
         }
         if entries.is_empty() {
@@ -3681,7 +3686,7 @@ where
                 continue;
             };
             rows_by_language
-                .entry(adapter.storage_language_key_for_file(file))
+                .entry(adapter.storage_language_key_for_file(file).to_string())
                 .or_default()
                 .push((file.clone(), row));
         }
@@ -3743,7 +3748,7 @@ where
                 .validated_oid_for_path(file)
                 .and_then(|blob_oid| Self::path_symbol_row(adapter, file, blob_oid))
                 .map(|row| (adapter.storage_language_key_for_file(file), row));
-            let replacement_ref = replacement.as_ref().map(|(lang, row)| (lang.as_str(), row));
+            let replacement_ref = replacement.as_ref().map(|&(lang, ref row)| (lang, row));
             let mut persisted = false;
             for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
                 if store_context
@@ -3764,7 +3769,7 @@ where
                 }
             }
             if !persisted && let Some((lang, row)) = replacement {
-                dirty.insert(file.clone(), (lang, row));
+                dirty.insert(file.clone(), (lang.to_string(), row));
             }
         }
     }
@@ -3798,7 +3803,7 @@ where
             .collect();
         let files: Vec<ProjectFile> = files
             .into_iter()
-            .filter(|file| served_keys.contains(&adapter.storage_language_key_for_file(file)))
+            .filter(|file| served_keys.contains(adapter.storage_language_key_for_file(file)))
             .collect();
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
@@ -3812,9 +3817,12 @@ where
                 let all_blob_keys: Vec<_> = files
                     .iter()
                     .filter_map(|file| {
-                        file_oids
-                            .get(file)
-                            .map(|oid| (*oid, adapter.storage_language_key_for_file(file)))
+                        file_oids.get(file).map(|oid| {
+                            (
+                                *oid,
+                                adapter.storage_language_key_for_file(file).to_string(),
+                            )
+                        })
                     })
                     .collect();
                 let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
@@ -3861,9 +3869,9 @@ where
                         continue;
                     };
                     let storage_key = adapter.storage_language_key_for_file(file);
-                    if missing_blob_keys.contains(&(oid, storage_key.clone())) {
+                    if missing_blob_keys.contains(&(oid, storage_key.to_string())) {
                         representative_by_blob_key
-                            .entry((oid, storage_key))
+                            .entry((oid, storage_key.to_string()))
                             .or_insert_with(|| file.clone());
                     }
                 }
@@ -3900,7 +3908,7 @@ where
                                     RepresentativeBlobOutcome::Persisted
                                 };
                                 representative_blob_outcomes
-                                    .insert((oid, storage_key.clone()), blob_outcome);
+                                    .insert((oid, storage_key.to_string()), blob_outcome);
                                 let key = Self::transient_cache_key(oid, &file);
                                 match error {
                                     Some(error) => {
@@ -3909,7 +3917,7 @@ where
                                             key.clone(),
                                             Self::dirty_file_state(
                                                 Arc::clone(&state),
-                                                store_context.generations[&storage_key],
+                                                store_context.generations[storage_key],
                                                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
                                                 error.to_string(),
                                                 terminal_stale,
@@ -3932,7 +3940,7 @@ where
                             }
                             None => {
                                 representative_blob_outcomes.insert(
-                                    (oid, storage_key),
+                                    (oid, storage_key.to_string()),
                                     RepresentativeBlobOutcome::Unparseable,
                                 );
                             }
@@ -3949,7 +3957,7 @@ where
                         continue;
                     };
                     let storage_key = adapter.storage_language_key_for_file(file);
-                    let blob_key = (oid, storage_key);
+                    let blob_key = (oid, storage_key.to_string());
                     if !missing_blob_keys.contains(&blob_key) {
                         continue;
                     }
@@ -3972,14 +3980,14 @@ where
                     let mut seed_key = None;
                     if let Some(oid) = file_oids.get(&file).copied() {
                         let storage_key = adapter.storage_language_key_for_file(&file);
-                        let generation = store_context.generations[&storage_key];
+                        let generation = store_context.generations[storage_key];
                         Self::persist_or_mark_dirty(
                             &mut dirty_file_states,
                             store_context,
                             adapter,
                             &file,
                             oid,
-                            &storage_key,
+                            storage_key,
                             generation,
                             &state,
                         );
@@ -4009,14 +4017,14 @@ where
                         && let Ok(oid) = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     {
                         let storage_key = adapter.storage_language_key_for_file(&file);
-                        let generation = store_context.generations[&storage_key];
+                        let generation = store_context.generations[storage_key];
                         Self::persist_or_mark_dirty(
                             &mut dirty_file_states,
                             store_context,
                             adapter,
                             &file,
                             oid,
-                            &storage_key,
+                            storage_key,
                             generation,
                             &state,
                         );
@@ -4277,8 +4285,8 @@ where
     /// prefix-scan paths iterate the adapter's own declared keys.
     fn storage_key_and_generation(&self, file: &ProjectFile) -> Option<(String, GenerationId)> {
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations.get(&storage_key).copied()?;
-        Some((storage_key, generation))
+        let generation = self.store_context.generations.get(storage_key).copied()?;
+        Some((storage_key.to_string(), generation))
     }
 
     fn streaming_file_read_id(&self) -> usize {
@@ -4503,10 +4511,10 @@ where
         // that `storage_language_key_for_file` derives the key from the
         // file itself (#1195), index a foreign key absent from
         // `store_context.generations`. Answer honestly: no state.
-        if !self.owns_storage_language_key(&storage_key) {
+        if !self.owns_storage_language_key(storage_key) {
             return None;
         }
-        if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
+        if let Some(state) = self.retry_dirty_file_state(key, storage_key) {
             return Some(state);
         }
         if self.streaming_file_read_active(file) {
@@ -4548,8 +4556,8 @@ where
             .store_query_or_record(
                 self.store_context.store.hydrate_file_state_with_source(
                     key.oid,
-                    &storage_key,
-                    self.store_context.generations[&storage_key],
+                    storage_key,
+                    self.store_context.generations[storage_key],
                     self.adapter.as_ref(),
                     file,
                     &source,
@@ -4927,7 +4935,7 @@ where
                 continue;
             };
             let storage_key = self.adapter.storage_language_key_for_file(&file);
-            entries.push((file, oid, storage_key));
+            entries.push((file, oid, storage_key.to_string()));
         }
         if entries.is_empty() {
             return HashMap::default();
@@ -4940,7 +4948,7 @@ where
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
                 out.insert(file, (key, state.as_ref().clone()));
             } else {
-                clean_entries.push((file, oid, storage_key));
+                clean_entries.push((file, oid, storage_key.to_string()));
             }
         }
         let entries = clean_entries;
@@ -5057,7 +5065,7 @@ where
                 continue;
             };
             let storage_key = self.adapter.storage_language_key_for_file(&file);
-            entries.push((file, oid, storage_key));
+            entries.push((file, oid, storage_key.to_string()));
         }
         if entries.is_empty() {
             return HashMap::default();
@@ -5075,7 +5083,7 @@ where
                     },
                 );
             } else {
-                clean_entries.push((file, oid, storage_key));
+                clean_entries.push((file, oid, storage_key.to_string()));
             }
         }
         let entries = clean_entries;
@@ -5391,13 +5399,13 @@ where
                 continue;
             }
             let storage_key = self.adapter.storage_language_key_for_file(file);
-            let Some(generation) = self.store_context.generations.get(&storage_key).copied() else {
+            let Some(generation) = self.store_context.generations.get(storage_key).copied() else {
                 continue;
             };
-            if !claimed.insert((oid, storage_key.clone())) {
+            if !claimed.insert((oid, storage_key)) {
                 continue;
             }
-            targets.push((file.clone(), oid, storage_key, generation));
+            targets.push((file.clone(), oid, storage_key.to_string(), generation));
         }
         if targets.is_empty() {
             return;
@@ -5587,7 +5595,7 @@ where
             }
             let storage_key = self.adapter.storage_language_key_for_file(&project_file);
             let key = Self::transient_cache_key(oid, &project_file);
-            if self.retry_dirty_file_state(&key, &storage_key).is_some() {
+            if self.retry_dirty_file_state(&key, storage_key).is_some() {
                 files.push(project_file);
                 continue;
             }
@@ -5595,7 +5603,7 @@ where
         }
         let keys = persisted_candidates
             .iter()
-            .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
+            .map(|(_, oid, storage_key)| (*oid, storage_key.to_string()))
             .collect::<Vec<_>>();
         let present = {
             // The key set is the language's whole candidate list, so this one
@@ -5618,7 +5626,7 @@ where
             .unwrap_or_default()
         };
         for (project_file, oid, storage_key) in persisted_candidates {
-            if present.contains(&(oid, storage_key)) {
+            if present.contains(&(oid, storage_key.to_string())) {
                 files.push(project_file);
             }
         }
@@ -6030,7 +6038,9 @@ where
                     .unwrap_or_else(|| file.clone());
                 blob_keys.push((
                     *oid,
-                    self.adapter.storage_language_key_for_file(&project_file),
+                    self.adapter
+                        .storage_language_key_for_file(&project_file)
+                        .to_string(),
                 ));
             }
             blob_keys.sort();
@@ -6063,13 +6073,14 @@ where
                 let project_file = self
                     .rebase_live_file_to_project_root(&file)
                     .unwrap_or_else(|| file.clone());
-                if !self
-                    .adapter
-                    .include_path_synthetic_module(import_oids.contains(&(
+                if !self.adapter.include_path_synthetic_module(
+                    import_oids.contains(&(
                         oid,
-                        self.adapter.storage_language_key_for_file(&project_file),
-                    )))
-                {
+                        self.adapter
+                            .storage_language_key_for_file(&project_file)
+                            .to_string(),
+                    )),
+                ) {
                     continue;
                 }
             }
@@ -6093,7 +6104,7 @@ where
                 continue;
             }
             let storage_key = self.adapter.storage_language_key_for_file(&file);
-            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+            if let Some(state) = self.retry_dirty_file_state(&key, storage_key) {
                 states.push(state.as_ref().clone());
             }
         }
@@ -6252,7 +6263,9 @@ where
                 };
                 blob_keys.push((
                     oid,
-                    self.adapter.storage_language_key_for_file(&project_file),
+                    self.adapter
+                        .storage_language_key_for_file(&project_file)
+                        .to_string(),
                 ));
             }
             blob_keys.sort();
@@ -6661,8 +6674,8 @@ where
         self.store_query_or_record(
             self.store_context.store.write_parsed_blob_at_generation(
                 oid,
-                &storage_key,
-                self.store_context.generations[&storage_key],
+                storage_key,
+                self.store_context.generations[storage_key],
                 self.adapter.as_ref(),
                 &state,
             ),
@@ -8330,7 +8343,7 @@ where
         let Some(imports) = self
             .store_query_or_record(
                 self.store_context.store.hydrate_import_infos_by_key(
-                    &[(file.clone(), oid, storage_key)],
+                    &[(file.clone(), oid, storage_key.to_string())],
                     self.store_context.generations.as_ref(),
                     self.adapter.as_ref(),
                 ),
@@ -9409,7 +9422,7 @@ where
         // Multi-analyzer consumers may fan out a file to every provider. A
         // foreign file has no summary in this analyzer and, critically, no
         // generation entry in this analyzer's storage context.
-        if !self.owns_storage_language_key(&storage_key) {
+        if !self.owns_storage_language_key(storage_key) {
             return None;
         }
         if self.streaming_file_read_active(file) {
@@ -9431,12 +9444,12 @@ where
         {
             return Some(projection);
         }
-        let generation = self.store_context.generations.get(&storage_key).copied()?;
+        let generation = self.store_context.generations.get(storage_key).copied()?;
         let projection = self
             .store_query_or_record(
                 self.store_context.store.summary_file_projection(
                     oid,
-                    &storage_key,
+                    storage_key,
                     generation,
                     self.adapter.as_ref(),
                     file,
@@ -9474,13 +9487,13 @@ where
         self.adapter_owns_file(file, &self.live_snapshot()) && {
             let storage_key = self.adapter.storage_language_key_for_file(file);
             let key = Self::transient_cache_key(oid, file);
-            self.retry_dirty_file_state(&key, &storage_key).is_some()
+            self.retry_dirty_file_state(&key, storage_key).is_some()
                 || self
                     .store_query_or_record(
                         self.store_context.store.contains_parsed_blob_at_generation(
                             oid,
-                            &storage_key,
-                            self.store_context.generations[&storage_key],
+                            storage_key,
+                            self.store_context.generations[storage_key],
                         ),
                         format!("checking whether `{file}` is analyzed"),
                     )
@@ -9526,7 +9539,7 @@ where
             };
             let storage_key = self.adapter.storage_language_key_for_file(candidate);
             let key = Self::transient_cache_key(oid, candidate);
-            if self.retry_dirty_file_state(&key, &storage_key).is_some() {
+            if self.retry_dirty_file_state(&key, storage_key).is_some() {
                 analyzed.push(candidate.clone());
                 continue;
             }
@@ -9538,7 +9551,7 @@ where
         }
         let keys = persisted_candidates
             .iter()
-            .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
+            .map(|(_, oid, storage_key)| (*oid, storage_key.to_string()))
             .collect::<Vec<_>>();
         let present = self
             .store_query_or_record(
@@ -9550,7 +9563,7 @@ where
             )
             .unwrap_or_default();
         for (candidate, oid, storage_key) in persisted_candidates {
-            if present.contains(&(oid, storage_key)) {
+            if present.contains(&(oid, storage_key.to_string())) {
                 analyzed.push(candidate.clone());
             }
         }

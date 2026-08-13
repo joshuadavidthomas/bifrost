@@ -26,11 +26,7 @@ pub fn language_for_target(target: &CodeUnit) -> Language {
 }
 
 pub fn language_for_file(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
+    file.language()
 }
 
 /// The single language whose adapter adopts files by include inference
@@ -61,10 +57,7 @@ pub const INCLUDE_CLAIMING_LANGUAGE: Language = Language::Cpp;
 /// Use [`language_for_file`] to ask which language's extension list owns a
 /// path; use this to ask how a declaration found in that path is named.
 pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
-    match language_for_file(file) {
-        Language::None if has_unclaimed_extension(file) => INCLUDE_CLAIMING_LANGUAGE,
-        language => language,
-    }
+    file.declaration_language()
 }
 
 /// Whether no analyzable language claims this file's extension.
@@ -80,10 +73,7 @@ pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
 /// sibling extensions included, so a `.vue` or `.razor` file stays unclaimable
 /// even though no analyzer parses it directly.
 pub fn has_unclaimed_extension(file: &ProjectFile) -> bool {
-    match file.rel_path().extension().and_then(|ext| ext.to_str()) {
-        Some(extension) => !Language::is_source_extension(extension),
-        None => true,
-    }
+    file.has_unclaimed_extension()
 }
 
 /// Whether an analyzer covering `languages` could have indexed `file`, judged
