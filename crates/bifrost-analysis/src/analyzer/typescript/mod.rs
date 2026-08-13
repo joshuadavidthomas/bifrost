@@ -47,11 +47,11 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         TYPESCRIPT_QUERY_DIRECTORY
     }
 
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
         if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
-            "typescript:tsx".to_string()
+            "typescript:tsx"
         } else {
-            "typescript:ts".to_string()
+            "typescript:ts"
         }
     }
 
