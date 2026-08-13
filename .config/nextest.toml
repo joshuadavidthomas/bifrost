@@ -34,3 +34,11 @@ path = "junit.xml"
 [[profile.default.overrides]]
 filter = 'test(temp_storage_scripts)'
 threads-required = "num-cpus"
+
+# This process-isolated watchdog builds a large JS/TS usage graph inside a
+# four-thread rayon pool and enforces its own 60-second deadlock timeout. It
+# completes well within that boundary alone, but whole-suite CPU saturation can
+# starve the worker thread long enough to mimic the deadlock it detects.
+[[profile.default.overrides]]
+filter = 'test(jsts_usage_graph_receiver_analysis_does_not_deadlock_on_pool)'
+threads-required = "num-cpus"
