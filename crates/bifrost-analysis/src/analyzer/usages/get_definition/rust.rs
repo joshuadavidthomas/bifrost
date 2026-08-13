@@ -810,6 +810,12 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(outcome) =
+            rust_imported_pattern_variant_outcome(rust, support, file, source, tree, site)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
+        && let Some(outcome) =
             rust_exact_reference_role_outcome(analyzer, support, file, source, tree, site)
     {
         return outcome;
@@ -1500,6 +1506,56 @@ fn rust_exact_reference_role_outcome(
     None
 }
 
+fn rust_imported_pattern_variant_outcome(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let possible_unit_variant = lexical_scope::is_pattern_binding_identifier(focused);
+    let possible_constructor_variant =
+        std::iter::successors(focused.parent(), |node| node.parent())
+            .take_while(|node| !matches!(node.kind(), "match_arm" | "block" | "function_item"))
+            .any(|node| {
+                matches!(node.kind(), "tuple_struct_pattern" | "struct_pattern")
+                    && node
+                        .child_by_field_name("type")
+                        .is_some_and(|r#type| node_within(r#type, focused))
+            });
+    if !possible_unit_variant && !possible_constructor_variant {
+        return None;
+    }
+
+    let name = rust_node_text(focused, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let candidates = match rust_visible_import_resolution(
+        rust,
+        support,
+        file,
+        source,
+        site.focus_start_byte,
+        name,
+        RustBareReferenceRole::Value,
+    ) {
+        RustVisibleImportResolution::Resolved(candidates)
+        | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
+        RustVisibleImportResolution::BoundButUnindexed
+        | RustVisibleImportResolution::GlobBoundButUnindexed
+        | RustVisibleImportResolution::Unbound => return None,
+    };
+    let variants: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate))
+        .collect();
+    (!variants.is_empty()).then(|| candidates_outcome(variants))
+}
+
 fn rust_enclosing_lifetime(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         if node.kind() == "lifetime" {
@@ -1864,7 +1920,7 @@ fn rust_visible_import_resolution(
                 role,
             );
             routed_glob_candidates =
-                rust_glob_forward_export_candidates(rust, file, &binder, reference, role);
+                rust_glob_forward_export_candidates(rust, support, file, &binder, reference, role);
             if scoped_glob_resolution.is_some() {
                 targets.clear();
             }
@@ -2009,12 +2065,14 @@ fn rust_visible_import_resolution(
 
 fn rust_glob_forward_export_candidates(
     rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
     role: RustBareReferenceRole,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
+    let refs = support.forward_reference_context(rust, file);
     for binding in binder
         .bindings
         .values()
@@ -2028,15 +2086,25 @@ fn rust_glob_forward_export_candidates(
             continue;
         }
         let module_files = resolve_module_files(rust, file, &binding.module_specifier);
-        let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) else {
-            continue;
-        };
-        let definitions = rust.get_definitions(&fqn);
-        candidates.extend(
-            definitions
-                .into_iter()
-                .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
-        );
+        if let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) {
+            candidates.extend(
+                rust.get_definitions(&fqn)
+                    .into_iter()
+                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
+            );
+        }
+        if let Some(owner) = refs
+            .as_ref()
+            .and_then(|refs| resolve_rust_path_fqn(rust, refs, file, &binding.module_specifier))
+        {
+            candidates.extend(
+                support
+                    .fqn(&format!("{owner}.{reference}"))
+                    .into_iter()
+                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
+                    .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate)),
+            );
+        }
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -2112,6 +2180,7 @@ fn rust_scoped_glob_forward_import_candidates(
     let mut candidates = Vec::new();
     let mut saw_scoped_glob = false;
     let mut crossed_unindexed_explicit_binding = false;
+    let refs = support.forward_reference_context(rust, file);
     for binding in binder.bindings.values() {
         let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
             Language::Rust,
@@ -2123,6 +2192,18 @@ fn rust_scoped_glob_forward_import_candidates(
             continue;
         }
         saw_scoped_glob = true;
+        if let Some(owner) = refs
+            .as_ref()
+            .and_then(|refs| resolve_rust_path_fqn(rust, refs, file, &binding.module_specifier))
+        {
+            candidates.extend(
+                support
+                    .fqn(&format!("{owner}.{reference}"))
+                    .into_iter()
+                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
+                    .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate)),
+            );
+        }
         let Some(package) = resolve_rust_import_package_scoped(
             rust,
             file,

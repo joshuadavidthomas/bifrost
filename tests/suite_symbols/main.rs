@@ -15,6 +15,7 @@ mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
 mod issue_1963_ignored_nested_workspace;
+mod issue_2032_rust_wildcard_enum_variants;
 mod issue_2111_path_segment_selectors;
 mod most_relevant_files;
 mod optional_chain_reference_site;
