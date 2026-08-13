@@ -278,6 +278,7 @@ pub struct GoEdgeIndex {
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
     field_type_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
+    import_binding_names_by_file: HashMap<ProjectFile, HashSet<String>>,
 }
 
 impl GoEdgeIndex {
@@ -297,6 +298,15 @@ impl GoEdgeIndex {
     /// from the tree-free per-file map instead of retained parse trees.
     pub fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
         self.namespace_packages_by_file
+            .get(file)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every ordinary package name bound by an import in `file`, including
+    /// imports whose package is outside the indexed workspace.
+    pub fn import_binding_names(&self, file: &ProjectFile) -> HashSet<String> {
+        self.import_binding_names_by_file
             .get(file)
             .cloned()
             .unwrap_or_default()
@@ -486,21 +496,19 @@ fn build_go_edge_index_from_parsed(
         return_types.dedup();
     }
     let dir_index = build_parent_dir_index(package_names.keys());
-    let namespace_packages_by_file = parsed_files
-        .iter()
-        .map(|(file, parsed)| {
-            (
-                file.clone(),
-                namespace_packages_from_imports(
-                    file,
-                    &parsed.imports,
-                    &dir_index,
-                    source.workspace_paths,
-                    |target| package_names.get(target).cloned(),
-                ),
-            )
-        })
-        .collect();
+    let mut namespace_packages_by_file = HashMap::default();
+    let mut import_binding_names_by_file = HashMap::default();
+    for (file, parsed) in parsed_files {
+        let (namespace_packages, import_binding_names) = namespace_package_facts_from_imports(
+            file,
+            &parsed.imports,
+            &dir_index,
+            source.workspace_paths,
+            |target| package_names.get(target).cloned(),
+        );
+        namespace_packages_by_file.insert(file.clone(), namespace_packages);
+        import_binding_names_by_file.insert(file.clone(), import_binding_names);
+    }
     let type_alias_targets =
         collect_go_type_alias_targets(parsed_files, &package_names, &namespace_packages_by_file);
     for return_types in constructor_return_types.values_mut() {
@@ -532,6 +540,7 @@ fn build_go_edge_index_from_parsed(
         embedded_field_type_fqns: field_type_facts.embedded_by_owner,
         field_type_fqns: field_type_facts.field_types_by_owner,
         namespace_packages_by_file,
+        import_binding_names_by_file,
     }
 }
 
@@ -949,6 +958,23 @@ fn namespace_packages_from_imports(
     workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
+    namespace_package_facts_from_imports(
+        file,
+        imports,
+        dir_index,
+        workspace_paths,
+        target_package_name,
+    )
+    .0
+}
+
+fn namespace_package_facts_from_imports(
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+    dir_index: &ParentDirIndex,
+    workspace_paths: &GoWorkspacePathIndex,
+    target_package_name: impl Fn(&ProjectFile) -> Option<String>,
+) -> (NamespacePackages, HashSet<String>) {
     let bindings = import_bindings_from_imports(
         file,
         imports,
@@ -957,7 +983,16 @@ fn namespace_packages_from_imports(
         target_package_name,
         |_| None,
     );
-    (bindings.workspace, bindings.dot_workspace)
+    let import_binding_names = bindings
+        .workspace
+        .keys()
+        .chain(bindings.external.keys())
+        .cloned()
+        .collect();
+    (
+        (bindings.workspace, bindings.dot_workspace),
+        import_binding_names,
+    )
 }
 
 /// `declared_package_name` answers "what `package` clause does an activated

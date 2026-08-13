@@ -66,6 +66,7 @@ pub fn scan_files_for_target(
         let scan_bindings = ScanBindings::new(graph, file, spec);
         let file_package = graph.package_name_of(file).unwrap_or_default();
         let (alias_packages, dot_packages) = graph.namespace_packages(file);
+        let import_binding_names = graph.edge_index.import_binding_names(file);
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
@@ -79,6 +80,7 @@ pub fn scan_files_for_target(
             file_package,
             alias_packages,
             dot_packages,
+            import_binding_names,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -121,6 +123,7 @@ pub struct ScanCtx<'a> {
     file_package: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
     pub(crate) hits: &'a mut BTreeSet<UsageHit>,
     pub(crate) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -216,7 +219,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
         "selector_expression" | "qualified_type" => {
             scan_selector_like(node, ctx, locals);
         }
-        "identifier" | "type_identifier" if !scan_composite_literal_field_label(node, ctx) => {
+        "identifier" | "type_identifier" | "package_identifier"
+            if !scan_composite_literal_field_label(node, ctx) =>
+        {
             scan_direct_identifier(node, ctx, locals);
         }
         _ => {}
@@ -618,6 +623,9 @@ fn scan_direct_identifier(
         return;
     }
     let text = node_text(node, ctx.source);
+    if ctx.import_binding_names.contains(text) {
+        return;
+    }
     if !ctx.bindings.matches_direct_target(text) {
         return;
     }
