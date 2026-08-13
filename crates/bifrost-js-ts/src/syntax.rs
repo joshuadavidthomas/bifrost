@@ -775,6 +775,40 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     false
 }
 
+/// Return the enclosing enum declaration and current member assignment when
+/// `node` lies in that assignment's initializer. Deferred function and class
+/// bodies introduce their own lexical scope and do not inherit bare enum-member
+/// lookup from the surrounding initializer.
+pub fn typescript_enclosing_enum_initializer(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut current = node;
+    let assignment = loop {
+        let parent = current.parent()?;
+        if matches!(
+            parent.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "class_declaration"
+        ) {
+            return None;
+        }
+        if parent.kind() == "enum_assignment" {
+            let value = parent.child_by_field_name("value")?;
+            if value.start_byte() <= node.start_byte() && node.end_byte() <= value.end_byte() {
+                break parent;
+            }
+            return None;
+        }
+        current = parent;
+    };
+    let declaration = assignment
+        .parent()
+        .and_then(|body| body.parent())
+        .filter(|parent| parent.kind() == "enum_declaration")?;
+    Some((declaration, assignment))
+}
+
 pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "export_specifier"
