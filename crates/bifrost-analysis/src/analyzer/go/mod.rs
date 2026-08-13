@@ -499,6 +499,7 @@ impl CodeUnitIndex for GoAnalyzer {
             .filter_map(|range| {
                 let start_byte = if include_comments {
                     crate::analyzer::tree_sitter_analyzer::expanded_comment_start(
+                        Language::Go,
                         &content,
                         range.start_byte,
                     )

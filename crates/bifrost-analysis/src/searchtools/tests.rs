@@ -1725,3 +1725,73 @@ fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
     assert_eq!(1, result.files.len(), "{:?}", result.files);
     assert_eq!(5, result.files[0].classes.len(), "{:?}", result.files[0]);
 }
+
+/// #1775: boost's preprocessor limit headers write their preamble as null
+/// directives (`# /* Copyright ... */`, bare `#`) and their bodies as spaced
+/// directives (`# define BOOST_PP_BOOL_176 1`). Reading every `# ` line as a
+/// comment ran the attached-comment walk from any one macro back to line 1, so
+/// a one-line macro's `SourceBlock` reported `start_line: 1` and carried the
+/// whole preamble as its text.
+#[test]
+fn issue_1775_cpp_directive_lines_do_not_join_a_macros_comment_block() {
+    use crate::analyzer::{CppAnalyzer, TestProject};
+
+    let source = "\
+# /* Copyright (C) 2001
+#  * Housemarque Oy
+#  */
+#
+# ifndef GUARD_HPP
+# define GUARD_HPP
+#
+# define BOOST_PP_BOOL_0 0
+# define BOOST_PP_BOOL_1 1
+# define BOOST_PP_BOOL_2 1
+
+# /* Fast path toggle. */
+# define BOOST_PP_FAST 1
+#
+# endif
+";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), std::path::PathBuf::from("bool_limits.hpp"))
+        .write(source)
+        .unwrap();
+    let analyzer = CppAnalyzer::from_project(TestProject::new(root, Language::Cpp));
+
+    let block = |symbol: &str| {
+        let result = get_symbol_sources(
+            &analyzer,
+            SymbolLookupParams {
+                symbols: vec![symbol.to_string()],
+            },
+        );
+        assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
+        result.sources.into_iter().next().unwrap()
+    };
+    // The block's text must be the file's own content over the lines it
+    // reports -- the I1(c) contract the fuzzer checks.
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let reported_lines = |block: &super::SourceBlock| -> String {
+        lines[block.start_line - 1..block.end_line].concat()
+    };
+
+    let bool_2 = block("BOOST_PP_BOOL_2");
+    assert_eq!(
+        "# define BOOST_PP_BOOL_2 1\n", bool_2.text,
+        "a spaced `# define` above the macro is a directive, not its docstring: {bool_2:#?}"
+    );
+    assert_eq!(10, bool_2.start_line, "{bool_2:#?}");
+    assert_eq!(reported_lines(&bool_2), bool_2.text, "{bool_2:#?}");
+
+    // A null directive carrying nothing but comment text is still the macro's
+    // attached comment, which is the idiom the preamble itself uses.
+    let fast = block("BOOST_PP_FAST");
+    assert_eq!(
+        "# /* Fast path toggle. */\n# define BOOST_PP_FAST 1\n", fast.text,
+        "{fast:#?}"
+    );
+    assert_eq!(12, fast.start_line, "{fast:#?}");
+    assert_eq!(reported_lines(&fast), fast.text, "{fast:#?}");
+}

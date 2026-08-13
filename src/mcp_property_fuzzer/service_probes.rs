@@ -307,6 +307,11 @@ pub struct ProbeSummary {
     /// (#1336).
     pub skipped_render_partial: usize,
     pub i1c_source_text_checks: usize,
+    /// I1(c) blocks whose recorded `text` hit the record-string cap
+    /// ([`DUMP_PAYLOAD_EXCERPT_BYTES`]), so only the retained prefix could be
+    /// compared. Every block bigger than the cap lands here: a 141-line Java
+    /// class is 5.6 KB of legitimate source (#1775).
+    pub i1c_prefix_only_checks: usize,
     /// I1(c) blocks whose file was outside the sampled input (or had no
     /// source text available): unverifiable, neither pass nor fail.
     pub skipped_unsampled_source: usize,
@@ -635,6 +640,11 @@ fn cap_strings_for_record(value: Value) -> Value {
     }
 }
 
+/// The two halves of the marker [`truncate_record_string`] appends. Parsed
+/// back by [`retained_prefix`], so the format lives in exactly one place.
+const TRUNCATION_MARKER_OPEN: &str = "...[truncated, ";
+const TRUNCATION_MARKER_CLOSE: &str = " bytes total]";
+
 fn truncate_record_string(text: String) -> String {
     if text.len() <= DUMP_PAYLOAD_EXCERPT_BYTES {
         return text;
@@ -643,7 +653,26 @@ fn truncate_record_string(text: String) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...[truncated, {} bytes total]", &text[..end], text.len())
+    format!(
+        "{}{TRUNCATION_MARKER_OPEN}{}{TRUNCATION_MARKER_CLOSE}",
+        &text[..end],
+        text.len()
+    )
+}
+
+/// The prefix a capped string retained, when `text` is one this run capped.
+///
+/// A checker that reads a `text` payload is reading a record-time excerpt, not
+/// the tool's answer: comparing the excerpt against the whole reported range
+/// reports a contract break for every block over the cap, which is what made
+/// boost's preprocessor headers and chromium's Java classes share one I1(c)
+/// signature (#1775). The declared total must exceed what is left after the
+/// marker, so a source file that literally contains the marker text is not
+/// mistaken for a capped payload.
+fn retained_prefix(text: &str) -> Option<&str> {
+    let (prefix, total) = text.rsplit_once(TRUNCATION_MARKER_OPEN)?;
+    let total: usize = total.strip_suffix(TRUNCATION_MARKER_CLOSE)?.parse().ok()?;
+    (total > prefix.len()).then_some(prefix)
 }
 
 /// The JSONL line for one executed probe record: identity, exact arguments,
@@ -1783,7 +1812,16 @@ pub fn check_i1c(
                 ));
                 continue;
             };
-            if !text_matches_reported_lines(&expected, text) {
+            // A capped payload makes no claim past its cap: compare what the
+            // record kept, and count the reduced coverage (#1775).
+            let matched = match retained_prefix(text) {
+                Some(prefix) => {
+                    summary.i1c_prefix_only_checks += 1;
+                    text_prefix_matches_reported_lines(&expected, prefix)
+                }
+                None => text_matches_reported_lines(&expected, text),
+            };
+            if !matched {
                 sink.record(violation(
                     InvariantKind::I1,
                     language,
@@ -1817,19 +1855,7 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    // Split the returned text with the same mixed-ending convention as
-    // line_slice: `str::lines` splits on `\n` alone, so a CR-only file's
-    // block reads as one line and never matches its multi-row range
-    // (erupt's EruptModifyController.java, #1431).
-    let mut text_lines: Vec<&str> = Vec::new();
-    let mut rest = text;
-    while let Some((line, remaining)) = split_mixed_line(rest) {
-        text_lines.push(line);
-        rest = remaining;
-    }
-    if !rest.is_empty() {
-        text_lines.push(rest);
-    }
+    let text_lines = mixed_lines(text);
     let expected: Vec<&str> = expected
         .iter()
         .map(|line| line.trim_end_matches('\r'))
@@ -1862,6 +1888,46 @@ fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
                 || strip_type_keyword(text_lines[index])
                     .is_some_and(|stripped| expected[index] == stripped)
         })
+}
+
+/// Split with the same mixed-ending convention as `line_slice`: `str::lines`
+/// splits on `\n` alone, so a CR-only file's block reads as one line and never
+/// matches its multi-row range (erupt's EruptModifyController.java, #1431).
+fn mixed_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some((line, remaining)) = split_mixed_line(rest) {
+        lines.push(line);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+/// [`text_matches_reported_lines`] for a payload the record capped: the same
+/// line anchoring over however many lines survived, with the cut line read as
+/// a prefix of its file line. Coverage stops at the cap, so this can only
+/// clear a block's head -- the summary counts it separately for that reason.
+fn text_prefix_matches_reported_lines(expected: &[&str], prefix: &str) -> bool {
+    let prefix_lines = mixed_lines(prefix);
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    if prefix_lines.is_empty() || prefix_lines.len() > expected.len() {
+        return false;
+    }
+    let last = prefix_lines.len() - 1;
+    if last == 0 {
+        // One retained line, cut at both ends: it can sit anywhere inside the
+        // block's first file line.
+        return expected[0].contains(prefix_lines[0]);
+    }
+    expected[0].ends_with(prefix_lines[0])
+        && expected[last].starts_with(prefix_lines[last])
+        && (1..last).all(|index| expected[index] == prefix_lines[index])
 }
 
 /// Strip a deliberately re-inserted `type` keyword (Go embedded fields
@@ -2896,6 +2962,90 @@ mod tests {
         let text = capped["blocks"][0]["text"].as_str().unwrap();
         assert!(text.contains("[truncated,"));
         assert!(text.len() < DUMP_PAYLOAD_EXCERPT_BYTES * 2);
+    }
+
+    /// #1775: `check_i1c` reads a record-time excerpt, not the tool's answer.
+    /// Every source block over the record-string cap used to fail the whole
+    /// line-anchored comparison, which is how boost's preprocessor headers and
+    /// chromium's 141-line Java classes came to share one I1(c) signature.
+    #[test]
+    fn oversized_source_block_is_checked_against_its_retained_prefix() {
+        let file_text: String = (1..=400).map(|row| format!("line {row} text\n")).collect();
+        let block_text = file_text.clone();
+        let end_line = 400;
+
+        let input = I1Input {
+            files: vec![crate::mcp_property_fuzzer::I1File {
+                path: "src/Big.java".to_string(),
+                text: Some(file_text.clone()),
+                parse_errors: None,
+            }],
+            symbols: Vec::new(),
+        };
+        assert!(
+            block_text.len() > DUMP_PAYLOAD_EXCERPT_BYTES,
+            "the fixture must exceed the record-string cap to exercise the capped path"
+        );
+
+        let faithful = i1c_violations(&input, &file_text, block_text.clone(), 1, end_line);
+        assert!(
+            faithful.is_empty(),
+            "a faithful oversized block must clear I1(c): {faithful:#?}"
+        );
+
+        // The same block with one interior line rewritten must still fail,
+        // as long as the divergence is inside the retained prefix.
+        let corrupted = block_text.replacen("line 7 text", "line 7 TEXT", 1);
+        let violations = i1c_violations(&input, &file_text, corrupted, 1, end_line);
+        assert_eq!(
+            1,
+            violations.len(),
+            "a divergence inside the retained prefix must still be reported: {violations:#?}"
+        );
+    }
+
+    fn i1c_violations(
+        input: &I1Input,
+        file_text: &str,
+        block_text: String,
+        start_line: usize,
+        end_line: usize,
+    ) -> Vec<crate::mcp_property_fuzzer::Violation> {
+        assert!(
+            file_text.len() > DUMP_PAYLOAD_EXCERPT_BYTES,
+            "the fixture file must be big enough for the cap to bite"
+        );
+        let record = ProbeRecord {
+            id: "i2:get_symbol_sources#0:Big".to_string(),
+            tool: "get_symbol_sources",
+            arguments: json!({"symbols": ["Big"]}),
+            symbol_fq: "Big".to_string(),
+            symbol_path: "src/Big.java".to_string(),
+            kind: ProbeKind::Spelling {
+                order: 0,
+                spelling: "Big".to_string(),
+            },
+            outcome: Some(ProbeOutcome::Structured {
+                structured: cap_strings_for_record(json!({
+                    "sources": [{
+                        "path": "src/Big.java",
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "text": block_text,
+                    }],
+                })),
+                mode_b_structured: None,
+            }),
+            elapsed_ms: None,
+        };
+        let mut sink = ViolationSink::default();
+        let mut summary = ProbeSummary::default();
+        check_i1c(&[&record], input, "java", &mut sink, &mut summary);
+        assert_eq!(
+            1, summary.i1c_prefix_only_checks,
+            "an over-cap block must be counted as prefix-only coverage"
+        );
+        sink.into_sorted_vec()
     }
 
     // --- anomaly-directed service-sample composition ---

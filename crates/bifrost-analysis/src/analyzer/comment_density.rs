@@ -75,7 +75,7 @@ fn analyze_file(
     // Analyzer range and child lookups may hydrate persisted file state. Build
     // the declaration view once per file instead of repeating those lookups
     // for every comment in the file.
-    let declarations = collect_declarations(analyzer, source, file);
+    let declarations = collect_declarations(analyzer, language, source, file);
     let mut aggregates: HashMap<String, (u32, u32)> = HashMap::default();
     for comment in comments {
         let start = comment.start_byte();
@@ -122,6 +122,7 @@ struct DensityRange {
 
 fn collect_declarations(
     analyzer: &(impl IAnalyzer + ?Sized),
+    language: Language,
     source: &str,
     file: &ProjectFile,
 ) -> Vec<DensityDeclaration> {
@@ -148,7 +149,7 @@ fn collect_declarations(
         let ranges = raw_ranges
             .into_iter()
             .map(|range| DensityRange {
-                start: expanded_comment_start(source, range.start_byte),
+                start: expanded_comment_start(language, source, range.start_byte),
                 declaration_start: range.start_byte,
                 end: range.end_byte,
             })
