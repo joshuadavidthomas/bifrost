@@ -134,7 +134,9 @@ impl<'a> PolicySelectorSession<'a> {
         // Retire the finishing region's consumed work before the counters are
         // discarded, so the compile-wide work report stays a running total.
         let used = self.semantic_budget.used();
-        self.retired_program_points = self.retired_program_points.saturating_add(used.program_points);
+        self.retired_program_points = self
+            .retired_program_points
+            .saturating_add(used.program_points);
         self.retired_source_bytes = self.retired_source_bytes.saturating_add(used.source_bytes);
         let execution = self.semantic_execution_budget.work();
         self.retired_materialized_files = self
@@ -356,7 +358,8 @@ impl<'a> PolicySelectorSession<'a> {
             (
                 "semantic_source_bytes",
                 PolicyWorkUnit::Bytes,
-                self.retired_source_bytes.saturating_add(semantic.source_bytes),
+                self.retired_source_bytes
+                    .saturating_add(semantic.source_bytes),
             ),
             (
                 "semantic_program_points",
