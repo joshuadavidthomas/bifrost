@@ -271,7 +271,7 @@ fn built_in_policy_catalog_lists_without_constructing_a_workspace() {
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     let manifest = json_stdout(&output);
     assert_eq!(manifest["id"], "bifrost.code-smells");
-    assert_eq!(manifest["policies"].as_array().map(Vec::len), Some(12));
+    assert_eq!(manifest["policies"].as_array().map(Vec::len), Some(13));
     assert_eq!(
         manifest["policies"][0]["id"],
         "bifrost.correctness.dynamic-evaluation"
@@ -341,6 +341,7 @@ fn built_in_pack_and_category_selectors_run_valid_batches() {
         category_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ]
     );
@@ -370,6 +371,7 @@ fn built_in_pack_and_category_selectors_run_valid_batches() {
         pack_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
             "bifrost.performance.expensive-operation-in-nested-loop",

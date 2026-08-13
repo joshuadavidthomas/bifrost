@@ -34,9 +34,10 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, an initial catalog of twelve
+The installed binary embeds `bifrost.code-smells`, a catalog of thirteen
 structured match policies. It covers dynamic evaluation, unsafe Python object
-deserialization, and review prompts for sorting, regular-expression compilation,
+deserialization, rayon parallelism inside blocking Rust lazy initializers,
+and review prompts for sorting, regular-expression compilation,
 file reads, serialization, parsing, database calls, network calls, subprocesses,
 sleep, and expensive operations beneath nested loops. Every rule is an ordinary
 checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
@@ -61,6 +62,19 @@ sleep inside a condition-controlled `while` loop is usually the deliberate
 mechanism of a poll or bounded-backoff loop and no longer matches. Counting
 loops that a language cannot lexically distinguish from iteration (Go's single
 `for`, C-style `for`) stay outside the rule.
+
+Pack version 1.5 adds `bifrost.correctness.rayon-in-blocking-lazy-init`, a
+Rust-only review prompt for a blocking lazy-init call (`OnceLock::get_or_init`,
+`OnceLock::get_or_try_init`, `Once::call_once`, `LazyLock::new`) whose
+initializer closure lexically contains rayon parallelism (`par_iter`,
+`into_par_iter`, `par_bridge`, `par_chunks`). When the first initialization
+runs on a rayon worker, the initializer's parallel join steals sibling jobs; a
+stolen job that re-enters the same cell parks on it forever and can wedge the
+whole pool. The match is lexical containment, not proof of a deadlock: a rayon
+call inside a nested closure defined within the initializer also matches even
+when that closure only runs later, and bare `rayon::join`, `rayon::scope`, and
+`ThreadPool::install` are excluded because their unqualified names are too
+generic for a name-based rule.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
