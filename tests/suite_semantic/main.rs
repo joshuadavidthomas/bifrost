@@ -49,6 +49,7 @@ mod jvm_standard_library_pack;
 mod kotlin_dependency_semantic_pack;
 mod kotlin_semantic_diagnostics;
 mod measure_analyzer_persisted_memory;
+mod measure_coedit_retrieval;
 mod measure_dataflow_lifecycle;
 mod measure_file_dependency_graph;
 mod measure_go_usage_graph_memory;
