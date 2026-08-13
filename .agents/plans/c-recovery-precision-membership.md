@@ -9,9 +9,9 @@ The forward-versus-inverse differential runner checks whether every exact invers
 ## Progress
 
 - [x] (2026-08-13 15:02Z) Read #2089, `.agents/PLANS.md`, the full-ledger correction, the generic census-membership code, C authoritative inverse batching, and C resolver role helpers.
-- [ ] Introduce a bounded C recovery-membership collector in `brokk-bifrost-cpp` using structured AST roles and exact macro-environment evidence.
-- [ ] Reuse the authoritative C batch visibility to augment precision membership without changing the census probe frontier.
-- [ ] Make non-reference usage-hit kinds precision-ineligible and add behavior coverage for recovered references, declarations, labels, garbage, and candidate-cap failure.
+- [x] (2026-08-13 21:12Z) Introduced a bounded C recovery-membership collector in `brokk-bifrost-cpp` using structured AST roles and exact macro-environment evidence.
+- [x] (2026-08-13 21:12Z) Reused the authoritative C batch visibility to augment precision membership without changing the census probe frontier.
+- [x] (2026-08-13 21:12Z) Made binding/declaration usage-hit kinds precision-ineligible and added behavior coverage for recovered type/member references, macro definition/formal exclusions, and candidate-cap failure.
 - [ ] Run focused validation, commit, rebuild the release runner, exact-replay representative corpus witnesses, push, publish evidence, and close #2089 without waiting for the complete C campaign.
 
 ## Surprises & Discoveries
@@ -27,6 +27,9 @@ The forward-versus-inverse differential runner checks whether every exact invers
 
 - Observation: all 904 full-ledger precision findings are wholly contained by tree-sitter-cpp `ERROR` ranges.
   Evidence: the completed ledger at Bifrost `fcd83045` has 904 inverse-precision rows in 49 files; the original 651 remain unchanged and the 253 added rows have the same recovery mechanism.
+
+- Observation: a valid macro argument can preserve an ordinary selected-member subtree even when the surrounding declaration-shaped parse is recovered as `ERROR`.
+  Evidence: `DISCARD(const int = state->timestamp)` expands to a valid constant while tree-sitter-cpp retains `state->timestamp` as a `field_expression` below `ERROR`. Both authoritative inverse lookup and the recovery-membership collector identify the exact `timestamp` range.
 
 ## Decision Log
 
@@ -48,7 +51,9 @@ The forward-versus-inverse differential runner checks whether every exact invers
 
 ## Outcomes & Retrospective
 
-No production code has changed yet. The audit establishes a shared runner/language seam: the probe frontier is correctly conservative, while inverse precision needs a distinct C recovery membership set and explicit hit-kind eligibility.
+The implementation now separates the two contracts that the old shared census range set conflated. `CandidateFrontier::Census` remains conservative and still contributes no probe below `ERROR`. During inverse comparison, the already-built C authoritative batch supplies a bounded, structured recovery-only range set backed by the same macro visibility facts used by C usage resolution. The runner merges that set only for an explicitly C corpus and treats incomplete membership as unavailable rather than complete. Definition/import/reexport/override hits are excluded before reference-precision grading.
+
+The focused fixture proves the important non-vacuous case end to end: authoritative inverse analysis actually returns both a recovered type reference and a recovered selected-member reference; neither range appears among probe sites; and the differential emits no inverse-precision finding. The low-level collector test also pins macro definition/formal rejection and all-or-nothing cap behavior. Existing #1784 misparsed-region probing remains unchanged. Corpus replay and publication evidence are still pending.
 
 ## Context and Orientation
 
@@ -116,6 +121,8 @@ The completed full C ledger at Bifrost `fcd830452a078c69bb7e1f1d085c78ff447de7fe
 Representative shapes are strongSwan `malloc_thing(private_host_t)`, libarchive `iso9660->opt.boot`, pgBackRest `configLocal->option[...]`, SPDK declaration type references, Git `istate->timestamp`, and macro-shaped `THIS(const Bz2Compress)`. Two SPDK rows are Definition hits and should clear through eligibility, not membership.
 
 Plan revision note (2026-08-13): Created after #2093 closure. The source audit established that the authoritative C inverse batch is the minimal reuse seam and that the generic probe frontier must remain untouched.
+
+Plan revision note (2026-08-13 21:12Z): Updated after implementation and focused validation. The synthetic member witness was changed to a valid ignored macro argument, `DISCARD(const int = state->timestamp)`, so the grammar preserves a structured `field_expression` under `ERROR` and the test proves an actual inverse hit rather than membership-only bookkeeping.
 
 ## Interfaces and Dependencies
 

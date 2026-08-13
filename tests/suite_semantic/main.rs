@@ -70,6 +70,7 @@ mod python_dependency_pack;
 mod python_semantic_diagnostics;
 mod reference_differential;
 mod reference_differential_backlog_test;
+mod reference_differential_c_membership;
 mod ruby_dependency_semantic_pack;
 mod ruby_semantic_diagnostics;
 mod rust_dependency_semantic_pack;

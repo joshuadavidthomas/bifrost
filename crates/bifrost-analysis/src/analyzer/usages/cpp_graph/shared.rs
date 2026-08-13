@@ -10,14 +10,18 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, Range, resolve_analyzer,
+};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_cpp::declarations::CppSentinelRecoveredClass;
 use brokk_bifrost_cpp::graph::extractor::{
     ScanState, prepare_file, prewarm_project_using_index, scan_prepared_file,
 };
-use brokk_bifrost_cpp::graph::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
+use brokk_bifrost_cpp::graph::resolver::{
+    RecoveredCReferenceRanges, TargetSpec, TypeScanKey, VisibilityIndex,
+};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -133,6 +137,23 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
             max_usages,
             &self.visibility,
         )
+    }
+
+    pub fn recovered_c_reference_ranges(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> Option<Vec<Range>> {
+        let prepared = self.resolver.cpp.prepared_syntax(file)?;
+        match self.visibility.recovered_c_reference_ranges(
+            file,
+            prepared.tree().root_node(),
+            prepared.source(),
+            limit,
+        ) {
+            RecoveredCReferenceRanges::Complete(ranges) => Some(ranges),
+            RecoveredCReferenceRanges::LimitExceeded => None,
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]

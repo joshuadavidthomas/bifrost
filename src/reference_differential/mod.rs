@@ -475,7 +475,7 @@ pub fn run_reference_differential_with_progress(
         &mut summary,
         &mut file_errors,
     )?;
-    let census_membership = if config.probe_seed == ProbeSeed::Census {
+    let mut census_membership = if config.probe_seed == ProbeSeed::Census {
         collect_census_membership(
             analyzer,
             &audited,
@@ -510,7 +510,7 @@ pub fn run_reference_differential_with_progress(
     let inverse_precision_findings = compare_inverse(
         analyzer,
         &audited,
-        &census_membership,
+        &mut census_membership,
         groups,
         config,
         &mut records,
@@ -570,6 +570,53 @@ fn collect_census_membership(
         membership.insert(rel_path_string(file), Some(entries));
     }
     membership
+}
+
+fn augment_c_recovery_membership(
+    analyzer: &dyn IAnalyzer,
+    membership: &mut CensusMembership,
+    batch: Option<&CppAuthoritativeUsageBatch<'_>>,
+    files: &HashSet<ProjectFile>,
+    limit: usize,
+) {
+    for file in files {
+        let path = rel_path_string(file);
+        let Some(entry) = membership.get_mut(&path) else {
+            continue;
+        };
+        if entry.is_none() {
+            continue;
+        }
+        let Some(batch) = batch else {
+            *entry = None;
+            continue;
+        };
+        let Some(source) = analyzer.indexed_source(file) else {
+            *entry = None;
+            continue;
+        };
+        let Some(ranges) = batch.recovered_c_reference_ranges(file, limit) else {
+            *entry = None;
+            continue;
+        };
+        let mut exceeded = false;
+        if let Some(entries) = entry.as_mut() {
+            for range in ranges {
+                let Some(text) = source.get(range.start_byte..range.end_byte) else {
+                    exceeded = true;
+                    break;
+                };
+                entries.insert((range.start_byte, range.end_byte, text.to_string()));
+                if entries.len() > limit {
+                    exceeded = true;
+                    break;
+                }
+            }
+        }
+        if exceeded {
+            *entry = None;
+        }
+    }
 }
 
 fn eligible_files_with_inventory(
@@ -1165,7 +1212,7 @@ fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
 fn compare_inverse(
     analyzer: &dyn IAnalyzer,
     audited_files: &[ProjectFile],
-    census_membership: &CensusMembership,
+    census_membership: &mut CensusMembership,
     mut groups: Vec<ResolvedGroup>,
     config: &ReferenceDifferentialConfig,
     records: &mut [ReferenceDifferentialSite],
@@ -1262,6 +1309,15 @@ fn compare_inverse(
     } else {
         CppAuthoritativeUsageBatch::new(analyzer, &cpp_roots)
     };
+    if config.probe_seed == ProbeSeed::Census && config.corpus_language == "c" {
+        augment_c_recovery_membership(
+            analyzer,
+            census_membership,
+            cpp_batch.as_ref(),
+            &cpp_roots,
+            config.max_candidates_per_file,
+        );
+    }
     if !cpp_roots.is_empty() {
         progress(
             ReferenceDifferentialProgress::InverseVisibilityBuildCompleted {
@@ -1496,6 +1552,15 @@ fn inverse_precision_findings(
         .collect::<Vec<_>>();
     hits.iter()
         .filter_map(|hit| {
+            if matches!(
+                hit.kind,
+                UsageHitKind::Import
+                    | UsageHitKind::Reexport
+                    | UsageHitKind::Definition
+                    | UsageHitKind::OverrideDeclaration
+            ) {
+                return None;
+            }
             let path = rel_path_string(&hit.file);
             let trigger_site = trigger_sites
                 .iter()
@@ -2117,6 +2182,21 @@ mod tests {
                 .expect("trigger site")
                 .path,
             "lib.rs"
+        );
+        assert!(
+            inverse_precision_findings(
+                analyzer,
+                std::slice::from_ref(&target),
+                &[hit.clone().into_definition()],
+                &empty_membership,
+                &[ExactReferenceSite {
+                    path: "lib.rs".to_string(),
+                    start_byte: start,
+                    end_byte: Some(start + "target".len()),
+                }],
+            )
+            .is_empty(),
+            "definition linkage is not a source reference precision claim"
         );
 
         let mut membership = HashMap::default();

@@ -1938,4 +1938,67 @@ ABSL_NAMESPACE_END
             "required parameter must remain enforced: {arity:?}"
         );
     }
+
+    #[test]
+    fn recovered_c_precision_membership_keeps_roles_bounded_and_structured() {
+        let source = r#"typedef struct Widget Widget;
+struct Widget { int field; };
+#define THIS(type) type *self
+
+int trigger(Widget *value) { return value->field; }
+int recovered(void) { THIS(const Widget); return 0; }
+
+struct Stamp { int sec; };
+struct State { struct Stamp timestamp; };
+#define DISCARD(value) 0
+int recovered_member(struct State *state) {
+    DISCARD(const int = state->timestamp);
+    return 0;
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        let file = ProjectFile::new(&root, "recovered.c");
+        fs::write(file.abs_path(), source).expect("write recovery fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(&analyzer, &roots).expect("C batch");
+        let ranges = batch
+            .recovered_c_reference_ranges(&file, 100)
+            .expect("complete recovered ranges");
+        let ranges = ranges
+            .into_iter()
+            .map(|range| (range.start_byte, range.end_byte))
+            .collect::<HashSet<_>>();
+
+        let recovered_type = source.rfind("Widget").expect("recovered Widget");
+        let recovered_member = source.rfind("timestamp").expect("recovered timestamp");
+        assert!(
+            ranges.contains(&(recovered_type, recovered_type + "Widget".len())),
+            "the macro-shaped type remains a structured reference: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(recovered_member, recovered_member + "timestamp".len())),
+            "the recovered selected member remains a structured reference: {ranges:?}"
+        );
+
+        let macro_definition =
+            source.find("#define THIS").expect("THIS definition") + "#define ".len();
+        let macro_formal = source.find("THIS(type)").expect("THIS formal") + "THIS(".len();
+        assert!(
+            !ranges.contains(&(macro_definition, macro_definition + "THIS".len())),
+            "macro definition names are not references"
+        );
+        assert!(
+            !ranges.contains(&(macro_formal, macro_formal + "type".len())),
+            "macro formal parameters are not references"
+        );
+        assert!(
+            batch.recovered_c_reference_ranges(&file, 0).is_none(),
+            "a cap hit makes the whole recovery membership unavailable"
+        );
+    }
 }

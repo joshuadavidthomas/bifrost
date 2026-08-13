@@ -114,6 +114,12 @@ pub enum OrdinaryMacroReferenceResolution {
     Missing,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveredCReferenceRanges {
+    Complete(Vec<Range>),
+    LimitExceeded,
+}
+
 pub fn resolve_namespace_value(
     analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
@@ -1814,6 +1820,51 @@ impl<'a> VisibilityIndex<'a> {
             }
             0 => OrdinaryMacroReferenceResolution::Missing,
         }
+    }
+
+    /// Collect reference-capable C tokens beneath tree-sitter recovery nodes.
+    ///
+    /// The ordinary census deliberately skips every `ERROR` subtree. This
+    /// separate, precision-only frontier admits only roles that retain enough
+    /// structure for the C usage graph to interpret independently (#2089).
+    /// Macro evidence comes from this visibility index at the exact byte; no
+    /// source-text parsing or terminal-name fallback is used.
+    pub fn recovered_c_reference_ranges(
+        &self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        limit: usize,
+    ) -> RecoveredCReferenceRanges {
+        if !is_c_source_file(file) {
+            return RecoveredCReferenceRanges::Complete(Vec::new());
+        }
+        let mut ranges = Vec::new();
+        let mut seen = HashSet::default();
+        let mut stack = vec![(root, root.is_error())];
+        while let Some((node, inside_error)) = stack.pop() {
+            let inside_error = inside_error || node.is_error();
+            if inside_error
+                && recovered_c_reference_node(self, file, node, source)
+                && seen.insert((node.start_byte(), node.end_byte()))
+            {
+                if ranges.len() == limit {
+                    return RecoveredCReferenceRanges::LimitExceeded;
+                }
+                ranges.push(Range {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    start_line: node.start_position().row,
+                    end_line: node.end_position().row,
+                });
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push((child, inside_error));
+            }
+        }
+        ranges.sort_unstable();
+        RecoveredCReferenceRanges::Complete(ranges)
     }
 
     /// Whether this target is an indexed macro visible from this file.
@@ -9040,6 +9091,103 @@ pub fn is_ordinary_macro_reference_node(node: Node<'_>) -> bool {
         current = ancestor.parent();
     }
     true
+}
+
+fn recovered_c_reference_node(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    if node.start_byte() >= node.end_byte()
+        || node.is_error()
+        || node.is_missing()
+        || !matches!(
+            node.kind(),
+            "identifier" | "field_identifier" | "type_identifier" | "namespace_identifier"
+        )
+        || recovered_c_macro_binding_role(node)
+        || recovered_c_label_role(node)
+    {
+        return false;
+    }
+
+    let name = node_text(node, source);
+    if !name.is_empty() && visibility.macro_name_may_be_bound_at(file, name, node.start_byte()) {
+        return true;
+    }
+    if is_declaration_name(node) {
+        return false;
+    }
+    if matches!(node.kind(), "type_identifier" | "namespace_identifier") {
+        return true;
+    }
+    recovered_c_reference_anchor(node)
+}
+
+fn recovered_c_macro_binding_role(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "preproc_def" | "preproc_function_def" | "preproc_params"
+        ) {
+            return true;
+        }
+        if parent.is_error()
+            || matches!(
+                parent.kind(),
+                "translation_unit" | "function_definition" | "compound_statement"
+            )
+        {
+            return false;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn recovered_c_label_role(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "labeled_statement" | "goto_statement")
+            && parent.child_by_field_name("label") == Some(node)
+    })
+}
+
+fn recovered_c_reference_anchor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() {
+            return false;
+        }
+        if parent.kind().ends_with("_expression")
+            || matches!(
+                parent.kind(),
+                "argument_list"
+                    | "return_statement"
+                    | "expression_statement"
+                    | "case_statement"
+                    | "initializer_list"
+                    | "init_declarator"
+                    | "array_declarator"
+                    | "field_designator"
+                    | "enumerator"
+            )
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "translation_unit"
+                | "function_definition"
+                | "compound_statement"
+                | "declaration"
+                | "field_declaration"
+                | "parameter_declaration"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 /// Whether a parameter declaration belongs to the callable scope whose body can
