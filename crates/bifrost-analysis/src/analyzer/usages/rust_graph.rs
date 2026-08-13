@@ -1,5 +1,4 @@
 use crate::analyzer::rust::usage_binding_seeds;
-#[cfg(test)]
 use crate::analyzer::rust::usage_candidate_files_while;
 mod extractor;
 mod hits;
@@ -16,7 +15,6 @@ use crate::analyzer::usages::outcome::{
 use crate::analyzer::usages::rust_graph::extractor::{
     effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
-#[cfg(test)]
 use crate::analyzer::usages::rust_graph::resolver::infer_graph_seeds_while;
 use crate::analyzer::usages::rust_graph::resolver::{
     RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
@@ -25,7 +23,6 @@ use crate::analyzer::usages::rust_graph::resolver::{
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
-#[cfg(test)]
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -71,7 +68,6 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
-#[cfg(test)]
 pub(crate) fn rust_usage_candidate_files(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,

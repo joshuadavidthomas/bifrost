@@ -23,10 +23,10 @@ mod usage_walks_tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, fqn_bulk_nodes,
+    BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
+    DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
+    LanguageSupport, StructuralReceiverResolver, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
@@ -37,6 +37,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_rust_type_bounded};
 use crate::analyzer::usages::rust_graph::{
     RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
+    rust_usage_candidate_files,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
@@ -94,13 +95,12 @@ pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
-#[cfg(test)]
-pub(crate) use brokk_bifrost_rust::usage::usage_candidate_files_while;
 pub(crate) use brokk_bifrost_rust::usage::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
-    usage_binding_seeds, usage_crate_export_targets, usage_declaration_visible_at,
-    usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    usage_binding_seeds, usage_candidate_files_while, usage_crate_export_targets,
+    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
+    usage_importers, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
 };
 
 #[derive(Clone)]
@@ -1350,6 +1350,15 @@ impl LanguageSupport for RustSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &RUST_USAGE_STRATEGY
+    }
+
+    /// Protected: these are the files reached through Rust's re-export and binding graph,
+    /// which the generic import-graph walk cannot see, so a truncated query that dropped
+    /// them would report proven absence for a symbol used through a `pub use`.
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        Some(CandidateAugmentation::protected(
+            rust_usage_candidate_files(ctx.analyzer, ctx.target, ctx.cancellation),
+        ))
     }
 
     fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
