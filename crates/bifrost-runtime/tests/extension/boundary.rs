@@ -3,8 +3,9 @@ use brokk_bifrost_analysis::Language;
 use brokk_bifrost_runtime::extension::{
     CodeQuery, ExtensionCancellation, ExtensionCompatibility, ExtensionCompletion, ExtensionError,
     ExtensionLimitValues, ExtensionLimits, ExtensionRequest, ExtensionResponse, ExtensionWorkspace,
-    ExtensionWorkspaceOptions, NormalizedRelativePath, SemanticRelationRequest, SourceSpan,
-    StructuralRequest, decode_request_json, encode_request_json, encode_response_json,
+    ExtensionWorkspaceOptions, NormalizedRelativePath, SemanticDirection, SemanticRelationKind,
+    SemanticRelationRequest, SemanticRelationScope, SemanticSeed, SourceSpan, StructuralRequest,
+    decode_request_json, encode_request_json, encode_response_json,
 };
 use serde_json::json;
 
@@ -123,6 +124,106 @@ fn semantic_control_flow_is_source_backed_and_cancellable() {
         outcome.completion,
         ExtensionCompletion::Truncated { .. }
     ));
+}
+
+#[test]
+fn semantic_control_dependence_preserves_typed_branch_evidence() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/app.ts",
+            "export function answer(flag: boolean) { let value = 0; if (flag) value = 42; else value = 7; return value; }\n",
+        )
+        .build();
+    let workspace =
+        ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(project.root())).unwrap();
+    let base = SemanticRelationRequest::from_source(
+        workspace.generation().clone(),
+        SourceSpan {
+            path: NormalizedRelativePath::new("src/app.ts").unwrap(),
+            start_utf8_byte: 20,
+            end_utf8_byte: 20,
+        },
+        ExtensionLimits::default(),
+    )
+    .unwrap();
+    let request = SemanticRelationRequest::new(
+        base.expected_generation,
+        vec![SemanticSeed::Source {
+            span: match &base.seeds[0] {
+                SemanticSeed::Source { span } => span.clone(),
+                SemanticSeed::StableNode { .. } => unreachable!(),
+            },
+        }],
+        SemanticRelationScope::Procedure,
+        vec![SemanticRelationKind::ControlDependence],
+        SemanticDirection::Outgoing,
+        base.limits,
+    )
+    .unwrap();
+    let outcome = workspace
+        .semantic_relations(request, &ExtensionCancellation::new())
+        .unwrap();
+    assert_eq!(outcome.completion, ExtensionCompletion::Complete);
+    let snapshot = outcome.value.unwrap();
+    assert!(!snapshot.edges.is_empty());
+    assert!(
+        snapshot
+            .edges
+            .iter()
+            .all(|edge| edge.kind == SemanticRelationKind::ControlDependence)
+    );
+    assert!(snapshot.edges.iter().any(|edge| {
+        edge.subtype.as_deref() == Some("conditional_true")
+            || edge.subtype.as_deref() == Some("conditional_false")
+    }));
+    assert!(snapshot.edges.iter().all(|edge| {
+        !edge.evidence.is_empty()
+            && edge
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.mappings.iter())
+                .all(|span| span.path.as_str() == "src/app.ts")
+    }));
+}
+
+#[test]
+fn java_control_dependence_uses_the_same_language_neutral_relation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/App.java",
+            "class App { int answer(boolean flag) { int value = 0; if (flag) value = 42; else value = 7; return value; } }\n",
+        )
+        .build();
+    let workspace =
+        ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(project.root())).unwrap();
+    let span = SourceSpan {
+        path: NormalizedRelativePath::new("src/App.java").unwrap(),
+        start_utf8_byte: 20,
+        end_utf8_byte: 20,
+    };
+    let request = SemanticRelationRequest::new(
+        workspace.generation().clone(),
+        vec![SemanticSeed::Source { span }],
+        SemanticRelationScope::Procedure,
+        vec![SemanticRelationKind::ControlDependence],
+        SemanticDirection::Outgoing,
+        ExtensionLimits::default().values().into(),
+    )
+    .unwrap();
+    let snapshot = workspace
+        .semantic_relations(request, &ExtensionCancellation::new())
+        .unwrap()
+        .value
+        .unwrap();
+    assert!(!snapshot.edges.is_empty());
+    assert!(snapshot.edges.iter().all(|edge| {
+        edge.kind == SemanticRelationKind::ControlDependence
+            && edge
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.mappings.iter())
+                .all(|span| span.path.as_str() == "src/App.java")
+    }));
 }
 
 #[test]

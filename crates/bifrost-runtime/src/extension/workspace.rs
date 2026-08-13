@@ -1,6 +1,7 @@
 use super::*;
 use brokk_bifrost_analysis::analyzer::semantic::{
     SemanticBudget, SemanticOutcome, SemanticRequest,
+    cfg_algorithms::derive_procedure_control_dependence,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryExecutionLimits, execute_workspace_request_with_cancellation,
@@ -390,38 +391,116 @@ impl ExtensionWorkspace {
                 }
             })
             .collect::<Vec<_>>();
-        let edges = procedure
-            .control_edges()
-            .iter()
-            .filter(|edge| {
-                edge.source_point.index() < values.max_nodes as usize
-                    && edge.target_point.index() < values.max_nodes as usize
-            })
-            .take(values.max_edges as usize)
-            .map(|edge| SemanticRelationEdge {
-                source: edge.source_point.index() as u32,
-                target: edge.target_point.index() as u32,
-                kind: SemanticRelationKind::ControlFlow,
-                subtype: Some(edge.kind.label().into()),
+        let source_span = |mapping_id| {
+            let mapping = procedure
+                .source_mapping(mapping_id)
+                .expect("validated semantic source mapping");
+            let span = mapping.locator.anchor().span();
+            SourceSpan {
+                path: seed.path.clone(),
+                start_utf8_byte: span.start_byte() as u64,
+                end_utf8_byte: span.end_byte() as u64,
+            }
+        };
+        let edge_evidence = |edge: &brokk_bifrost_analysis::analyzer::semantic::ControlEdge| {
+            let evidence = procedure
+                .evidence_row(edge.evidence)
+                .expect("validated control-edge evidence");
+            let completeness = match &evidence.completeness {
+                brokk_bifrost_analysis::analyzer::semantic::EvidenceCompleteness::Complete => {
+                    SemanticRelationCompleteness::Complete
+                }
+                brokk_bifrost_analysis::analyzer::semantic::EvidenceCompleteness::Partial(
+                    reason,
+                ) => SemanticRelationCompleteness::Partial {
+                    reason: reason.clone(),
+                },
+            };
+            SemanticEvidence {
+                kind: "control_edge".into(),
+                mappings: std::iter::once(source_span(edge.source))
+                    .chain(evidence.sources.iter().copied().map(source_span))
+                    .collect(),
                 proof: SemanticProof::Proven,
-                completeness: SemanticRelationCompleteness::Complete,
-                evidence: vec![SemanticEvidence {
-                    kind: "control_edge".into(),
-                    mappings: vec![seed.clone()].into_boxed_slice(),
-                    proof: SemanticProof::Proven,
-                    completeness: SemanticRelationCompleteness::Complete,
-                }]
-                .into_boxed_slice(),
-            })
-            .collect::<Vec<_>>();
+                completeness,
+            }
+        };
+        let mut edges = Vec::new();
+        if request
+            .relations
+            .contains(&SemanticRelationKind::ControlFlow)
+        {
+            edges.extend(
+                procedure
+                    .control_edges()
+                    .iter()
+                    .filter(|edge| {
+                        edge.source_point.index() < values.max_nodes as usize
+                            && edge.target_point.index() < values.max_nodes as usize
+                    })
+                    .map(|edge| SemanticRelationEdge {
+                        source: edge.source_point.index() as u32,
+                        target: edge.target_point.index() as u32,
+                        kind: SemanticRelationKind::ControlFlow,
+                        subtype: Some(edge.kind.label().into()),
+                        proof: SemanticProof::Proven,
+                        completeness: SemanticRelationCompleteness::Complete,
+                        evidence: vec![edge_evidence(edge)].into_boxed_slice(),
+                    }),
+            );
+        }
+        let mut relation_boundaries = Vec::new();
+        let mut algorithm_work = 0_u64;
+        if request
+            .relations
+            .contains(&SemanticRelationKind::ControlDependence)
+        {
+            let dependence = derive_procedure_control_dependence(
+                procedure,
+                usize::try_from(values.max_traversal_steps).unwrap_or(usize::MAX),
+                cancellation.token(),
+            )
+            .map_err(ExtensionError::Execution)?;
+            algorithm_work = (dependence.node_visits + dependence.edge_visits) as u64;
+            edges.extend(dependence.rows.iter().filter_map(|(edge_id, governed)| {
+                let edge = procedure.control_edge(*edge_id)?;
+                (edge.source_point.index() < values.max_nodes as usize
+                    && governed.index() < values.max_nodes as usize)
+                    .then(|| SemanticRelationEdge {
+                        source: edge.source_point.index() as u32,
+                        target: governed.index() as u32,
+                        kind: SemanticRelationKind::ControlDependence,
+                        subtype: Some(edge.kind.label().into()),
+                        proof: SemanticProof::Proven,
+                        completeness: SemanticRelationCompleteness::Complete,
+                        evidence: vec![edge_evidence(edge)].into_boxed_slice(),
+                    })
+            }));
+            relation_boundaries.extend(dependence.non_exiting_regions.iter().map(|region| {
+                SemanticRelationBoundary {
+                    kind: SemanticRelationBoundaryKind::NonExitingRegion,
+                    at: region.first().map(|point| point.index() as u32),
+                    relations: vec![SemanticRelationKind::ControlDependence].into_boxed_slice(),
+                    message: format!(
+                        "{} live program points cannot reach a procedure exit",
+                        region.len()
+                    )
+                    .into_boxed_str(),
+                    evidence: Box::new([]),
+                }
+            }));
+        }
+        let derived_edge_count = edges.len();
+        edges.truncate(values.max_edges as usize);
         let work = ExtensionWork {
             semantic_nodes: nodes.len() as u64,
             semantic_edges: edges.len() as u64,
+            traversal_steps: algorithm_work,
             ..Default::default()
         };
         let request_digest = request_digest(&request)
             .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
-        let boundaries = if truncated {
+        let mut boundaries = if truncated || derived_edge_count > values.max_edges as usize {
             vec![SemanticRelationBoundary {
                 kind: SemanticRelationBoundaryKind::NodeLimit,
                 at: None,
@@ -432,6 +511,9 @@ impl ExtensionWorkspace {
         } else {
             Vec::new()
         };
+        boundaries.extend(relation_boundaries);
+        let truncated =
+            truncated || derived_edge_count > values.max_edges as usize || !boundaries.is_empty();
         let snapshot = SemanticRelationSnapshot::try_new(
             self.generation.clone(),
             request_digest,
