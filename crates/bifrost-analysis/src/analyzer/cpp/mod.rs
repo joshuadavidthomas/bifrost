@@ -115,6 +115,7 @@ pub struct CppAnalyzer {
     /// the exclusion verdict is a pure function of the analyzer and the file.
     direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
+    external_header_closures: Arc<KeyedPoolSafeMemo<ProjectFile, external::ReachedExternalHeaders>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -135,6 +136,17 @@ pub struct CppAnalyzer {
     /// counted 11.0M of.
     #[cfg(any(test, feature = "test-support"))]
     reconcile_candidate_evaluation_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    external_header_closure_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    external_header_parse_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExternalHeaderClosureWorkCounts {
+    pub builds: usize,
+    pub external_header_parses: usize,
 }
 
 impl ForwardQueryProvider for CppAnalyzer {
@@ -233,6 +245,7 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
+            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -249,6 +262,10 @@ impl CppAnalyzer {
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -345,6 +362,7 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
+            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -361,6 +379,10 @@ impl CppAnalyzer {
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -402,6 +424,43 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
+    }
+
+    pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+        self.inner.active_query_cancellation()
+    }
+
+    fn external_header_closure_cell(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<PoolSafeMemo<external::ReachedExternalHeaders>> {
+        self.external_header_closures.cell(file)
+    }
+
+    fn record_external_header_closure_build(&self) {
+        #[cfg(test)]
+        self.external_header_closure_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_external_header_parse(&self) {
+        #[cfg(test)]
+        self.external_header_parse_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_header_closure_work_counts_for_test(
+        &self,
+    ) -> ExternalHeaderClosureWorkCounts {
+        ExternalHeaderClosureWorkCounts {
+            builds: self
+                .external_header_closure_build_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            external_header_parses: self
+                .external_header_parse_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn prepared_syntax_limited_cancellable(

@@ -95,8 +95,17 @@ pub fn external_angle_include_paths(source: &str) -> Vec<PathBuf> {
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .expect("the linked tree-sitter-cpp grammar matches this tree-sitter version");
     let tree = parser.parse(source, None).expect("uncancelled C++ parse");
+    external_angle_include_paths_from_root(source, tree.root_node())
+}
+
+/// Return literal unconditional angle includes from an existing C++ syntax tree.
+///
+/// The source and root must describe the same immutable snapshot. Analyzer
+/// callers use this form to reuse prepared workspace syntax; standalone
+/// external headers use [`external_angle_include_paths`].
+pub fn external_angle_include_paths_from_root(source: &str, root: Node<'_>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let mut stack = vec![tree.root_node()];
+    let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "preproc_include"
             && !has_conditional_preprocessor_ancestor(node)
@@ -350,11 +359,19 @@ mod tests {
 
     #[test]
     fn extracts_only_literal_angle_include_paths() {
+        let source = "#include <vector>\n#include \"local.hpp\"\n#include HEADER\n#if FEATURE\n#include <conditional.hpp>\n#endif\n";
         assert_eq!(
             vec![PathBuf::from("vector")],
-            external_angle_include_paths(
-                "#include <vector>\n#include \"local.hpp\"\n#include HEADER\n"
-            )
+            external_angle_include_paths(source)
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("tree");
+        assert_eq!(
+            vec![PathBuf::from("vector")],
+            external_angle_include_paths_from_root(source, tree.root_node())
         );
     }
 
