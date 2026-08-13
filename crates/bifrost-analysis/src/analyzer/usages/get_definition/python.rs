@@ -1599,6 +1599,58 @@ pub(super) fn resolve_python(
     }
 }
 
+/// Restore the exact synthetic identifier selected inside a deferred annotation.
+///
+/// Tree-sitter represents the contents of `"Widget | Gadget"` as one
+/// `string_content` leaf. The generic reference-site resolver therefore widens
+/// either structured occurrence range to that whole leaf, even though the
+/// Python adapter has parsed and validated two distinct identifier ranges
+/// inside it. Narrow only ranges reproduced by that structured parser; ordinary
+/// strings and arbitrary subranges retain the generic fail-closed behavior.
+pub(super) fn python_site_for_focus(
+    mut site: ResolvedReferenceSite,
+    tree: &Tree,
+    source: &str,
+    requested_start: Option<usize>,
+    requested_end: Option<usize>,
+) -> ResolvedReferenceSite {
+    let (Some(start), Some(end)) = (requested_start, requested_end) else {
+        return site;
+    };
+    let Some(node) = smallest_named_node_covering(tree.root_node(), start, end) else {
+        return site;
+    };
+    if node.kind() != "string_content" {
+        return site;
+    }
+    let Some(string) = node.parent() else {
+        return site;
+    };
+    let exact_deferred_identifier =
+        python_deferred_annotation_identifier_ranges(string, source, None).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|range| range.start_byte == start && range.end_byte == end)
+        });
+    if !exact_deferred_identifier {
+        return site;
+    }
+    let Some(text) = source.get(start..end) else {
+        return site;
+    };
+    let line_starts = compute_line_starts(source);
+    site.text = text.to_owned();
+    site.range = Range {
+        start_byte: start,
+        end_byte: end,
+        start_line: find_line_index_for_offset(&line_starts, start) + 1,
+        end_line: find_line_index_for_offset(&line_starts, end.saturating_sub(1)) + 1,
+    };
+    site.focus_start_byte = start;
+    site.focus_end_byte = end;
+    site
+}
+
 #[allow(clippy::too_many_arguments)]
 fn python_visible_module_binding_candidates(
     analyzer: &dyn IAnalyzer,
