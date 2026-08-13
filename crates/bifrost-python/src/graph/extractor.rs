@@ -1096,19 +1096,23 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         record_hit(attribute, ctx);
     }
 
-    if let Some(namespace_target) = namespace_attribute_target_hit(node, ctx) {
-        record_hit(namespace_target, ctx);
+    if let Some(module_binding_target) = module_binding_attribute_target_hit(node, ctx) {
+        record_hit(module_binding_target, ctx);
     }
 }
 
-/// Resolve a top-level symbol written through a namespace import and any number
-/// of intermediate modules (`K.feature.DISK`, `pkg.core.ops.eye_like`).
+/// Resolve a top-level symbol written through an imported module binding and
+/// any number of intermediate modules (`K.feature.DISK`,
+/// `pkg.core.ops.eye_like`). This includes both `import pkg as K` and
+/// `from pkg import submodule`; the latter is a named import syntactically but
+/// still introduces a module binding when the structured module index proves
+/// that `pkg.submodule` is a workspace module.
 ///
 /// The written path is assembled only from tree-sitter's `attribute` fields.
 /// The analyzer's canonical export resolver then proves that the whole path
 /// names the exact physical target, so re-export aliases remain supported
 /// without comparing rendered source paths or broadening same-name candidates.
-fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
+fn module_binding_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
     if ctx.target_member.is_some() {
         return None;
     }
@@ -1124,16 +1128,8 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         return None;
     }
 
-    let root_name = slice(root, ctx.source);
-    if root_name.is_empty() || import_root_shadowed(ctx, root_name, root, node) {
-        return None;
-    }
-    let binder = ctx.python.import_binder_of(ctx.file);
-    let binding = binder.bindings.get(root_name)?;
-    if binding.kind != ImportKind::Namespace {
-        return None;
-    }
-    let mut written_module = binding.module_specifier.clone();
+    let imported_module = imported_module_binding_fqn(ctx, root, node)?;
+    let mut written_module = imported_module.clone();
     for attribute in &attributes[..attributes.len() - 1] {
         let segment = slice(*attribute, ctx.source);
         if segment.is_empty() {
@@ -1152,7 +1148,7 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         return Some(terminal);
     }
 
-    let mut written_fqn = binding.module_specifier.clone();
+    let mut written_fqn = imported_module;
     for attribute in attributes {
         let segment = slice(attribute, ctx.source);
         if segment.is_empty() {
@@ -1465,7 +1461,9 @@ fn imported_module_binding_fqn(
     if root_text.is_empty() {
         return None;
     }
-    if import_root_shadowed(ctx, root_text, root, reference) {
+    if import_root_shadowed(ctx, root_text, root, reference)
+        || !ctx.module_binding_targets_query(root_text, reference)
+    {
         return None;
     }
     let binder = ctx.python.import_binder_of(ctx.file);
@@ -1492,9 +1490,9 @@ fn import_root_shadowed(
     root: Node<'_>,
     reference: Node<'_>,
 ) -> bool {
-    ctx.scope_facts_for_node(root)
-        .or_else(|| ctx.scope_facts_for_node(reference))
-        .is_some_and(|facts| facts.is_shadowed(root_text))
+    ctx.scope_entry_for_node(root)
+        .or_else(|| ctx.scope_entry_for_node(reference))
+        .is_some_and(|(scope, facts)| !scope.is_module() && facts.is_shadowed(root_text))
         || enclosing_parameters_shadow(root_text, reference, ctx.source)
 }
 
