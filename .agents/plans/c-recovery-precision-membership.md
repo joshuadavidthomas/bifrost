@@ -12,7 +12,8 @@ The forward-versus-inverse differential runner checks whether every exact invers
 - [x] (2026-08-13 21:12Z) Introduced a bounded C recovery-membership collector in `brokk-bifrost-cpp` using structured AST roles and exact macro-environment evidence.
 - [x] (2026-08-13 21:12Z) Reused the authoritative C batch visibility to augment precision membership without changing the census probe frontier.
 - [x] (2026-08-13 21:12Z) Made binding/declaration usage-hit kinds precision-ineligible and added behavior coverage for recovered type/member references, macro definition/formal exclusions, and candidate-cap failure.
-- [ ] Run focused validation, commit, rebuild the release runner, exact-replay representative corpus witnesses, push, publish evidence, and close #2089 without waiting for the complete C campaign.
+- [x] (2026-08-13 21:31Z) Ran focused validation, committed `695339c9`, rebuilt the release runner, and exact-replayed six representative corpus witnesses with zero actionable findings and zero file errors.
+- [ ] Push the implementation and plan closure, publish the exact evidence, and close #2089 without waiting for the complete C campaign.
 
 ## Surprises & Discoveries
 
@@ -53,7 +54,9 @@ The forward-versus-inverse differential runner checks whether every exact invers
 
 The implementation now separates the two contracts that the old shared census range set conflated. `CandidateFrontier::Census` remains conservative and still contributes no probe below `ERROR`. During inverse comparison, the already-built C authoritative batch supplies a bounded, structured recovery-only range set backed by the same macro visibility facts used by C usage resolution. The runner merges that set only for an explicitly C corpus and treats incomplete membership as unavailable rather than complete. Definition/import/reexport/override hits are excluded before reference-precision grading.
 
-The focused fixture proves the important non-vacuous case end to end: authoritative inverse analysis actually returns both a recovered type reference and a recovered selected-member reference; neither range appears among probe sites; and the differential emits no inverse-precision finding. The low-level collector test also pins macro definition/formal rejection and all-or-nothing cap behavior. Existing #1784 misparsed-region probing remains unchanged. Corpus replay and publication evidence are still pending.
+The focused fixture proves the important non-vacuous case end to end: authoritative inverse analysis actually returns both a recovered type reference and a recovered selected-member reference; neither range appears among probe sites; and the differential emits no inverse-precision finding. The low-level collector test also pins macro definition/formal rejection and all-or-nothing cap behavior. Existing #1784 misparsed-region probing remains unchanged.
+
+Six exact production replays now cover the original partial ledger and the completed-ledger supplement. strongSwan validates a recovered type, libarchive and Git validate selected members under large/preprocessor recovery envelopes, pgBackRest validates a macro token whose parser role resembles a declaration, SPDK validates definition-kind ineligibility, and CycloneDDS validates a supplemental recovered member. Every run completed with one consistent site, zero inverse-precision findings, zero candidate truncation, and zero file errors. This is sufficient focused acceptance for the requested push; the full 904-key replay remains intentionally deferred to the broader campaign.
 
 ## Context and Orientation
 
@@ -120,9 +123,20 @@ The completed full C ledger at Bifrost `fcd830452a078c69bb7e1f1d085c78ff447de7fe
 
 Representative shapes are strongSwan `malloc_thing(private_host_t)`, libarchive `iso9660->opt.boot`, pgBackRest `configLocal->option[...]`, SPDK declaration type references, Git `istate->timestamp`, and macro-shaped `THIS(const Bz2Compress)`. Two SPDK rows are Definition hits and should clear through eligibility, not membership.
 
+Focused acceptance artifacts from clean Bifrost `695339c91a8022b63ddec7718b7c1721ddd725c4` are under `/tmp/bifrost-fird-695339c9/c-exact/`. Each report has `status=completed`, one consistent site, `inverse_precision_unbacked_hits=0`, and an empty `file_errors` array:
+
+- strongSwan `eb93c6d1645829ae.jsonl`: SHA-256 `71205b25a0dc0b320fea92d821cefa7c2a290edf18a85c70e8fc769358ee4a5c`.
+- libarchive `f003f11bea101258.jsonl`: SHA-256 `57f229ad5824a87b422f34169400ce166eacb86bb0c747c3c379437816f73ede`.
+- pgBackRest `6de35192d3dc946c.jsonl`: SHA-256 `0f7731ce80baadbb0e40c9653675f78f1e202703dca10afcf7ba95de8665ccc4`.
+- SPDK definition `16d423f3a20b9acc.jsonl`: SHA-256 `60691843153b855e5da1f1a9e43d12dded729c27bbdfb20529f6bda38a1f7776`.
+- Git `04f08137303d41a7.jsonl`: SHA-256 `81c36c13ddbd35377b5a0db78f92629c037da7856c676c1fa789e6967a560d75`.
+- CycloneDDS supplemental `ad5ee6035c0fa0df.jsonl`: SHA-256 `2c5fefc13fb864f5eff3537201de223a544e38c7293b67938c7bc0d601b89152`.
+
 Plan revision note (2026-08-13): Created after #2093 closure. The source audit established that the authoritative C inverse batch is the minimal reuse seam and that the generic probe frontier must remain untouched.
 
 Plan revision note (2026-08-13 21:12Z): Updated after implementation and focused validation. The synthetic member witness was changed to a valid ignored macro argument, `DISCARD(const int = state->timestamp)`, so the grammar preserves a structured `field_expression` under `ERROR` and the test proves an actual inverse hit rather than membership-only bookkeeping.
+
+Plan revision note (2026-08-13 21:31Z): Recorded checkpoint `695339c9` and six clean exact corpus replays. The supplemental CycloneDDS result demonstrates that the fix is not limited to the original partial-nine ledger.
 
 ## Interfaces and Dependencies
 
