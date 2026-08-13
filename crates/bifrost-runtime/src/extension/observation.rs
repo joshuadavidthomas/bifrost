@@ -19,7 +19,7 @@ pub enum ObservationScalar {
     Boolean(bool),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationIdentity {
     pub namespace: Box<str>,
@@ -308,6 +308,19 @@ impl ExtensionWorkspace {
         }
         let mut outcomes = Vec::with_capacity(document.records.len());
         let mut total = 0usize;
+        let sources = document
+            .records
+            .iter()
+            .map(|record| &record.source.span.path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    read_observation_source(self.project_root(), path),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         for record in &document.records {
             if cancellation.is_cancelled() {
                 outcomes.push(ObservationMappingOutcome::Truncated {
@@ -318,10 +331,12 @@ impl ExtensionWorkspace {
                 });
                 continue;
             }
-            let path = self.project_root().join(record.source.span.path.as_str());
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+            let bytes = match sources
+                .get(&record.source.span.path)
+                .and_then(Option::as_deref)
+            {
+                Some(bytes) => bytes,
+                None => {
                     outcomes.push(ObservationMappingOutcome::Stale {
                         record_id: record.record_id.clone(),
                         source: record.source.clone(),
@@ -340,7 +355,7 @@ impl ExtensionWorkspace {
                 continue;
             }
             let actual =
-                StableDigest::parse(format!("{:x}", Sha256::digest(&bytes))).expect("sha256");
+                StableDigest::parse(format!("{:x}", Sha256::digest(bytes))).expect("sha256");
             if actual != record.source.content_sha256 {
                 outcomes.push(ObservationMappingOutcome::Stale {
                     record_id: record.record_id.clone(),
@@ -350,7 +365,7 @@ impl ExtensionWorkspace {
                 continue;
             }
             let end = record.source.span.end_utf8_byte as usize;
-            let source_text = std::str::from_utf8(&bytes)
+            let source_text = std::str::from_utf8(bytes)
                 .map_err(|_| ExtensionError::InvalidRequest("source is not UTF-8".into()))?;
             if end > bytes.len()
                 || !source_text.is_char_boundary(record.source.span.start_utf8_byte as usize)
@@ -404,21 +419,27 @@ impl ExtensionWorkspace {
                 .nodes
                 .iter()
                 .filter(|node| intersects(&node.span, &record.source.span))
-                .map(|node| MappedObservationNode {
-                    stable_id: node.stable_id.clone(),
-                    call_context: node.call_context.clone(),
-                    span: node.span.clone(),
-                    role: node.role.clone(),
+                .map(|node| {
+                    let mapped = MappedObservationNode {
+                        stable_id: node.stable_id.clone(),
+                        call_context: node.call_context.clone(),
+                        span: node.span.clone(),
+                        role: node.role.clone(),
+                    };
+                    (
+                        (
+                            mapped.stable_id.clone(),
+                            mapped.call_context.clone(),
+                            mapped.span.start_utf8_byte,
+                            mapped.span.end_utf8_byte,
+                            mapped.role.clone(),
+                        ),
+                        mapped,
+                    )
                 })
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
                 .collect::<Vec<_>>();
-            nodes.sort_by(|a, b| {
-                (&a.stable_id, &a.call_context, a.span.start_utf8_byte).cmp(&(
-                    &b.stable_id,
-                    &b.call_context,
-                    b.span.start_utf8_byte,
-                ))
-            });
-            nodes.dedup();
             if nodes.len() > document.limits.max_mapped_nodes_per_record as usize
                 || total + nodes.len() > document.limits.max_total_mapped_nodes as usize
             {
@@ -484,6 +505,13 @@ impl ExtensionWorkspace {
 
 fn intersects(a: &SourceSpan, b: &SourceSpan) -> bool {
     a.path == b.path && a.start_utf8_byte < b.end_utf8_byte && b.start_utf8_byte < a.end_utf8_byte
+}
+
+fn read_observation_source(
+    root: &std::path::Path,
+    path: &NormalizedRelativePath,
+) -> Option<Vec<u8>> {
+    fs::read(root.join(path.as_str())).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

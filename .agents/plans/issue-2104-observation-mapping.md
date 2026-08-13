@@ -21,7 +21,9 @@ Extensions can safely join exact observation mappings to bounded semantic-relati
 - [x] (2026-08-13 19:53Z) Added Java/Python behavior fixtures plus stale content, malformed schema, and interrupted JSONL coverage in the existing runtime external-boundary harness.
 - [x] (2026-08-13 20:02Z) Passed `cargo fmt --check`, all 11 runtime extension tests (including 3 observation tests), `node scripts/check-workspace-dependencies.mjs`, runtime all-target clippy with `-D warnings`, and `git diff --check`.
 - [x] (2026-08-13 20:14Z) Ran `scripts/pre-push-gate.sh`: formatting and all workspace doctests passed; nextest was stopped by three sandbox-denied pre-existing `benchmark::mcp_session` stderr tests, and all-features clippy was blocked reading `/Users/dave/.cache/uv/sdists-v9/.git`. Focused runtime all-target clippy and all runtime extension tests remain green.
-- [ ] Checkpoint commit, push, open the correctly stacked ready PR, and record CI/PR evidence here.
+- [x] (2026-08-13 20:17Z) Committed `069dcbbf4`, pushed the issue branch, and opened ready stacked PR #2119 against the #2101 branch.
+- [x] (2026-08-14 08:35Z) Triaged PR checks: the three Rust failures are inherited unchanged from #2116's TypeScript definition test; fixed #2104's two policy findings by materializing each distinct path once and collecting mapped nodes into canonical keyed order without a per-record sort. Focused tests, clippy, formatting, and dependency checks pass.
+- [ ] Push the policy fix, confirm the refreshed code-smells scan, then merge/retarget the stack as parent state permits.
 
 ## Surprises & Discoveries
 
