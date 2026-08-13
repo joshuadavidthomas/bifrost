@@ -147,14 +147,14 @@ arity, #1092 C header/source duality, #1093 display-vs-resolution separators, #1
 import-path gaps, #1016 parse truncation, #1194 csharp census explosion, #1336
 render-mode drift race, #1347 rust alias-chain stack overflow, #1431 CR-only-line-ending
 source text, #1524/#1566/#1573 (cpp whale-class recovery/reconcile/panic),
-#1689/#1698/#1707 (phalcon/chromium memory, reparse, hydration).
+#1689/#1698/#1707 (phalcon/chromium memory, reparse, hydration), #1927 (phalcon-class
+per-call latency; fixed `aab8f0e18` — the cpp usage extractor no longer re-walks whale
+ASTs per candidate).
 
 Open families — expected to keep firing; triage new instances as known-issue with an
 exemplar note, no new issue: **#1775** (I1 source-text-differs: `#`-directive comment
-overrun; interior/mid-line mismatch in class blocks), **#1927** (phalcon-class per-call
-latency: per-request TU re-parse in `CppIdentityRenderCache` + row-by-row
-`hydrate_file_state_with_source`; minutes-to-hours per call on macro-heavy generated
-C), **#1928** (chromium `SegmentInterner` resolve/intern + park/unpark churn),
+overrun; interior/mid-line mismatch in class blocks), **#1928** (chromium
+`SegmentInterner` resolve/intern + park/unpark churn),
 **#2111** (bundle/dist symbols whose display fq embeds path segments — unaddressable
 selector spellings, cross-spelling drift, empty I5 refusals; ts bundles).
 
