@@ -2,8 +2,8 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
-    go_is_declaration_or_import_name, reference_candidate_ranges,
-    reference_candidate_requires_point_lookup,
+    census_membership_identifier_ranges, go_is_declaration_or_import_name,
+    reference_candidate_ranges, reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -552,13 +552,14 @@ fn collect_census_membership(
         let Some(root) = context.root_node() else {
             continue;
         };
-        let ranges = match census_identifier_ranges(root, language, max_candidates_per_file) {
-            ReferenceCandidateRanges::Complete(ranges) => ranges,
-            ReferenceCandidateRanges::LimitExceeded { .. } => {
-                membership.insert(rel_path_string(file), None);
-                continue;
-            }
-        };
+        let ranges =
+            match census_membership_identifier_ranges(root, language, max_candidates_per_file) {
+                ReferenceCandidateRanges::Complete(ranges) => ranges,
+                ReferenceCandidateRanges::LimitExceeded { .. } => {
+                    membership.insert(rel_path_string(file), None);
+                    continue;
+                }
+            };
         let entries = ranges
             .into_iter()
             .filter_map(|range| {

@@ -120,6 +120,25 @@ pub fn census_identifier_ranges(
         .expect("non-cancellable collection cannot be cancelled")
 }
 
+/// The raw identifier membership used to validate inverse hits independently
+/// of probe eligibility. It retains the census contract and additionally
+/// includes grammar nodes that are simultaneous source references and binders,
+/// such as JS/TS shorthand destructuring properties (#2037).
+pub fn census_membership_identifier_ranges(
+    root: Node<'_>,
+    language: Language,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    collect_candidate_ranges(
+        root,
+        language,
+        limit,
+        CandidateFrontier::CensusMembership,
+        &|| false,
+    )
+    .expect("non-cancellable collection cannot be cancelled")
+}
+
 /// Per-file answer to "could a BARE occurrence of this name, at this byte, bind
 /// to something declared in this file?".
 ///
@@ -184,6 +203,7 @@ enum CandidateFrontier {
     References,
     SemanticTokens,
     Census,
+    CensusMembership,
 }
 
 fn collect_candidate_ranges(
@@ -209,12 +229,18 @@ fn collect_candidate_ranges(
         // leaves the rest of the file proposed. The index-filtered and
         // semantic-token frontiers keep their existing reach, because the LSP
         // still colors and resolves inside a broken edit.
-        if matches!(frontier, CandidateFrontier::Census) && node.is_error() {
+        if matches!(
+            frontier,
+            CandidateFrontier::Census | CandidateFrontier::CensusMembership
+        ) && node.is_error()
+        {
             continue;
         }
         let compound = matches!(
             frontier,
-            CandidateFrontier::References | CandidateFrontier::Census
+            CandidateFrontier::References
+                | CandidateFrontier::Census
+                | CandidateFrontier::CensusMembership
         ) && is_compound_reference_candidate(language, node.kind());
         let candidate = match frontier {
             CandidateFrontier::References => is_reference_candidate_node(language, node.kind()),
@@ -225,9 +251,12 @@ fn collect_candidate_ranges(
             // identifier-class leaves the semantic-token frontier keeps, unioned
             // with the receiver keywords and compound callable names the
             // reference frontier adds. No index knowledge, no exclusions.
-            CandidateFrontier::Census => {
+            CandidateFrontier::Census | CandidateFrontier::CensusMembership => {
                 is_semantic_token_identifier_node(language, node.kind())
                     || is_reference_candidate_node(language, node.kind())
+                    || (matches!(frontier, CandidateFrontier::CensusMembership)
+                        && matches!(language, Language::JavaScript | Language::TypeScript)
+                        && node.kind() == "shorthand_property_identifier_pattern")
             }
         };
         if candidate
@@ -274,7 +303,9 @@ fn is_excluded_reference_candidate(
     if language == Language::CSharp
         && matches!(
             frontier,
-            CandidateFrontier::References | CandidateFrontier::Census
+            CandidateFrontier::References
+                | CandidateFrontier::Census
+                | CandidateFrontier::CensusMembership
         )
         && csharp_is_statement_label(node)
     {
@@ -435,6 +466,20 @@ mod tests {
             .collect()
     }
 
+    fn census_membership_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, path);
+        let tree = parse_tree_for_language(&file, language, source)
+            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+        let ReferenceCandidateRanges::Complete(ranges) =
+            census_membership_identifier_ranges(tree.root_node(), language, 1000)
+        else {
+            panic!("census membership budget exceeded for {language:?}");
+        };
+        ranges.into_iter().map(|range| range.start_byte).collect()
+    }
+
     fn census_texts<'a>(language: Language, path: &str, source: &'a str) -> Vec<&'a str> {
         census_ranges(language, path, source)
             .into_iter()
@@ -557,6 +602,52 @@ mod tests {
                 go_census.contains(&offset),
                 "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
             );
+        }
+    }
+
+    #[test]
+    fn js_ts_census_membership_adds_only_shorthand_destructuring_properties() {
+        let source = concat!(
+            "const plain = 1;\n",
+            "const { shorthand } = owner;\n",
+            "const { renamed: local } = owner;\n",
+            "const literal = { \"quoted\": 1 };\n",
+        );
+        for (language, path) in [
+            (Language::JavaScript, "index.js"),
+            (Language::TypeScript, "index.ts"),
+        ] {
+            let census = census_offsets(language, path, source);
+            let membership = census_membership_offsets(language, path, source);
+            let shorthand = source.find("shorthand").expect("shorthand property");
+            let renamed = source.find("renamed").expect("renamed property");
+            let local = source.find("local").expect("renamed local binder");
+            let plain = source.find("plain").expect("ordinary declaration");
+            let quoted = source.find("quoted").expect("quoted key");
+
+            assert!(!census.contains(&shorthand), "{language:?}: {census:?}");
+            assert!(
+                membership.contains(&shorthand),
+                "{language:?}: {membership:?}"
+            );
+            for offset in [renamed, local, plain] {
+                assert_eq!(
+                    census.contains(&offset),
+                    membership.contains(&offset),
+                    "only the exact shorthand grammar node is added for {language:?} at {offset}"
+                );
+            }
+            assert!(
+                !membership.contains(&quoted),
+                "{language:?}: {membership:?}"
+            );
+
+            let added = membership
+                .iter()
+                .copied()
+                .filter(|offset| !census.contains(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(added, vec![shorthand], "{language:?}");
         }
     }
 
