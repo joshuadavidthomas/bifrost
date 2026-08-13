@@ -1324,6 +1324,86 @@ function beforeEstablishment() {
 }
 "#;
 
+    /// The #2015 acceptance shape: a procedure whose only object is a local
+    /// plain literal used purely as a member-access base carries no lowering
+    /// gap, so every axis is covered and the missing reaching row below is a
+    /// conclusion, not an unknown.
+    const TS_READ_BEFORE_ESTABLISHMENT: &str = r#"
+function beforeEstablishment(): number | undefined {
+  const ns: { value?: number } = {};
+  const early = ns.value;
+  ns.value = 1;
+  return early;
+}
+"#;
+
+    #[test]
+    fn a_plain_object_literal_procedure_covers_every_axis() {
+        for (language, path, source) in [
+            (
+                Language::JavaScript,
+                "src/main.js",
+                JS_READ_BEFORE_ESTABLISHMENT,
+            ),
+            (
+                Language::TypeScript,
+                "src/main.ts",
+                TS_READ_BEFORE_ESTABLISHMENT,
+            ),
+        ] {
+            let fixture = Fixture::new(language, &[(path, source)]);
+            let state = fixture.state(0);
+            let derivation = procedure_containing(
+                &state,
+                |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+            );
+            assert!(
+                derivation.completeness.is_complete(),
+                "{language:?} must publish no gap for the plain-literal shape; got {:?}",
+                derivation.completeness
+            );
+            for axis in FLOW_STATE_AXES {
+                assert!(
+                    derivation.completeness.covers(*axis),
+                    "{language:?} must cover {axis:?}"
+                );
+            }
+        }
+    }
+
+    const JS_ESCAPING_OBJECT: &str = r#"
+function escapingObject(sink) {
+  const ns = {};
+  sink(ns);
+  return ns.value;
+}
+"#;
+
+    /// An object literal that escapes into a call can grow accessors behind
+    /// the lowering's back, so its accesses keep the conservative gaps and
+    /// the property and relation axes stay uncovered.
+    #[test]
+    fn an_escaping_object_literal_keeps_the_axes_uncovered() {
+        let fixture = Fixture::new(Language::JavaScript, &[("src/main.js", JS_ESCAPING_OBJECT)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(
+            &state,
+            |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        assert!(
+            !derivation
+                .completeness
+                .covers(FlowStateAxis::PropertyEvents),
+            "an escaping base must keep the property axis uncovered; got {:?}",
+            derivation.completeness
+        );
+        assert!(
+            !derivation
+                .completeness
+                .covers(FlowStateAxis::ReachingRelation)
+        );
+    }
+
     /// Source co-presence is not evidence: the only write to the property
     /// follows the read on every path, so no reaching row exists for it.
     #[test]

@@ -653,6 +653,46 @@ pub(super) fn logical_assignment_operator(node: Node<'_>) -> Option<&'static str
     }
 }
 
+/// An object literal whose evaluation yields an object with only data
+/// properties and the default `Object.prototype`. A property access on such an
+/// object cannot invoke an accessor or a proxy trap, and its field identities
+/// are fully declared by the literal plus in-procedure stores.
+///
+/// Spread members are plain: spreading copies enumerable own properties as
+/// data properties (source accessors run at literal evaluation, not at later
+/// accesses). A non-computed `__proto__` key replaces the prototype, and a
+/// `get`/`set` member installs an accessor, so both disqualify the literal.
+pub(super) fn is_plain_object_literal(source: &str, node: Node<'_>) -> bool {
+    if node.kind() != "object" {
+        return false;
+    }
+    named_children(node).into_iter().all(|member| {
+        match member.kind() {
+            "comment" => true,
+            "shorthand_property_identifier" | "spread_element" => true,
+            "pair" => member.child_by_field_name("key").is_some_and(|key| {
+                match key.kind() {
+                    "property_identifier" => {
+                        node_text(source, key).is_some_and(|text| text != "__proto__")
+                    }
+                    "number" => true,
+                    // String and computed keys can spell `__proto__`
+                    // indirectly; a template key can also throw during
+                    // evaluation of the literal itself.
+                    _ => false,
+                }
+            }),
+            "method_definition" => {
+                let mut cursor = member.walk();
+                !member
+                    .children(&mut cursor)
+                    .any(|child| matches!(child.kind(), "get" | "set"))
+            }
+            _ => false,
+        }
+    })
+}
+
 pub(super) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     match node.kind() {
         "unary_expression"

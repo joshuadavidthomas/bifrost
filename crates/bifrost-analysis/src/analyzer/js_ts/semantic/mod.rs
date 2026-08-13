@@ -18,8 +18,8 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
 };
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v8";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v9";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v9";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v10";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -354,10 +354,26 @@ struct LoweringContext<'tree, 'targets> {
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     abruptness: HashMap<usize, bool>,
     cleanups: Vec<CleanupRegion<'tree>>,
+    plain_object_locals: HashMap<ValueId, PlainObjectLocal>,
 }
 
 struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+}
+
+/// A local whose value is a plain object literal for the binding's whole
+/// extent: the initializer is a plain literal, and every use of the name in
+/// the procedure is a non-`__proto__` member-access base outside call-callee
+/// position, so no alias, capture, rebind, or prototype mutation exists that
+/// could install an accessor or a proxy behind a later property access.
+struct PlainObjectLocal {
+    /// Node id of the declaration statement's parent. A property access is
+    /// established only when this node is among its ancestors, so control
+    /// cannot reach the access without first executing the declarator.
+    declaration_parent: usize,
+    /// End byte of the declarator; accesses before it may observe the
+    /// binding uninitialized.
+    available_after: usize,
 }

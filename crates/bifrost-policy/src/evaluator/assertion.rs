@@ -24,12 +24,26 @@ impl AssertionSubject {
                 .collect()
         })
     }
+
+    /// Whether one capture of this name binds a node that is not an
+    /// identifier -- a field access, for example -- and therefore never has
+    /// an identifier-occurrence row of any role.
+    fn binds_non_identifier(&self, name: &str) -> bool {
+        self.captures.get(name).is_some_and(|captures| {
+            captures
+                .iter()
+                .any(|capture| capture.kind.is_some_and(|kind| kind != "identifier"))
+        })
+    }
 }
 
 /// One capture of one subject row.
 #[derive(Debug)]
 struct SubjectCapture {
     ast_id: Option<String>,
+    /// The captured node's normalized kind, which says whether the capture is
+    /// an identifier occurrence at all.
+    kind: Option<&'static str>,
     /// The captured node's display region, which is what a containment assert
     /// compares a declaring scope against. Absent when the match carried no
     /// node range.
@@ -512,11 +526,20 @@ pub(super) fn evaluate_assertion_policy(
                     );
                 };
                 // A capture that carries no occurrence of the asserted role is
-                // not a subject this assert is about. Only the occurrence
-                // family, whose whole question is how many such rows exist,
-                // evaluates anyway.
+                // not a subject this assert is about. The occurrence family,
+                // whose whole question is how many such rows exist, evaluates
+                // anyway. The flow family also evaluates when the capture
+                // binds a non-identifier node: its join is the state-event
+                // row, and a property read anchors on the whole field access,
+                // which has no identifier-occurrence row of any role (#2015).
+                // An identifier capture of the wrong role stays skipped for
+                // it like for every other family.
+                let non_identifier_flow_subject =
+                    matches!(assertion, PolicyAssert::FlowEstablishment(_))
+                        && subject.binds_non_identifier(at);
                 if let Some(role) = assertion.role()
                     && !matches!(assertion, PolicyAssert::Occurrence(_))
+                    && !non_identifier_flow_subject
                     && !joined_role_rows(&ast_ids, &rows_by_ast_id, role)
                 {
                     continue;
@@ -2540,7 +2563,6 @@ fn evaluate_flow_establishment_assert<'rows>(
         late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
         return None;
     };
-
     let mut offending: Vec<String> = Vec::new();
     let mut locations: Vec<PolicySourceLocation> = Vec::new();
     let mut count = 0_u64;
@@ -3043,6 +3065,7 @@ fn collect_assertion_subjects(
                 .or_default()
                 .push(SubjectCapture {
                     ast_id: capture.ast_id.clone(),
+                    kind: capture.kind,
                     range: capture.range,
                 });
         }

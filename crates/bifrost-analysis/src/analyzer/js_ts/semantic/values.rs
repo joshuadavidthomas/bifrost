@@ -76,6 +76,161 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         })
     }
 
+    /// Identify locals that hold a plain object literal for their whole
+    /// extent, so field accesses on them can be lowered without capability
+    /// gaps. Runs after [`Self::emit_local_bindings`] so `local_at` resolves.
+    ///
+    /// A candidate is a declarator whose initializer is a plain object
+    /// literal. It survives only when every occurrence of the name inside the
+    /// binding's scope is the base of a non-`__proto__` member access outside
+    /// call-callee position: any other use (a call argument, a return, an
+    /// assignment in either direction, a subscript base, a shorthand
+    /// property, a capture inside a nested procedure) creates an alias,
+    /// rebind, or mutation channel this lowering does not track, so the
+    /// binding keeps the conservative gaps.
+    pub(super) fn collect_plain_object_locals(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), TsLoweringError> {
+        struct Candidate {
+            name_node: usize,
+            declaration_parent: usize,
+            available_after: usize,
+        }
+        let source = self.prepared.source();
+        let mut candidates: HashMap<ValueId, Candidate> = HashMap::default();
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(TsLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if is_js_ts_nested_execution_boundary(node, body) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "identifier"
+                && let Some(initializer) = node.child_by_field_name("value")
+                && is_plain_object_literal(source, initializer)
+                && let Some(text) = node_text(source, name)
+                && let Some(value) = self.local_at(text, name.start_byte())
+                && let Some(declaration_parent) =
+                    node.parent().and_then(|declaration| declaration.parent())
+            {
+                candidates.entry(value).or_insert(Candidate {
+                    name_node: name.id(),
+                    declaration_parent: declaration_parent.id(),
+                    available_after: node.end_byte(),
+                });
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Occurrence scan over the full body, nested procedures included: a
+        // capture invalidates the candidate exactly like a local escape does.
+        let mut boundary_ends: Vec<usize> = Vec::new();
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(TsLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            while boundary_ends
+                .last()
+                .is_some_and(|end| node.start_byte() >= *end)
+            {
+                boundary_ends.pop();
+            }
+            let inside_nested = !boundary_ends.is_empty();
+            if is_js_ts_nested_execution_boundary(node, body) {
+                boundary_ends.push(node.end_byte());
+            }
+            if !matches!(
+                node.kind(),
+                "identifier"
+                    | "shorthand_property_identifier"
+                    | "shorthand_property_identifier_pattern"
+            ) {
+                return Ok(WalkControl::Continue);
+            }
+            let Some(text) = node_text(source, node) else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(value) = self.local_at(text, node.start_byte()) else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(candidate) = candidates.get(&value) else {
+                return Ok(WalkControl::Continue);
+            };
+            if node.id() == candidate.name_node {
+                return Ok(WalkControl::Continue);
+            }
+            let survives = !inside_nested
+                && node.kind() == "identifier"
+                && plain_member_base_use(source, node);
+            if !survives {
+                candidates.remove(&value);
+                if candidates.is_empty() {
+                    return Ok(WalkControl::Break);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        self.plain_object_locals = candidates
+            .into_iter()
+            .map(|(value, candidate)| {
+                (
+                    value,
+                    PlainObjectLocal {
+                        declaration_parent: candidate.declaration_parent,
+                        available_after: candidate.available_after,
+                    },
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Whether `access` is a field access whose base identifier resolves to a
+    /// plain object local and executes only after the declarator has run:
+    /// the declaration statement's parent must be an ancestor of the access,
+    /// and the access must start after the declarator ends, so no path
+    /// reaches the access without establishing the binding first.
+    pub(super) fn established_plain_object_base(
+        &self,
+        access: Node<'tree>,
+        object: Node<'tree>,
+    ) -> bool {
+        if object.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), object) else {
+            return false;
+        };
+        let Some(value) = self.local_at(name, object.start_byte()) else {
+            return false;
+        };
+        let Some(plain) = self.plain_object_locals.get(&value) else {
+            return false;
+        };
+        if access.start_byte() < plain.available_after {
+            return false;
+        }
+        let mut current = access.parent();
+        while let Some(node) = current {
+            if node.id() == plain.declaration_parent {
+                return true;
+            }
+            current = node.parent();
+        }
+        false
+    }
+
     pub(super) fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
         self.locals
             .get(name)?
@@ -339,4 +494,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_gap(builder, point, subject, capability, kind, detail)?;
         Ok(())
     }
+}
+
+/// Whether this identifier occurrence is the object of a member access that
+/// preserves the plain-object guarantee: not a `__proto__` access (a
+/// non-computed `__proto__` store replaces the prototype), and not the callee
+/// of a call (the receiver escapes into the called procedure).
+fn plain_member_base_use(source: &str, node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "member_expression" {
+        return false;
+    }
+    if parent
+        .child_by_field_name("object")
+        .is_none_or(|object| object.id() != node.id())
+    {
+        return false;
+    }
+    let property_is_plain = parent
+        .child_by_field_name("property")
+        .and_then(|property| node_text(source, property))
+        .is_some_and(|text| text != "__proto__");
+    if !property_is_plain {
+        return false;
+    }
+    if let Some(grandparent) = parent.parent()
+        && matches!(grandparent.kind(), "call_expression" | "new_expression")
+        && grandparent
+            .child_by_field_name("function")
+            .is_some_and(|function| function.id() == parent.id())
+    {
+        return false;
+    }
+    true
 }
