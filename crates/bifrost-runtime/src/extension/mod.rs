@@ -27,14 +27,17 @@
 //! let _: StableDigest = dense.into();
 //! ```
 
+mod artifacts;
 mod codec;
 mod identity;
 mod limits;
+mod observation;
 mod outcome;
 mod relation;
 mod version;
 mod workspace;
 
+pub use artifacts::*;
 pub use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 pub use codec::{
     ExtensionDecodeError, ExtensionEncodeError, ExtensionRequest, ExtensionResponse,
@@ -44,6 +47,7 @@ pub use identity::{NormalizedRelativePath, SourceSpan, StableDigest, WorkspaceGe
 pub use limits::{
     ExtensionCancellation, ExtensionLimitValues, ExtensionLimits, InvalidExtensionLimits,
 };
+pub use observation::*;
 pub use outcome::{
     ExtensionCompletion, ExtensionDiagnostic, ExtensionOutcome, ExtensionResultMetadata,
     ExtensionWork,

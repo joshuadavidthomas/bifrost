@@ -96,6 +96,10 @@ pub struct ExtensionWorkspace {
 }
 
 impl ExtensionWorkspace {
+    pub(crate) fn project_root(&self) -> &std::path::Path {
+        self.analyzer.analyzer().project().root()
+    }
+
     pub fn open(options: ExtensionWorkspaceOptions) -> Result<Self, ExtensionWorkspaceError> {
         if options.roots.len() != 1 {
             return Err(ExtensionWorkspaceError::InvalidRoots(
