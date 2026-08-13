@@ -74,16 +74,16 @@ fn semantic_control_flow_is_source_backed_and_cancellable() {
         .build();
     let workspace =
         ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(project.root())).unwrap();
-    let request = SemanticRelationRequest {
-        compatibility: ExtensionCompatibility::default(),
-        expected_generation: workspace.generation().clone(),
-        seed: SourceSpan {
+    let request = SemanticRelationRequest::from_source(
+        workspace.generation().clone(),
+        SourceSpan {
             path: NormalizedRelativePath::new("src/app.ts").unwrap(),
             start_utf8_byte: 20,
             end_utf8_byte: 20,
         },
-        limits: ExtensionLimits::default(),
-    };
+        ExtensionLimits::default(),
+    )
+    .unwrap();
     let outcome = workspace
         .semantic_relations(request.clone(), &ExtensionCancellation::new())
         .unwrap();
@@ -113,7 +113,7 @@ fn semantic_control_flow_is_source_backed_and_cancellable() {
     })
     .unwrap();
     let limited = SemanticRelationRequest {
-        limits: tiny_limits,
+        limits: tiny_limits.values().into(),
         ..request
     };
     let outcome = workspace

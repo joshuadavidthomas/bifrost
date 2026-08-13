@@ -208,7 +208,7 @@ impl ExtensionWorkspace {
                 None,
                 ExtensionCompletion::Cancelled,
                 &self.generation,
-                &request.limits,
+                &ExtensionLimits::default(),
                 "structural.query",
                 ApiStability::Stable,
                 ExtensionWork::default(),
@@ -273,9 +273,8 @@ impl ExtensionWorkspace {
     ) -> Result<ExtensionOutcome<SemanticRelationSnapshot>, ExtensionError> {
         self.validate(&request.compatibility, &request.expected_generation)?;
         request
-            .seed
             .validate()
-            .map_err(|error| ExtensionError::InvalidRequest(error.into_boxed_str()))?;
+            .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
         let stability = ApiStability::Experimental { since_minor: 0 };
         let operation = "experimental.semantic.control_flow";
         if cancellation.is_cancelled() {
@@ -283,14 +282,19 @@ impl ExtensionWorkspace {
                 None,
                 ExtensionCompletion::Cancelled,
                 &self.generation,
-                &request.limits,
+                &ExtensionLimits::default(),
                 operation,
                 stability,
                 ExtensionWork::default(),
             ));
         }
+        let Some(SemanticSeed::Source { span: seed }) = request.seeds.first() else {
+            return Err(ExtensionError::InvalidRequest(
+                "stable-node seeds require a prior snapshot resolver".into(),
+            ));
+        };
         let root = self.analyzer.analyzer().project().root();
-        let file = ProjectFile::new(root.to_path_buf(), request.seed.path.as_str());
+        let file = ProjectFile::new(root.to_path_buf(), seed.path.as_str());
         if self
             .analyzer
             .program_semantics_provider_for_file(&file)
@@ -302,13 +306,13 @@ impl ExtensionWorkspace {
                     capability: capability(operation),
                 },
                 &self.generation,
-                &request.limits,
+                &ExtensionLimits::default(),
                 operation,
                 stability,
                 ExtensionWork::default(),
             ));
         }
-        let values = request.limits.values();
+        let values = request.limits;
         let mut budget = SemanticBudget::default();
         let mut semantic_request = SemanticRequest::new(&mut budget, cancellation.token());
         let materialized = self
@@ -321,13 +325,13 @@ impl ExtensionWorkspace {
                 None,
                 completion,
                 &self.generation,
-                &request.limits,
+                &ExtensionLimits::default(),
                 operation,
                 stability,
                 ExtensionWork::default(),
             ));
         };
-        let seed_start = u32::try_from(request.seed.start_utf8_byte)
+        let seed_start = u32::try_from(seed.start_utf8_byte)
             .map_err(|_| ExtensionError::InvalidRequest("seed byte offset exceeds u32".into()))?;
         let procedure = artifact
             .procedures()
@@ -345,33 +349,36 @@ impl ExtensionWorkspace {
                 None,
                 ExtensionCompletion::Unknown,
                 &self.generation,
-                &request.limits,
+                &ExtensionLimits::default(),
                 operation,
                 stability,
                 ExtensionWork::default(),
             ));
         };
-        let truncated = procedure.points().len() > values.semantic_nodes as usize
-            || procedure.control_edges().len() > values.semantic_edges as usize;
+        let truncated = procedure.points().len() > values.max_nodes as usize
+            || procedure.control_edges().len() > values.max_edges as usize;
         let nodes = procedure
             .points()
             .iter()
-            .take(values.semantic_nodes as usize)
-            .map(|point| {
+            .take(values.max_nodes as usize)
+            .enumerate()
+            .map(|(local_id, point)| {
                 let mapping = procedure
                     .source_mapping(point.source)
                     .expect("validated semantic source mapping");
                 let span = mapping.locator.anchor().span();
                 SemanticNodeOccurrence {
-                    id: stable_semantic_id(
+                    local_id: local_id as u32,
+                    stable_id: stable_semantic_id(
                         &self.generation,
-                        request.seed.path.as_str(),
+                        seed.path.as_str(),
                         span.start_byte(),
                         span.end_byte(),
                         point.id.index(),
                     ),
+                    call_context: Box::new([]),
                     span: SourceSpan {
-                        path: request.seed.path.clone(),
+                        path: seed.path.clone(),
                         start_utf8_byte: span.start_byte() as u64,
                         end_utf8_byte: span.end_byte() as u64,
                     },
@@ -382,11 +389,25 @@ impl ExtensionWorkspace {
         let edges = procedure
             .control_edges()
             .iter()
-            .take(values.semantic_edges as usize)
+            .filter(|edge| {
+                edge.source_point.index() < values.max_nodes as usize
+                    && edge.target_point.index() < values.max_nodes as usize
+            })
+            .take(values.max_edges as usize)
             .map(|edge| SemanticRelationEdge {
                 source: edge.source_point.index() as u32,
                 target: edge.target_point.index() as u32,
-                kind: edge.kind.label().into(),
+                kind: SemanticRelationKind::ControlFlow,
+                subtype: Some(edge.kind.label().into()),
+                proof: SemanticProof::Proven,
+                completeness: SemanticRelationCompleteness::Complete,
+                evidence: vec![SemanticEvidence {
+                    kind: "control_edge".into(),
+                    mappings: vec![seed.clone()].into_boxed_slice(),
+                    proof: SemanticProof::Proven,
+                    completeness: SemanticRelationCompleteness::Complete,
+                }]
+                .into_boxed_slice(),
             })
             .collect::<Vec<_>>();
         let work = ExtensionWork {
@@ -394,15 +415,32 @@ impl ExtensionWorkspace {
             semantic_edges: edges.len() as u64,
             ..Default::default()
         };
-        let snapshot = SemanticRelationSnapshot {
-            nodes: nodes.into_boxed_slice(),
-            edges: edges.into_boxed_slice(),
-            boundaries: if truncated {
-                vec!["limit".into()].into_boxed_slice()
-            } else {
-                Box::new([])
-            },
+        let request_digest = request_digest(&request)
+            .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
+        let boundaries = if truncated {
+            vec![SemanticRelationBoundary {
+                kind: SemanticRelationBoundaryKind::NodeLimit,
+                at: None,
+                relations: request.relations.clone(),
+                message: "semantic node or edge limit reached".into(),
+                evidence: Box::new([]),
+            }]
+        } else {
+            Vec::new()
         };
+        let snapshot = SemanticRelationSnapshot::try_new(
+            self.generation.clone(),
+            request_digest,
+            if truncated {
+                SemanticRelationStatus::Partial
+            } else {
+                SemanticRelationStatus::Complete
+            },
+            nodes,
+            edges,
+            boundaries,
+        )
+        .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
         Ok(make_outcome(
             Some(snapshot),
             if truncated {
@@ -413,7 +451,7 @@ impl ExtensionWorkspace {
                 completion
             },
             &self.generation,
-            &request.limits,
+            &ExtensionLimits::default(),
             operation,
             stability,
             work,
@@ -545,29 +583,4 @@ impl<'de> Deserialize<'de> for StructuralRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuralResult {
     pub items: Box<[Value]>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticRelationRequest {
-    pub compatibility: ExtensionCompatibility,
-    pub expected_generation: WorkspaceGeneration,
-    pub seed: SourceSpan,
-    pub limits: ExtensionLimits,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticNodeOccurrence {
-    pub id: StableDigest,
-    pub span: SourceSpan,
-    pub role: Box<str>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticRelationEdge {
-    pub source: u32,
-    pub target: u32,
-    pub kind: Box<str>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticRelationSnapshot {
-    pub nodes: Box<[SemanticNodeOccurrence]>,
-    pub edges: Box<[SemanticRelationEdge]>,
-    pub boundaries: Box<[Box<str>]>,
 }

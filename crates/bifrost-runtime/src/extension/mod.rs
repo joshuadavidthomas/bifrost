@@ -31,6 +31,7 @@ mod codec;
 mod identity;
 mod limits;
 mod outcome;
+mod relation;
 mod version;
 mod workspace;
 
@@ -47,6 +48,7 @@ pub use outcome::{
     ExtensionCompletion, ExtensionDiagnostic, ExtensionOutcome, ExtensionResultMetadata,
     ExtensionWork,
 };
+pub use relation::*;
 pub use version::{
     ApiStability, EXTENSION_API_VERSION, ExtensionApiVersion, ExtensionCapabilityId,
     ExtensionCompatibility, ExtensionCompatibilityError, NegotiatedExtensionApi,
@@ -55,6 +57,5 @@ pub use version::{
 pub use workspace::{
     CapabilitySupport, ExtensionCapabilityReport, ExtensionError, ExtensionWorkspace,
     ExtensionWorkspaceDescription, ExtensionWorkspaceError, ExtensionWorkspaceOptions,
-    LanguageCapabilityReport, OperationCapability, SemanticNodeOccurrence, SemanticRelationEdge,
-    SemanticRelationRequest, SemanticRelationSnapshot, StructuralRequest, StructuralResult,
+    LanguageCapabilityReport, OperationCapability, StructuralRequest, StructuralResult,
 };
