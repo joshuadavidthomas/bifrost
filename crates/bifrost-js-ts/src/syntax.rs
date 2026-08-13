@@ -127,6 +127,7 @@ pub struct JsTsLexicalBindingScope {
 /// their entire scope.
 pub struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
+    binding_ranges_by_name: HashMap<String, Vec<(JsTsLexicalBindingScope, Range)>>,
     /// Byte offsets of assignment targets, keyed by the assigned name. An
     /// assignment site whose name resolves to the program scope rebinds the
     /// program-level callable, so calls through that name stay ambiguous.
@@ -149,6 +150,7 @@ impl JsTsLexicalBindingIndex {
     pub fn build(root: Node<'_>, source: &str) -> Self {
         let mut index = Self {
             scopes_by_name: HashMap::default(),
+            binding_ranges_by_name: HashMap::default(),
             assignments_by_name: HashMap::default(),
         };
         let mut stack = vec![root];
@@ -160,6 +162,23 @@ impl JsTsLexicalBindingIndex {
                     let scope = node_scope(root);
                     for name in binder.names() {
                         index.insert(name, scope);
+                    }
+                    let imported_names: HashSet<_> = binder.names().collect();
+                    let mut import_stack = vec![node];
+                    while let Some(import_node) = import_stack.pop() {
+                        if matches!(import_node.kind(), "identifier" | "type_identifier")
+                            && is_declaration_identifier(import_node)
+                        {
+                            let name = slice(import_node, source);
+                            if imported_names.contains(name) {
+                                index.insert_binding(name, scope, import_node);
+                            }
+                        }
+                        for child_index in (0..import_node.named_child_count()).rev() {
+                            if let Some(child) = import_node.named_child(child_index) {
+                                import_stack.push(child);
+                            }
+                        }
                     }
                 }
                 "variable_declarator" => {
@@ -246,6 +265,21 @@ impl JsTsLexicalBindingIndex {
             .min_by_key(|scope| scope.end_byte - scope.start_byte)
     }
 
+    /// Declaration-token ranges for the active lexical binding. Consumers use
+    /// these ranges to distinguish a program binding from a same-spelled object
+    /// member in the same file without guessing from either FQN shape.
+    pub fn binding_identifier_ranges_at(&self, name: &str, byte: usize) -> Vec<Range> {
+        let Some(scope) = self.binding_scope_at(name, byte) else {
+            return Vec::new();
+        };
+        self.binding_ranges_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(binding_scope, range)| (*binding_scope == scope).then_some(*range))
+            .collect()
+    }
+
     pub fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
         self.binding_scope_at(name, byte) == Some(node_scope(root))
     }
@@ -289,8 +323,25 @@ impl JsTsLexicalBindingIndex {
         for binder in pattern_binder_identifiers(pattern) {
             let name = slice(binder, source);
             if !name.is_empty() {
-                self.insert(name, scope);
+                self.insert_binding(name, scope, binder);
             }
+        }
+    }
+
+    fn insert_binding(&mut self, name: &str, scope: JsTsLexicalBindingScope, binder: Node<'_>) {
+        self.insert(name, scope);
+        let range = Range {
+            start_byte: binder.start_byte(),
+            end_byte: binder.end_byte(),
+            start_line: binder.start_position().row,
+            end_line: binder.end_position().row,
+        };
+        let ranges = self
+            .binding_ranges_by_name
+            .entry(name.to_string())
+            .or_default();
+        if !ranges.contains(&(scope, range)) {
+            ranges.push((scope, range));
         }
     }
 
@@ -1066,6 +1117,40 @@ function render(tasks) {
         assert_ne!(
             bindings.binding_scope_at("task", for_of_use),
             bindings.binding_scope_at("task", arrow_use)
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_retains_the_active_declaration_token() {
+        let source = r#"
+const fresh = require("fresh");
+function outer(fresh) {
+  return fresh();
+}
+fresh();
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let program_use = source.rfind("fresh();").expect("program fresh use");
+        let parameter_use = source.find("return fresh").expect("parameter fresh use") + 7;
+
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", program_use),
+            vec![Range {
+                start_byte: source.find("fresh =").expect("program binder"),
+                end_byte: source.find("fresh =").expect("program binder") + "fresh".len(),
+                start_line: 1,
+                end_line: 1,
+            }]
+        );
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", parameter_use),
+            vec![Range {
+                start_byte: source.find("fresh) {").expect("parameter binder"),
+                end_byte: source.find("fresh) {").expect("parameter binder") + "fresh".len(),
+                start_line: 2,
+                end_line: 2,
+            }]
         );
     }
 

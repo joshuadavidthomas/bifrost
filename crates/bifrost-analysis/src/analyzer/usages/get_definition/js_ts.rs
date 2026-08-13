@@ -604,7 +604,19 @@ pub(super) fn resolve_js_ts(
         .filter(|candidate| jsts_candidate_is_bare_declaration(file, reference, candidate))
         .cloned()
         .collect();
-    if same_file.is_empty() && language == Language::JavaScript {
+    let binding_ranges =
+        lexical_bindings.binding_identifier_ranges_at(reference, site.focus_start_byte);
+    if !binding_ranges.is_empty() {
+        same_file.retain(|candidate| {
+            analyzer.ranges(candidate).iter().any(|declaration_range| {
+                binding_ranges.iter().any(|binding_range| {
+                    declaration_range.start_byte <= binding_range.start_byte
+                        && binding_range.end_byte <= declaration_range.end_byte
+                })
+            })
+        });
+    }
+    if same_file.is_empty() && binding_ranges.is_empty() && language == Language::JavaScript {
         same_file = jsts_exact_browser_global_bare_candidates(
             analyzer,
             tree.root_node(),
@@ -620,6 +632,14 @@ pub(super) fn resolve_js_ts(
     }
     if !same_file.is_empty() {
         return js_ts_candidates_outcome(analyzer, same_file);
+    }
+    if !binding_ranges.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "the lexical binding for `{reference}` is not indexed in the requested namespace"
+            ),
+        );
     }
 
     // Last resort for a bare name, symmetric with the dotted one above (#1787).
