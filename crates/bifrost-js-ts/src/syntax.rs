@@ -662,6 +662,9 @@ pub fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
 }
 
 pub fn is_declaration_identifier(node: Node<'_>) -> bool {
+    if is_export_alias_identifier(node) {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -719,6 +722,15 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
         return pattern.start_byte() <= node.start_byte() && node.end_byte() <= pattern.end_byte();
     }
     false
+}
+
+pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "export_specifier"
+            && parent
+                .child_by_field_name("alias")
+                .is_some_and(|alias| alias == node)
+    })
 }
 
 pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {

@@ -12,7 +12,7 @@ use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
-    js_program_is_external_module, pattern_binder_identifiers, slice,
+    is_export_alias_identifier, js_program_is_external_module, pattern_binder_identifiers, slice,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -212,6 +212,12 @@ pub(super) fn resolve_js_ts(
         }
     }
 
+    if focused.is_some_and(is_export_alias_identifier) {
+        return no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            "JS/TS export aliases declare outward bindings and do not reference indexed definitions",
+        );
+    }
     if focused
         .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
     {

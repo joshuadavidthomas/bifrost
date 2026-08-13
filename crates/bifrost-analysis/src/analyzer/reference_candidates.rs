@@ -1,7 +1,7 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
-use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
+use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use tree_sitter::Node;
@@ -289,19 +289,9 @@ fn is_excluded_reference_candidate(
         Language::Go => go_is_declaration_or_import_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
         Language::Rust => is_rust_associated_type_declaration_name(node),
-        Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
+        Language::JavaScript | Language::TypeScript => is_export_alias_identifier(node),
         _ => false,
     }
-}
-
-fn is_js_ts_export_alias(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "export_specifier"
-        && parent
-            .child_by_field_name("alias")
-            .is_some_and(|alias| alias == node)
 }
 
 /// Whether a Go identifier occupies a declaration or import binding role.
