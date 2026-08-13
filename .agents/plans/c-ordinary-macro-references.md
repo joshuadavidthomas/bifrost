@@ -14,7 +14,7 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 - [x] (2026-08-13 14:18Z) Added InlineTestProject coverage for every advertised expression surface and fail-closed control, plus a bulk-edge unit pin.
 - [x] (2026-08-13 14:31Z) Passed focused #2093, #1812, #1819, #1960, resolver, bulk-edge, affected-crate clippy, and dependency validation.
 - [x] (2026-08-13 14:44Z) Committed `8af20c88`, rebuilt the release runner, and replayed three clean unconditional corpus witnesses with exact inverse parity.
-- [ ] Push, publish evidence, and close #2093 without waiting for the full rank-31+ rerun.
+- [x] (2026-08-13 14:52Z) Pushed through `40b92073` to `origin/master`, published focused evidence, and closed #2093 without waiting for the full rank-31+ rerun.
 
 ## Surprises & Discoveries
 
@@ -52,7 +52,7 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 
 ## Outcomes & Retrospective
 
-The shared resolver verdict and all three consumers are implemented. Focused behavior covers array bounds, initializers, binary and argument expressions, casts, returns, and selected member spellings. Before-definition, after-`#undef`, contradictory conditional definitions, labels, macro definition/formal names, and the existing function-like call surface remain fail-closed or on their established paths. Focused tests, clippy, dependency validation, and three clean exact corpus replays are green. Publication remains; the full 843-key campaign rerun is deliberately deferred under the user's push-without-full-CI instruction.
+The shared resolver verdict and all three consumers are implemented, pushed, and published. Focused behavior covers array bounds, initializers, binary and argument expressions, casts, returns, and selected member spellings. Before-definition, after-`#undef`, contradictory conditional definitions, labels, macro definition/formal names, and the existing function-like call surface remain fail-closed or on their established paths. Focused tests, clippy, dependency validation, and three clean exact corpus replays are green. #2093 is closed; the full 843-key campaign rerun is deliberately deferred under the user's push-without-full-CI instruction.
 
 ## Context and Orientation
 
@@ -131,6 +131,8 @@ Each artifact records a clean Bifrost tree and clean pinned repository, one reso
 Plan revision note (2026-08-13): Created after closing #2092 and auditing #2093's three resolver surfaces. The audit established that extraction and targeted matching already exist; the missing root is a shared ordinary-occurrence activation verdict.
 
 Plan revision note (2026-08-13): Implementation completed at `8af20c88`. A first exact `SAVE` replay exposed conditional redefinition rather than an unconditional macro miss; acceptance evidence therefore uses three unconditional ranked witnesses and retains `SAVE` as the intended ambiguity control.
+
+Plan revision note (2026-08-13): Pushed through `40b92073`; evidence comment: https://github.com/BrokkAi/bifrost/issues/2093#issuecomment-5279832307. Issue closed as completed.
 
 ## Interfaces and Dependencies
 
