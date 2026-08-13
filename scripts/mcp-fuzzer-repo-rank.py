@@ -2,7 +2,7 @@
 """Per-language repository ranking for the MCP property fuzzer campaign.
 
 Ranks corpus repositories by task count, as pinned in
-`.agents/plans/mcp_property_fuzzer.md` (Decision Log, 2026-07-21): the primary
+`.agents/plans/mcp_property_fuzzer.md` (Corpus and ranking): the primary
 key is `tasks.sft_count_for_repo` (candidate commits passing `SFT_PREDICATES`),
 the tiebreaker is the raw scan-record count, then slug ascending. Languages
 whose `sft_count` is zero across the board (testsome never bound there) fall
