@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -279,6 +279,15 @@ pub struct ProbeSummary {
     pub follow_up_probes: usize,
     pub calls_executed: usize,
     pub calls_errored: usize,
+    /// Probes skipped unexecuted because their symbol's fq had already
+    /// exhausted `--symbol-time-budget-ms`: a pathological selector family
+    /// (phalcon's `PHP_METHOD` macro declarations resolve for ~25 minutes
+    /// per probe, #1927) would otherwise hold a shard for weeks. Skipped
+    /// probes carry no outcome and are excluded from every checker --
+    /// unexecuted is neither pass nor fail.
+    pub calls_skipped_time_budget: usize,
+    /// Distinct symbol fqs that tripped the time budget at least once.
+    pub symbols_time_budgeted: usize,
     pub render_mode_comparisons: usize,
     /// Render-mode comparisons whose payloads differed but where at least one
     /// side reported wall-clock partiality (`summary.partial`): the two modes
@@ -434,6 +443,7 @@ pub fn run_service_invariants(
         &mut probes,
         summary,
         probe_parallelism,
+        config.symbol_time_budget_ms,
         dump_writer.as_mut(),
     )?;
     let mut follow_ups = derive_follow_ups(&probes, config, summary);
@@ -442,9 +452,16 @@ pub fn run_service_invariants(
         &mut follow_ups,
         summary,
         probe_parallelism,
+        config.symbol_time_budget_ms,
         dump_writer.as_mut(),
     )?;
-    let records: Vec<&ProbeRecord> = probes.iter().chain(follow_ups.iter()).collect();
+    // Over-budget probes were never executed: they carry no outcome and are
+    // not evidence for any checker.
+    let records: Vec<&ProbeRecord> = probes
+        .iter()
+        .chain(follow_ups.iter())
+        .filter(|probe| probe.outcome.is_some())
+        .collect();
 
     let mut sink = ViolationSink::default();
     check_render_mode_drift(&records, language, &mut sink, summary);
@@ -1082,11 +1099,12 @@ fn execute_probes(
     probes: &mut [ProbeRecord],
     summary: &mut ProbeSummary,
     probe_parallelism: usize,
+    symbol_time_budget_ms: u64,
     mut dump: Option<&mut std::io::BufWriter<std::fs::File>>,
 ) -> Result<(), String> {
     // Owned work items: workers never borrow the probe slice, which keeps the
     // borrow story trivial and lets the calling thread apply results.
-    let work: Vec<(usize, &'static str, Value, bool, String)> = probes
+    let work: Vec<(usize, &'static str, Value, bool, String, String)> = probes
         .iter()
         .enumerate()
         .filter(|(_, probe)| probe.outcome.is_none())
@@ -1098,6 +1116,7 @@ fn execute_probes(
                 // Scans are the expensive calls; they run single-mode.
                 !matches!(probe.kind, ProbeKind::Scan { .. }),
                 probe.id.clone(),
+                probe.symbol_fq.clone(),
             )
         })
         .collect();
@@ -1107,19 +1126,44 @@ fn execute_probes(
     }
     let worker_count = probe_parallelism.min(work.len()).max(1);
     let next = AtomicUsize::new(0);
-    let (sender, receiver) = mpsc::channel::<(usize, ProbeOutcome, bool, u64)>();
+    // Cumulative executed wall-clock per symbol fq, applied by the receiver as
+    // outcomes land. Workers consult it before starting a probe, so once a
+    // pathological family trips the budget its remaining probes skip after at
+    // most one worker wave of overshoot.
+    let spent = Mutex::new(HashMap::<String, u64>::new());
+    // A `None` outcome marks a budget-skipped probe: it never executed, so the
+    // receiver leaves its record outcome-less and the checkers never see it.
+    let (sender, receiver) = mpsc::channel::<(usize, Option<ProbeOutcome>, bool, u64)>();
     thread::scope(|scope| -> Result<(), String> {
         for _ in 0..worker_count {
             let next = &next;
+            let spent = &spent;
             let sender = sender.clone();
             let work = &work;
             scope.spawn(move || {
                 loop {
                     let claim = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((index, tool, arguments, run_mode_b, probe_id)) = work.get(claim)
+                    let Some((index, tool, arguments, run_mode_b, probe_id, symbol_fq)) =
+                        work.get(claim)
                     else {
                         break;
                     };
+                    if symbol_time_budget_ms > 0 {
+                        let over = spent
+                            .lock()
+                            .expect("probe budget mutex poisoned")
+                            .get(symbol_fq)
+                            .is_some_and(|total| *total >= symbol_time_budget_ms);
+                        if over {
+                            if trace {
+                                eprintln!("[probe-skip] budget exhausted {tool} {probe_id}");
+                            }
+                            if sender.send((*index, None, false, 0)).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     if trace {
                         eprintln!("[probe-start] {tool} {probe_id}");
                     }
@@ -1140,7 +1184,7 @@ fn execute_probes(
                         eprintln!("[probe-done] {elapsed_ms}ms {tool} {probe_id}");
                     }
                     if sender
-                        .send((*index, outcome, compared_modes, elapsed_ms))
+                        .send((*index, Some(outcome), compared_modes, elapsed_ms))
                         .is_err()
                     {
                         break;
@@ -1153,7 +1197,13 @@ fn execute_probes(
         // for a finished probe must reach disk even when a sibling probe runs
         // for days (#1689 -- the collect-then-apply shape still withheld every
         // record until the slowest probe in the wave returned).
+        let mut budgeted_fqs = HashSet::new();
         for (index, outcome, compared_modes, elapsed_ms) in receiver.iter() {
+            let Some(outcome) = outcome else {
+                summary.calls_skipped_time_budget += 1;
+                budgeted_fqs.insert(probes[index].symbol_fq.clone());
+                continue;
+            };
             if compared_modes {
                 summary.render_mode_comparisons += 1;
             }
@@ -1161,12 +1211,20 @@ fn execute_probes(
                 summary.calls_errored += 1;
             }
             summary.calls_executed += 1;
+            if symbol_time_budget_ms > 0 {
+                *spent
+                    .lock()
+                    .expect("probe budget mutex poisoned")
+                    .entry(probes[index].symbol_fq.clone())
+                    .or_default() += elapsed_ms;
+            }
             probes[index].elapsed_ms = Some(elapsed_ms);
             probes[index].outcome = Some(outcome);
             if let Some(writer) = dump.as_deref_mut() {
                 write_probe_record_line(writer, &probes[index])?;
             }
         }
+        summary.symbols_time_budgeted += budgeted_fqs.len();
         Ok(())
     })
 }

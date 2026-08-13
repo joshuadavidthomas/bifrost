@@ -127,6 +127,13 @@ pub struct FuzzerConfig {
     /// Cap on `scan_usages_by_reference` probes, which are the most expensive
     /// service calls. Scanned symbols are a prefix of the service sample.
     pub max_scan_probes: usize,
+    /// Per-symbol-fq cumulative wall-clock budget for service probes, in
+    /// milliseconds; 0 disables the budget. Once a symbol's completed probes
+    /// consume the budget, its remaining probes are skipped unexecuted and
+    /// counted (`ProbeSummary::calls_skipped_time_budget`), so one
+    /// pathological selector family cannot hold a shard indefinitely.
+    #[serde(default)]
+    pub symbol_time_budget_ms: u64,
     /// Optional substring filter restricting service probes to symbols whose
     /// fq name contains it (used by acceptance runs and `--rerun`).
     #[serde(skip_serializing_if = "Option::is_none", default)]

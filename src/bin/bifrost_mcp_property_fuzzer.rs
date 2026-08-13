@@ -127,6 +127,7 @@ struct FuzzerArgs {
     max_symbols: usize,
     max_service_symbols: usize,
     max_scan_probes: usize,
+    symbol_time_budget_ms: u64,
     symbol_filter: Option<String>,
     path_filter: Option<String>,
     shard: Option<ShardSpec>,
@@ -153,6 +154,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
     let mut max_symbols = DEFAULT_MAX_SYMBOLS;
     let mut max_service_symbols = DEFAULT_MAX_SERVICE_SYMBOLS;
     let mut max_scan_probes = DEFAULT_MAX_SCAN_PROBES;
+    let mut symbol_time_budget_ms = 0_u64;
     let mut symbol_filter = None;
     let mut path_filter = None;
     let mut shard = None;
@@ -207,6 +209,12 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
             }
             "--max-scan-probes" => {
                 max_scan_probes = take_usize(args, &mut index, "--max-scan-probes")?
+            }
+            "--symbol-time-budget-ms" => {
+                let value = take_value(args, &mut index, "--symbol-time-budget-ms")?;
+                symbol_time_budget_ms = value.parse::<u64>().map_err(|_| {
+                    format!("--symbol-time-budget-ms expects a non-negative integer, got `{value}`")
+                })?;
             }
             "--symbol-filter" => {
                 symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
@@ -286,6 +294,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         max_symbols,
         max_service_symbols,
         max_scan_probes,
+        symbol_time_budget_ms,
         symbol_filter,
         path_filter,
         shard,
@@ -661,6 +670,7 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             max_symbols: args.max_symbols,
             max_service_symbols: args.max_service_symbols,
             max_scan_probes: args.max_scan_probes,
+            symbol_time_budget_ms: args.symbol_time_budget_ms,
             symbol_filter: args.symbol_filter.clone(),
             path_filter: args.path_filter.clone(),
             shard: args.shard.clone(),
@@ -1171,6 +1181,9 @@ fn print_help() {
     );
     println!(
         "  --max-scan-probes N    scan_usages_by_reference probes per repository (default: {DEFAULT_MAX_SCAN_PROBES})"
+    );
+    println!(
+        "  --symbol-time-budget-ms N  Skip a symbol's remaining probes once its executed probes exceed N ms cumulative (default: 0, unlimited)"
     );
     println!(
         "  --symbol-filter TEXT   Restrict service probes to symbols whose fq name contains TEXT"
