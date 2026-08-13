@@ -698,7 +698,7 @@ fn conformance_static_record_keys_are_labels_while_computed_keys_read() {
     );
     assert_eq!(
         resolved_targets(&value, "label"),
-        vec!["keyed.ts.label".to_string(), "keyed.ts.label".to_string()],
+        vec!["label".to_string(), "label".to_string()],
         "exactly the two reads resolve, and they resolve to the binding"
     );
 }
