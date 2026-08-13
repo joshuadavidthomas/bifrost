@@ -14,7 +14,7 @@ Python annotations postponed by `from __future__ import annotations` must resolv
 - [x] (2026-08-13 18:15Z) Routed ordinary Python get-definition through it before runtime binding-timeline lookup; kept the separately budgeted bounded route unchanged rather than introducing an unbounded graph-index read into that contract.
 - [x] (2026-08-13 18:20Z) Added InlineTestProject behavior coverage for future annotations, quoted/nested types, runtime controls, external boundaries, and `Literal` values.
 - [x] (2026-08-13 18:30Z) Passed focused tests, dependency checks, clippy, and two exact Page replays.
-- [ ] Commit, push, comment evidence, and close #2051.
+- [x] (2026-08-13 18:45Z) Committed as `3544acd6`, merged the intervening FQName identity work, revalidated at the merged head, pushed `26df7d89` to `master`, commented exact evidence, and closed #2051.
 
 ## Surprises & Discoveries
 
@@ -71,3 +71,5 @@ No new crate or dependency is required. The fix must remain in the Python langua
 Revision note (2026-08-13 17:45Z): Created after reconciling #2051's issue description with the exact 158-site ledger and locating the existing structured inverse resolver bypassed by forward lookup.
 
 Revision note (2026-08-13 18:30Z): Recorded the focused annotation implementation, bounded-provider decision, behavior controls, validation, and exact Page replay hashes.
+
+Revision note (2026-08-13 18:45Z): Recorded the pushed commit, post-merge validation, GitHub evidence comment, and issue closure.
