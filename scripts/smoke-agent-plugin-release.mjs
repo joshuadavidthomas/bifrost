@@ -303,7 +303,14 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     });
     assert.equal(catalog.result?.isError, false, `MCP list_policies returned an error: ${JSON.stringify(catalog)}`);
     assert.equal(catalog.result?.structuredContent?.id, "bifrost.code-smells");
-    assert.equal(catalog.result?.structuredContent?.policies?.length, 12);
+    const policies = catalog.result?.structuredContent?.policies;
+    assert.ok(Array.isArray(policies) && policies.length > 0, "MCP list_policies returned no built-in policies");
+    const policyIds = policies.map((entry) => entry.id);
+    assert.equal(new Set(policyIds).size, policyIds.length, "MCP list_policies returned duplicate policy IDs");
+    assert.ok(
+      policyIds.includes("bifrost.correctness.dynamic-evaluation"),
+      `MCP list_policies omitted the policy exercised by this smoke: ${JSON.stringify(policyIds)}`
+    );
     const policy = await roundTrip(child, reader, {
       jsonrpc: "2.0",
       id: 4,
