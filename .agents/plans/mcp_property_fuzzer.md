@@ -149,11 +149,21 @@ render-mode drift race, #1347 rust alias-chain stack overflow, #1431 CR-only-lin
 source text, #1524/#1566/#1573 (cpp whale-class recovery/reconcile/panic),
 #1689/#1698/#1707 (phalcon/chromium memory, reparse, hydration), #1927 (phalcon-class
 per-call latency; fixed `aab8f0e18` — the cpp usage extractor no longer re-walks whale
-ASTs per candidate).
+ASTs per candidate), #1775 (I1 source-text-differs on boost `#`-directive headers and
+chromium Java classes — one checker defect, one product defect; see below).
+
+#1775 in detail, because both halves were misdiagnosed in the issue. The *signature*
+came from the fuzzer itself: `cap_strings_for_record` truncates every recorded string
+at `DUMP_PAYLOAD_EXCERPT_BYTES` (4 KB), and I1(c) then compared that excerpt against
+the block's whole reported line range, so every source block over 4 KB failed. That is
+why boost macros and a faithful 141-line Java class shared a signature. I1(c) now
+compares the retained prefix of a capped payload and counts `i1c_prefix_only_checks`.
+Behind it sat a real product defect on the boost half only: the attached-comment walk
+read `# define`/`# ifndef` as comments, so one macro's block ran back to line 1 and
+grew past the cap. The walk is now language-aware (`hash_starts_line_comment`).
 
 Open families — expected to keep firing; triage new instances as known-issue with an
-exemplar note, no new issue: **#1775** (I1 source-text-differs: `#`-directive comment
-overrun; interior/mid-line mismatch in class blocks), **#1928** (chromium
+exemplar note, no new issue: **#1928** (chromium
 `SegmentInterner` resolve/intern + park/unpark churn),
 **#2111** (bundle/dist symbols whose display fq embeds path segments — unaddressable
 selector spellings, cross-spelling drift, empty I5 refusals; ts bundles).
@@ -170,7 +180,10 @@ selector spellings, cross-spelling drift, empty I5 refusals; ts bundles).
 - I1(c) compares line-affixes (interior lines exact; first text line a suffix of the
   file's start line; last a prefix of the end line). Blocks with `note`/`presentation`
   (file outlines, `#include` listings) use synthetic coordinates and are skipped. Go
-  embedded-field blocks deliberately re-insert the `type` keyword — accepted.
+  embedded-field blocks deliberately re-insert the `type` keyword — accepted. A block
+  whose recorded `text` hit the record-string cap is compared over its retained prefix
+  only and counted in `i1c_prefix_only_checks`: past the cap the record carries no
+  claim to check (#1775).
 - Ambiguity is encoded differently per surface: `get_symbol_sources`/`get_summaries`
   use a structured `ambiguous` array; `get_definitions_by_reference` uses
   `status: "not_found"` plus `diagnostics[].kind == "ambiguous_symbol"`. Read the

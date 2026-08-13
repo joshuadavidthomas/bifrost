@@ -9028,7 +9028,11 @@ where
             .source_snapshot_file_state(code_unit.source())
             .or_else(|| self.fetch_file_state(code_unit.source()))?;
         let start_byte = if include_comments {
-            expanded_comment_start(&file_state.source, range.start_byte)
+            expanded_comment_start(
+                self.adapter.language(),
+                &file_state.source,
+                range.start_byte,
+            )
         } else {
             range.start_byte
         };
@@ -10299,7 +10303,7 @@ mod tests {
         let declaration = source.find("fn work").unwrap();
 
         assert_eq!(
-            expanded_comment_start(source, declaration),
+            expanded_comment_start(Language::Rust, source, declaration),
             source.find("// docs").unwrap()
         );
     }
@@ -10310,7 +10314,7 @@ mod tests {
         let declaration = source.find("fn work").unwrap();
 
         assert_eq!(
-            expanded_comment_start(source, declaration),
+            expanded_comment_start(Language::Rust, source, declaration),
             source.find("// nearby").unwrap()
         );
     }
@@ -10320,9 +10324,12 @@ mod tests {
         let source = "// docs\nfn café() {}";
         let non_boundary = source.find('é').unwrap() + 1;
 
-        assert_eq!(expanded_comment_start(source, non_boundary), non_boundary);
         assert_eq!(
-            expanded_comment_start(source, source.len() + 1),
+            expanded_comment_start(Language::Rust, source, non_boundary),
+            non_boundary
+        );
+        assert_eq!(
+            expanded_comment_start(Language::Rust, source, source.len() + 1),
             source.len()
         );
     }

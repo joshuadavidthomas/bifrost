@@ -10,7 +10,7 @@
 //! that do need those -- the per-language extractors -- stay in
 //! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
-use crate::analyzer::model::{ParseError, ParseErrorKind, Range};
+use crate::analyzer::model::{Language, ParseError, ParseErrorKind, Range};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Node;
 
@@ -170,7 +170,11 @@ pub fn walk_named_tree_preorder_bounded<'tree>(
 /// misattributed as that declaration's docstring, which previously made chunk
 /// `text` start at the file header while `start_line`/`end_line` still pointed
 /// at the declaration body.
-pub fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
+///
+/// `language` decides what a leading `#` means, which is not a detail the walk
+/// can guess: in Python, Ruby, and PHP it opens a line comment, while in C and
+/// C++ it opens a preprocessor directive (see [`hash_starts_line_comment`]).
+pub fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -> usize {
     // Tree-sitter can report a byte offset inside a UTF-8 code point for a
     // malformed or generated source file. The caller's later `str::get` already
     // rejects that range, so do not panic while trying to add comments. This
@@ -215,12 +219,12 @@ pub fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
             break;
         }
 
-        if is_comment_like(trimmed) {
+        if is_comment_like(trimmed, language) {
             comment_start = line_start;
             continue;
         }
 
-        if let Some(offset) = first_comment_offset(line) {
+        if let Some(offset) = first_comment_offset(line, language) {
             comment_start = line_start + offset;
         }
         break;
@@ -229,24 +233,75 @@ pub fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
     comment_start
 }
 
-fn is_comment_like(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("/**")
+/// Whether a leading `#` opens a line comment in `language`.
+///
+/// The three that say yes are the analyzable languages whose `#` runs to end
+/// of line. Everywhere else `#` is either a preprocessor directive (C, C++,
+/// C#) or not a comment at all, and a `#`-prefixed line only continues a
+/// comment block when what follows the `#` is itself comment text -- which is
+/// what [`is_comment_like`] then requires.
+///
+/// Boost's preprocessor limit headers are why this is a language decision and
+/// not a spelling one (#1775). They write their license preamble as null
+/// directives (`# /* Copyright ... */`, then a bare `#`) and their bodies as
+/// spaced directives (`# define BOOST_PP_BOOL_176 1`). Reading every `# `
+/// line as a comment made the backward walk run from any one macro through
+/// every preceding `# define` and `# ifndef` up to line 1, so
+/// `get_symbol_sources` answered a one-line macro with the whole 193-line
+/// preamble.
+fn hash_starts_line_comment(language: Language) -> bool {
+    match language {
+        Language::Python | Language::Ruby | Language::Php => true,
+        Language::None
+        | Language::Java
+        | Language::Go
+        | Language::Cpp
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Rust
+        | Language::Scala
+        | Language::CSharp
+        | Language::Kotlin => false,
+    }
+}
+
+fn is_comment_like(trimmed_line: &str, language: Language) -> bool {
+    if trimmed_line.starts_with("/**")
         || trimmed_line.starts_with("/*")
         || trimmed_line.starts_with("*/")
         || trimmed_line.starts_with('*')
         || trimmed_line.starts_with("//")
-        || trimmed_line.strip_prefix('#').is_some_and(|rest| {
-            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
-        })
         || trimmed_line.starts_with("#[")
+    {
+        return true;
+    }
+    let Some(rest) = trimmed_line.strip_prefix('#') else {
+        return false;
+    };
+    if hash_starts_line_comment(language) {
+        return rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace);
+    }
+    // A directive line continues an attached comment block only when the
+    // directive itself is null and carries nothing but comment text: boost's
+    // `# /* Revised by Paul Mensonides (2002) */` and its bare `#` spacers
+    // stay attached, while `# define` and `# ifndef` terminate the walk.
+    let rest = rest.trim_start();
+    rest.is_empty()
+        || rest.starts_with("/*")
+        || rest.starts_with("*/")
+        || rest.starts_with('*')
+        || rest.starts_with("//")
 }
 
-fn first_comment_offset(line: &str) -> Option<usize> {
-    ["/**", "/*", "//", "#["]
+fn first_comment_offset(line: &str, language: Language) -> Option<usize> {
+    let markers = ["/**", "/*", "//", "#["]
         .into_iter()
-        .filter_map(|marker| line.find(marker))
-        .chain(line.find("# "))
-        .min()
+        .filter_map(|marker| line.find(marker));
+    if hash_starts_line_comment(language) {
+        markers.chain(line.find("# ")).min()
+    } else {
+        markers.min()
+    }
 }
 
 /// The direct named children of `node`, in source order.
@@ -401,5 +456,98 @@ fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'
         if let Some(child) = node.named_child(index) {
             stack.push(TreeWalkFrame::Enter(child));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expanded_comment_start;
+    use crate::analyzer::model::Language;
+
+    /// The boost preprocessor limit-header shape from #1775.
+    const BOOST_SHAPE: &str = "\
+# /* Copyright (C) 2001
+#  * Housemarque Oy
+#  */
+#
+# ifndef GUARD_HPP
+# define GUARD_HPP
+#
+# define BOOST_PP_BOOL_0 0
+# define BOOST_PP_BOOL_1 1
+";
+
+    #[test]
+    fn cpp_spaced_directive_lines_terminate_the_walk() {
+        let declaration = BOOST_SHAPE.find("# define BOOST_PP_BOOL_1 1").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(Language::Cpp, BOOST_SHAPE, declaration),
+            declaration,
+            "`# define`/`# ifndef` are directives, so the macro has no attached comment"
+        );
+    }
+
+    #[test]
+    fn hash_comment_languages_still_attach_every_hash_line() {
+        // The same bytes read as a hash-comment language: every `# ` line is a
+        // comment, so the whole block above the declaration attaches.
+        let declaration = BOOST_SHAPE.find("# define BOOST_PP_BOOL_1 1").unwrap();
+
+        for language in [Language::Python, Language::Ruby, Language::Php] {
+            assert_eq!(
+                expanded_comment_start(language, BOOST_SHAPE, declaration),
+                0,
+                "{language:?} spells a line comment with `#`"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_null_directives_carrying_comment_text_stay_attached() {
+        let source = "\
+# /* Fast path toggle.
+#  * Second line.
+#  */
+#
+# define FAST 1
+";
+        let declaration = source.find("# define FAST 1").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(Language::Cpp, source, declaration),
+            0,
+            "a null directive whose payload is comment text is the macro's docstring"
+        );
+    }
+
+    #[test]
+    fn cpp_directive_after_a_block_comment_keeps_the_comment() {
+        let source = "/** Fast path toggle. */\n# define FAST 1\n";
+        let declaration = source.find("# define FAST 1").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(Language::Cpp, source, declaration),
+            0
+        );
+    }
+
+    #[test]
+    fn python_inline_comment_boundary_survives_the_language_gate() {
+        // The `# ` fallback on a terminating code line is a hash-comment-only
+        // rule: it must not fire for a C++ line that merely contains `# `.
+        let python = "value = 1  # nearby\ndef work():\n";
+        let declaration = python.find("def work").unwrap();
+        assert_eq!(
+            expanded_comment_start(Language::Python, python, declaration),
+            python.find("# nearby").unwrap()
+        );
+
+        let cpp = "int value = 1;  # not a comment\nvoid work() {}\n";
+        let declaration = cpp.find("void work").unwrap();
+        assert_eq!(
+            expanded_comment_start(Language::Cpp, cpp, declaration),
+            declaration
+        );
     }
 }
