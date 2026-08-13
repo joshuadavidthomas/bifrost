@@ -98,6 +98,7 @@ mod issue_2066_js_lexical_binding_precedence;
 mod issue_2069_go_named_container_literals;
 mod issue_2070_go_nested_map_keys;
 mod issue_2071_go_elided_map_key_owner;
+mod issue_2072_go_promoted_interface_chain;
 mod issue_2092_c_this_binding;
 mod issue_2093_c_ordinary_macro_references;
 mod issue_693_profile;

@@ -82,9 +82,7 @@ impl GoProjectGraph {
     /// `package_name` half of the analyzer's `CodeUnit::fq_name()` so the inverted
     /// scan's callee fqns line up with the graph's nodes.
     pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
-        self.parsed
-            .get(file)
-            .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
+        self.edge_index.package_name_of(file)
     }
 
     pub fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
@@ -1303,19 +1301,25 @@ fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
 pub fn build_go_graph(
     source: GoGraphSource<'_>,
     candidate_files: &HashSet<ProjectFile>,
+    resolution_files: &[ProjectFile],
     target_file: &ProjectFile,
     cancellation: Option<&CancellationToken>,
 ) -> GoProjectGraph {
-    let mut parsed: HashMap<ProjectFile, Arc<ParsedFile>> = HashMap::default();
-    let mut files = Vec::new();
     let scoped_files: BTreeSet<ProjectFile> = candidate_files
         .iter()
         .filter(|file| language_for_file(file) == Language::Go)
         .cloned()
         .chain(std::iter::once(target_file.clone()))
         .collect();
+    let all_files: BTreeSet<ProjectFile> = resolution_files
+        .iter()
+        .filter(|file| language_for_file(file) == Language::Go)
+        .cloned()
+        .chain(scoped_files.iter().cloned())
+        .collect();
+    let mut all_parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
 
-    for file in scoped_files {
+    for file in all_files {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
@@ -1323,28 +1327,31 @@ pub fn build_go_graph(
             continue;
         }
         let parsed_file = match parse_go_file(&file) {
-            Some(parsed_file) => Arc::new(parsed_file),
+            Some(parsed_file) => parsed_file,
             None => continue,
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
-        files.push(file.clone());
-        parsed.insert(file, parsed_file);
+        all_parsed.insert(file, parsed_file);
     }
 
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        files.clear();
-        parsed.clear();
+        all_parsed.clear();
     }
 
-    let dir_index = build_parent_dir_index(parsed.keys());
-    let parsed_refs: Vec<_> = parsed
+    let dir_index = build_parent_dir_index(all_parsed.keys());
+    let parsed_refs: Vec<_> = all_parsed
         .iter()
-        .map(|(file, parsed)| (file.clone(), parsed.as_ref()))
+        .map(|(file, parsed)| (file.clone(), parsed))
         .collect();
     let workspace_paths = source.workspace_paths;
     let edge_index = build_go_edge_index_from_parsed(source, &parsed_refs);
+    let package_names: HashMap<ProjectFile, String> = all_parsed
+        .iter()
+        .map(|(file, parsed)| (file.clone(), parsed.package_name.clone()))
+        .collect();
+    let files: Vec<ProjectFile> = all_parsed.keys().cloned().collect();
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -1355,7 +1362,7 @@ pub fn build_go_graph(
         exports_by_file.insert(file.clone(), export_index_of(source, file));
         binders_by_file.insert(
             file.clone(),
-            import_binder_of(source, file, &parsed, &dir_index, workspace_paths),
+            import_binder_of(source, file, &package_names, &dir_index, workspace_paths),
         );
     }
 
@@ -1367,6 +1374,15 @@ pub fn build_go_graph(
     } = build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
     let importer_reverse =
         build_importer_reverse_go(&files, &binders_by_file, &exports_by_file, &resolve);
+
+    // Only candidate and target trees survive the build. The remaining parses
+    // contributed compact cross-workspace type/import facts above and are
+    // dropped here, so a narrow query does not retain the whole workspace CST.
+    let parsed = all_parsed
+        .into_iter()
+        .filter(|(file, _)| scoped_files.contains(file))
+        .map(|(file, parsed)| (file, Arc::new(parsed)))
+        .collect();
 
     GoProjectGraph {
         parsed,
@@ -1397,7 +1413,7 @@ fn export_index_of(source: GoGraphSource<'_>, file: &ProjectFile) -> ExportIndex
 fn import_binder_of(
     source: GoGraphSource<'_>,
     file: &ProjectFile,
-    parsed: &HashMap<ProjectFile, Arc<ParsedFile>>,
+    package_names: &HashMap<ProjectFile, String>,
     dir_index: &ParentDirIndex,
     workspace_paths: &GoWorkspacePathIndex,
 ) -> ImportBinder {
@@ -1433,8 +1449,8 @@ fn import_binder_of(
                         let resolved = resolve_go_module(file, &path, dir_index, workspace_paths);
                         let mut names: Vec<_> = resolved
                             .iter()
-                            .filter_map(|target| parsed.get(target))
-                            .map(|target| target.package_name.clone())
+                            .filter_map(|target| package_names.get(target))
+                            .cloned()
                             .filter(|name| !name.is_empty())
                             .collect();
                         names.sort();
