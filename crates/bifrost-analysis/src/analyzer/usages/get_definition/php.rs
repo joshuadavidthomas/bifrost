@@ -743,7 +743,10 @@ fn php_reference_node<'tree>(
         "name" | "qualified_name" | "relative_scope" => {
             let parent = node.parent()?;
             match parent.kind() {
-                "object_creation_expression" | "named_type" => Some(PhpReferenceNode::Type(node)),
+                "object_creation_expression"
+                | "named_type"
+                | "base_clause"
+                | "class_interface_clause" => Some(PhpReferenceNode::Type(node)),
                 "function_call_expression"
                     if parent.child_by_field_name("function") == Some(node) =>
                 {

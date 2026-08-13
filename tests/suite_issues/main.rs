@@ -80,6 +80,7 @@ mod issue_1950_cpp_nested_callee_focus;
 mod issue_1960_cpp_macro_activation;
 mod issue_1971_python_project_root;
 mod issue_1975_php_chained_static_factory;
+mod issue_2027_php_qualified_ancestry;
 mod issue_2092_c_this_binding;
 mod issue_2093_c_ordinary_macro_references;
 mod issue_693_profile;
