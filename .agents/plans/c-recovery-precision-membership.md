@@ -13,7 +13,7 @@ The forward-versus-inverse differential runner checks whether every exact invers
 - [x] (2026-08-13 21:12Z) Reused the authoritative C batch visibility to augment precision membership without changing the census probe frontier.
 - [x] (2026-08-13 21:12Z) Made binding/declaration usage-hit kinds precision-ineligible and added behavior coverage for recovered type/member references, macro definition/formal exclusions, and candidate-cap failure.
 - [x] (2026-08-13 21:31Z) Ran focused validation, committed `695339c9`, rebuilt the release runner, and exact-replayed six representative corpus witnesses with zero actionable findings and zero file errors.
-- [ ] Push the implementation and plan closure, publish the exact evidence, and close #2089 without waiting for the complete C campaign.
+- [x] (2026-08-13 21:39Z) Pushed through merge tip `2fc2d1de`, published the focused test and six-report evidence, and closed #2089 without waiting for the complete C campaign.
 
 ## Surprises & Discoveries
 
@@ -137,6 +137,8 @@ Plan revision note (2026-08-13): Created after #2093 closure. The source audit e
 Plan revision note (2026-08-13 21:12Z): Updated after implementation and focused validation. The synthetic member witness was changed to a valid ignored macro argument, `DISCARD(const int = state->timestamp)`, so the grammar preserves a structured `field_expression` under `ERROR` and the test proves an actual inverse hit rather than membership-only bookkeeping.
 
 Plan revision note (2026-08-13 21:31Z): Recorded checkpoint `695339c9` and six clean exact corpus replays. The supplemental CycloneDDS result demonstrates that the fix is not limited to the original partial-nine ledger.
+
+Plan revision note (2026-08-13 21:39Z): Marked complete after the implementation reached `origin/master` and #2089 was closed with focused validation and immutable corpus-report hashes.
 
 ## Interfaces and Dependencies
 
