@@ -167,10 +167,13 @@ impl FileScan<'_> {
 fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     match node.kind() {
         "import_declaration" => return,
-        "function_declaration" | "method_declaration" => {
+        "func_literal" | "function_declaration" | "method_declaration" => {
             locals.enter_scope();
+            scan_callable_header(node, ctx, locals);
             seed_parameters(node, ctx, locals);
-            scan_children(node, ctx, locals);
+            if let Some(body) = node.child_by_field_name("body") {
+                scan_node(body, ctx, locals);
+            }
             locals.exit_scope();
             return;
         }
@@ -181,7 +184,11 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
             return;
         }
         "parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                scan_node(type_node, ctx, locals);
+            }
             seed_parameter_declaration(node, ctx, locals, is_method_receiver_parameter(node));
+            return;
         }
         "const_declaration" if is_top_level_declaration(node) => {
             scan_top_level_value_initializers(node, ctx);
@@ -200,6 +207,33 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
         _ => {}
     }
     scan_children(node, ctx, locals);
+}
+
+fn scan_callable_header(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if node.child_by_field_name("body") == Some(child) {
+            continue;
+        }
+        if child.kind() == "parameter_list" {
+            let mut params = child.walk();
+            for parameter in child.named_children(&mut params) {
+                if matches!(
+                    parameter.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                ) && let Some(type_node) = parameter.child_by_field_name("type")
+                {
+                    scan_node(type_node, ctx, locals);
+                }
+            }
+        } else {
+            scan_node(child, ctx, locals);
+        }
+    }
 }
 
 fn is_top_level_declaration(node: Node<'_>) -> bool {
@@ -386,7 +420,7 @@ fn seed_parameters(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferen
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "parameter_list" {
+        if child.kind() == "parameter_list" && node.child_by_field_name("receiver") != Some(child) {
             seed_parameter_list(child, ctx, locals, false);
         }
     }
@@ -400,7 +434,10 @@ fn seed_parameter_list(
 ) {
     let mut params = node.walk();
     for param in node.named_children(&mut params) {
-        if param.kind() == "parameter_declaration" {
+        if matches!(
+            param.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
             seed_parameter_declaration(param, ctx, locals, is_method_receiver);
         }
     }
