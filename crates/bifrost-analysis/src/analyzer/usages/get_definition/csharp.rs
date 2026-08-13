@@ -2853,6 +2853,13 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if parent.kind() == "parameter" {
+        // A parameter owns both its declaration name and its default-value
+        // expression. The former is filtered as a declaration before this
+        // helper runs; the latter is an ordinary value reference and can name
+        // an enclosing constant or field (#2061).
+        return parent.child_by_field_name("name") != Some(node);
+    }
     if parent.kind() == "member_access_expression" {
         return csharp_member_access_receiver(parent)
             .is_some_and(|receiver| same_node(receiver, node));
@@ -2884,7 +2891,6 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "local_function_statement"
             | "constructor_declaration"
             | "property_declaration"
-            | "parameter"
             | "using_directive"
     )
 }
