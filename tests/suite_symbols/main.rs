@@ -15,6 +15,7 @@ mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
 mod issue_1963_ignored_nested_workspace;
+mod issue_2111_path_segment_selectors;
 mod most_relevant_files;
 mod optional_chain_reference_site;
 mod php_ranks21_30_regression;
