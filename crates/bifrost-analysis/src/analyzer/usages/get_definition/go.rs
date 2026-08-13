@@ -556,6 +556,7 @@ fn go_keyed_composite_label_outcome(
 
 enum GoCompositeOwnerStep {
     ContainerElementOrValue,
+    MapKey,
     KeyedValue(Option<String>),
 }
 
@@ -672,13 +673,21 @@ fn go_composite_label_owner_fqn(
             }
             "keyed_element" => {
                 let value = parent.child_by_field_name("value")?;
-                if value.id() != literal.id() {
+                let step = if value.id() == literal.id() {
+                    GoCompositeOwnerStep::KeyedValue(go_composite_key_identifier_name(
+                        support,
+                        parent.child_by_field_name("key")?,
+                        source,
+                    ))
+                } else if parent
+                    .child_by_field_name("key")
+                    .is_some_and(|key| key.id() == literal.id())
+                {
+                    GoCompositeOwnerStep::MapKey
+                } else {
                     return None;
-                }
-                let key = parent.child_by_field_name("key")?;
-                steps.push(GoCompositeOwnerStep::KeyedValue(
-                    go_composite_key_identifier_name(support, key, source),
-                ));
+                };
+                steps.push(step);
                 literal = parent
                     .parent()
                     .filter(|ancestor| ancestor.kind() == "literal_value")?;
@@ -695,13 +704,21 @@ fn go_composite_label_owner_fqn(
                 literal = match container.kind() {
                     "keyed_element" => {
                         let value = container.child_by_field_name("value")?;
-                        if value.id() != parent.id() {
+                        let step = if value.id() == parent.id() {
+                            GoCompositeOwnerStep::KeyedValue(go_composite_key_identifier_name(
+                                support,
+                                container.child_by_field_name("key")?,
+                                source,
+                            ))
+                        } else if container
+                            .child_by_field_name("key")
+                            .is_some_and(|key| key.id() == parent.id())
+                        {
+                            GoCompositeOwnerStep::MapKey
+                        } else {
                             return None;
-                        }
-                        let key = container.child_by_field_name("key")?;
-                        steps.push(GoCompositeOwnerStep::KeyedValue(
-                            go_composite_key_identifier_name(support, key, source),
-                        ));
+                        };
+                        steps.push(step);
                         container
                             .parent()
                             .filter(|ancestor| ancestor.kind() == "literal_value")?
@@ -726,6 +743,7 @@ fn go_composite_label_owner_fqn(
             GoCompositeOwnerStep::ContainerElementOrValue => {
                 go_composite_owner_container_step(analyzer, support, owner)?
             }
+            GoCompositeOwnerStep::MapKey => go_composite_owner_map_key_step(support, owner)?,
             GoCompositeOwnerStep::KeyedValue(field) => go_composite_owner_keyed_value_step(
                 analyzer,
                 support,
@@ -755,6 +773,28 @@ fn go_composite_label_owner_fqn(
             &package,
             &identity,
         ),
+    }
+}
+
+fn go_composite_owner_map_key_step<'tree>(
+    support: &dyn GoDefinitionProvider,
+    owner: GoCompositeOwnerRef<'tree>,
+) -> Option<GoCompositeOwnerRef<'tree>> {
+    match owner {
+        GoCompositeOwnerRef::Syntax(owner_type) => Some(GoCompositeOwnerRef::Syntax(
+            go_composite_map_key_type(support, owner_type)?,
+        )),
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => identity
+            .into_map_key_with(|| support.scope_step())
+            .map(|identity| GoCompositeOwnerRef::IndexedType {
+                file,
+                package,
+                identity,
+            }),
     }
 }
 
@@ -878,6 +918,22 @@ fn go_composite_container_element_or_value_type<'tree>(
             "array_type" => return node.child_by_field_name("element"),
             "slice_type" => return node.named_child(0),
             "map_type" => return node.child_by_field_name("value"),
+            "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
+            _ => return None,
+        }
+    }
+}
+
+fn go_composite_map_key_type<'tree>(
+    support: &dyn GoDefinitionProvider,
+    mut node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    loop {
+        if !support.scope_step() {
+            return None;
+        }
+        match node.kind() {
+            "map_type" => return node.child_by_field_name("key"),
             "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
             _ => return None,
         }

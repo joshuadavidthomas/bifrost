@@ -1428,6 +1428,19 @@ impl StructuredTypeIdentity {
         Some(self)
     }
 
+    /// Consumes a map identity and selects its key node without cloning the
+    /// arena.
+    pub fn into_map_key_with(mut self, mut visit: impl FnMut() -> bool) -> Option<Self> {
+        if !visit() {
+            return None;
+        }
+        self.root = match self.node(self.root)? {
+            StructuredTypeNode::Map { key, .. } => *key,
+            _ => return None,
+        };
+        Some(self)
+    }
+
     /// Compares only the reachable type shapes, charging once for each node
     /// inspected in both identities.
     pub fn structurally_eq_with(
@@ -3938,20 +3951,17 @@ mod structured_type_identity_tests {
     }
 
     #[test]
-    fn rerooted_container_identity_compares_by_reachable_shape() {
+    fn rerooted_map_identities_compare_by_reachable_shape() {
         let service =
             StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
         let key = StructuredTypeName::new(vec!["string".to_string()], Vec::new(), false).unwrap();
 
         let mut map_builder = StructuredTypeIdentityBuilder::default();
-        let key_id = map_builder.named(key).unwrap();
+        let key_id = map_builder.named(key.clone()).unwrap();
         let value_id = map_builder.named(service.clone()).unwrap();
         let map_id = map_builder.map(key_id, value_id).unwrap();
-        let value = map_builder
-            .finish(map_id)
-            .unwrap()
-            .into_container_element_with(|| true)
-            .unwrap();
+        let map = map_builder.finish(map_id).unwrap();
+        let value = map.clone().into_container_element_with(|| true).unwrap();
 
         let mut named_builder = StructuredTypeIdentityBuilder::default();
         let named_id = named_builder.named(service).unwrap();
@@ -3959,6 +3969,14 @@ mod structured_type_identity_tests {
 
         assert_eq!(value, named);
         assert_eq!(hash(&value), hash(&named));
+
+        let key_identity = map.into_map_key_with(|| true).unwrap();
+        let mut named_builder = StructuredTypeIdentityBuilder::default();
+        let named_id = named_builder.named(key).unwrap();
+        let named = named_builder.finish(named_id).unwrap();
+
+        assert_eq!(key_identity, named);
+        assert_eq!(hash(&key_identity), hash(&named));
     }
 }
 
