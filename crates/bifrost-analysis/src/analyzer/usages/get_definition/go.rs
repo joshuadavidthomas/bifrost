@@ -518,6 +518,12 @@ fn go_keyed_composite_label_outcome(
     let key = keyed.child_by_field_name("key")?;
     let label_node = go_simple_composite_key_identifier(support, key, selected)?;
 
+    if brokk_bifrost_go::graph::ast::composite_literal_owner_type_for_key(label_node)
+        .is_some_and(|owner| matches!(owner.kind(), "map_type" | "array_type" | "slice_type"))
+    {
+        return None;
+    }
+
     let direct_literal = keyed
         .parent()
         .filter(|parent| parent.kind() == "literal_value")?;
