@@ -12,7 +12,7 @@ Rust permits enum variants to enter the value namespace through explicit and glo
 - [x] (2026-08-13 22:28Z) Added a failing `InlineTestProject` covering plain and `self::` glob imports, an explicit renamed import, unit/tuple variants, and a true binder.
 - [x] (2026-08-13 22:28Z) Added the structured variant-before-binder seam and extended both ordinary and `self`/`super` glob routing with exact enum-owner lookup.
 - [x] (2026-08-13 22:28Z) Passed focused tests, all Rust crate tests, both affected crate clippy checks, dependency validation, formatting, and all six pinned serde-json exact replays.
-- [ ] Commit, push master without waiting for full CI, attach evidence, and close #2032.
+- [x] (2026-08-13 22:33Z) Committed as `c303a046b`, pushed master without waiting for full CI, attached exact evidence, and closed #2032.
 
 ## Surprises & Discoveries
 
@@ -34,7 +34,7 @@ Rust permits enum variants to enter the value namespace through explicit and glo
 
 Implementation and local validation are complete. The new suite-symbol regression passes for unqualified and `self::` glob imports, an explicit renamed variant, unit and tuple constructors, and a true binder. The adjacent #2036 regression and existing same-file enum tuple-pattern differential remain green, all 53 Rust crate tests pass, both affected crates pass clippy with warnings denied, and dependency/fmt/diff checks pass.
 
-All six pinned serde-json commands now exit zero with `actionable=0`: `Solidus`, `Backspace`, `FormFeed`, `CarriageReturn`, and both `AsciiControl` sites resolve to their exact `serde_json.ser.CharEscape.*` declaration, and inverse usage contains the exact reference range. Publication remains to be recorded after commit and push.
+All six pinned serde-json commands now exit zero with `actionable=0`: `Solidus`, `Backspace`, `FormFeed`, `CarriageReturn`, and both `AsciiControl` sites resolve to their exact `serde_json.ser.CharEscape.*` declaration, and inverse usage contains the exact reference range. The implementation was committed and pushed as `c303a046b`; evidence was posted at issue comment `#issuecomment-5287117062`, and #2032 was closed as completed.
 
 ## Context and Orientation
 
@@ -78,3 +78,5 @@ The pinned input is `/mnt/optane/tmp/bifrost-fird/final-63a1912a/inputs/rust/ser
 Plan revision note (2026-08-13 22:15Z): Initial plan created after the adjacent #2036 closure and direct audit of the existing Rust import/variant resolver.
 
 Plan revision note (2026-08-13 22:28Z): Updated after implementation and exact corpus replay. Added the production-only `self::Enum::*` discovery, the constrained owner-FQN lookup decision, and complete focused/corpus validation results.
+
+Plan revision note (2026-08-13 22:33Z): Recorded commit, push, issue evidence, and closure after publication.
