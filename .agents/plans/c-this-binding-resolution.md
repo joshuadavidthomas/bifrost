@@ -13,7 +13,13 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 - [x] (2026-08-13 11:27Z) Added shared C-source dialect detection and routed `this` reference nodes through local bindings in forward, targeted inverse, and bulk inverse analysis.
 - [x] (2026-08-13 11:34Z) Added InlineTestProject behavior tests for ordinary, direct, nested-shadow, wrong-owner, missing-binding, targeted-inverse, and C++ implicit-receiver behavior.
 - [x] (2026-08-13 11:39Z) Passed the three new issue tests, C/C++ receiver regressions, both affected crates' all-target clippy, formatting, dependency validation, and diff checks.
-- [ ] Commit, push, replay representative corpus witnesses, publish evidence, and close #2092.
+- [x] (2026-08-13 12:02Z) Committed and pushed the ordinary typed-binding fix as `e866c7bd` in merge `4496c7f9`, rebuilt the release runner, and replayed the three representative witnesses.
+- [x] (2026-08-13 12:17Z) Added shared structured recovery for an exact active function-like macro whose replacement is one local declaration, and used it in forward, targeted-inverse, and bulk-inverse binding engines.
+- [x] (2026-08-13 12:24Z) Passed the four #2092 behavior tests, established C/C++ receiver regressions, affected-crate all-target clippy, dependency validation, formatting, and diff checks.
+- [x] (2026-08-13 12:48Z) Replayed the production pgBackRest macro witness, preserved known macro definitions across unrelated unavailable includes, and pinned identical guarded re-includes, conflicting conditional definitions, and `#undef` controls.
+- [x] (2026-08-13 12:53Z) Re-ran resolver unit tests, the four #2092 integration tests, affected-crate all-target clippy, dependency validation, formatting, and diff checks after the visibility correction.
+- [x] (2026-08-13 13:01Z) Amended checkpoint `e283a796`, rebuilt the release runner, and replayed all three exact witnesses from clean pinned repositories: two resolved with exact inverse hits and the macro-local value was canonically adjudicated, with zero actionable findings, precision findings, or file errors.
+- [ ] Push, publish evidence, and close #2092.
 
 ## Surprises & Discoveries
 
@@ -26,6 +32,15 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 - Observation: direct parameter navigation is resolved before the C++ language-specific reference route.
   Evidence: the InlineTestProject query at `consume(this)` navigates to the indexed `struct S *this` parameter through the shared lexical-definition layer. The language-specific C branch remains necessary for recovered/unindexed binder shapes and returns the canonical local-value diagnostic when it can prove a shadow without a navigable declaration.
 
+- Observation: two of the three exact corpus witnesses use an ordinary typed binding, but the third creates the binding through a function-like macro.
+  Evidence: at pushed `4496c7f9`, strongSwan `this->usercert` and pgBackRest `this->varList` became consistent with exact inverse hits. PgBackRest `ASSERT(this != NULL)` remained missing because its function body contains `THIS(StorageAzure);`, where `#define THIS(type) type *this = thisVoid`; the AST has a call expression rather than a declaration even though the active macro environment contains the exact declaration template.
+
+- Observation: the shared macro environment contains enough structure to recover this declaration without parsing the invocation or source statement as text.
+  Evidence: `MacroDefinition::Function` preserves ordered formal parameters and the replacement. Parsing the replacement once inside a synthetic function body yields exactly one tree-sitter declaration, its declarator name, pointer depth, and a type node whose spelling is the formal parameter. The invocation supplies the corresponding structured argument node (`StorageAzure`).
+
+- Observation: the exact-site corpus runner can know the active macro and later lose exactness because an included header is outside prepared syntax.
+  Evidence: pgBackRest first applied the exact `THIS(type)` definition from `common/type/object.h`, then encountered `storage/azure/write.h` without prepared syntax. The macro environment correctly became globally uncertain, but its old representation replaced every known definition with `Unsupported`. Later guarded re-includes therefore could not prove that the same `THIS` definition remained a viable candidate.
+
 ## Decision Log
 
 - Decision: make source dialect explicit with one shared `is_c_source_file` helper based on the exact project-relative `.c` extension.
@@ -36,9 +51,13 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
   Rationale: the AST already distinguishes the declaration and use-site shapes. Looking up the exact spelling in the local binding engine preserves source order, scope, shadowing, and type precision. Missing or ambiguous bindings naturally fail closed.
   Date/Author: 2026-08-13 / Codex
 
+- Decision: materialize macro-produced locals only from a structurally known active function-like macro whose replacement parses as one declaration.
+  Rationale: this fixes the production `THIS(type)` shape at the macro-environment source of truth and lets all three binding engines share one interpretation. The replacement template is cached by definition identity; the declared type is instantiated from the exact AST argument node. A globally uncertain environment retains a previously known definition as provisional structured evidence, while a known `#undef` or conflicting conditional definition still replaces it with `Unsupported`. Arity mismatch, malformed or multi-statement replacements, and unsafe nested expansions fail closed. No regex, delimiter scan, or macro-name special case is involved.
+  Date/Author: 2026-08-13 / Codex
+
 ## Outcomes & Retrospective
 
-The structured implementation and focused behavior gate are complete locally. Proven `.c` sources resolve `this->field` through the visible typed binding on forward and targeted-inverse surfaces; the bulk inverse implementation uses the same rule. Nested C bindings preserve lexical precedence, missing bindings fail closed, and `.cpp` implicit receivers remain unchanged. Commit, push, corpus replay, publication, and issue closure remain.
+The ordinary typed-binding implementation is pushed, and the macro-produced local completion is committed at `e283a796`. All focused validation and all three clean pinned exact replays pass: strongSwan `usercert` resolves to `private_nm_creds_t.usercert`, pgBackRest `varList` resolves to `VarStore.varList`, both have exact inverse hits, and pgBackRest's direct macro-local `this` is an adjudicated `local_variable_reference`. Publication and issue closure remain.
 
 ## Context and Orientation
 
@@ -108,6 +127,8 @@ Plan revision note (2026-08-13): Created from #2092 after confirming the exact t
 
 Plan revision note (2026-08-13): Recorded the implemented shared dialect/binding route and focused acceptance. Direct `this` navigation proved to be handled by the shared lexical-definition layer before the C++ resolver; member ownership still required the three C-aware receiver changes.
 
+Plan revision note (2026-08-13): Recorded the first pushed checkpoint and exact replay. The third witness revealed the active `THIS(type)` declaration-macro variant, so the plan now includes shared structured macro-local materialization rather than treating the ordinary parameter fix as complete.
+
 ## Interfaces and Dependencies
 
-Expose `pub fn is_c_source_file(file: &ProjectFile) -> bool` from `brokk_bifrost_cpp::graph::resolver`. It must depend only on the core `ProjectFile` path API. No new crate or dependency is needed. Forward analysis imports the helper from the language crate; target-specific and bulk graph code call it within the same crate.
+Expose `pub fn is_c_source_file(file: &ProjectFile) -> bool` and `VisibilityIndex::function_macro_local_binding` from `brokk_bifrost_cpp::graph::resolver`. The macro-local result carries the declared name, structured invocation type node when parameterized, normalized type spelling, and declarator pointer depth. No new crate or dependency is needed. Forward analysis imports the shared APIs from the language crate; target-specific and bulk graph code call them within the same crate.

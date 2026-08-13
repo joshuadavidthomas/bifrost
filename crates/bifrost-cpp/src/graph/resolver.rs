@@ -580,6 +580,8 @@ pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
 pub type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
+type MacroLocalBindingTemplateCache =
+    HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment {
@@ -614,7 +616,7 @@ impl MacroEnvironment {
 
     fn mark_unknown_names(&mut self, source: &ProjectFile, byte: usize) {
         for binding in self.bindings.values_mut() {
-            *binding = MacroBinding::ambiguous(source, byte);
+            *binding = MacroBinding::uncertain_from(binding, source, byte);
         }
         self.unknown_names = true;
     }
@@ -776,6 +778,7 @@ pub struct VisibilityIndex<'a> {
     pub macro_environment_cursors:
         Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
+    macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_replacement_parse_count: AtomicUsize,
@@ -848,6 +851,31 @@ enum ParsedMacroReplacement {
     Unsupported,
 }
 
+#[derive(Clone)]
+enum MacroLocalBindingTypeTemplate {
+    Parameter(usize),
+    Fixed(String),
+}
+
+#[derive(Clone)]
+struct MacroLocalBindingTemplate {
+    name: String,
+    declared_type: MacroLocalBindingTypeTemplate,
+    pointer_depth: i32,
+}
+
+/// A local declaration contributed by one structurally known function-like macro.
+///
+/// `type_node` points into the invocation syntax when the replacement's type
+/// is one of the macro parameters. Consumers can therefore use their normal
+/// lexical type resolver without parsing replacement text themselves.
+pub struct MacroLocalBinding<'tree> {
+    pub name: String,
+    pub type_name: String,
+    pub type_node: Option<Node<'tree>>,
+    pub pointer_depth: i32,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MacroBinding {
     source: ProjectFile,
@@ -868,6 +896,15 @@ impl MacroBinding {
 
     fn is_exact(&self) -> bool {
         self.exact
+    }
+
+    fn uncertain_from(current: &Self, source: &ProjectFile, declaration_byte: usize) -> Self {
+        Self {
+            source: source.clone(),
+            declaration_byte,
+            definition: current.definition.clone(),
+            exact: false,
+        }
     }
 }
 
@@ -1054,6 +1091,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            macro_local_binding_templates: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
@@ -1193,6 +1231,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            macro_local_binding_templates: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             macro_replacement_parse_count: AtomicUsize::new(0),
@@ -1300,6 +1339,9 @@ impl<'a> VisibilityIndex<'a> {
                 CallArityEvidence::Exact(1)
             };
         };
+        if !binding.is_exact() {
+            return CallArityEvidence::Unknown;
+        }
         match (&binding.definition, invocation_arguments, function_like) {
             (MacroDefinition::Object { replacement }, None, false) => self
                 .replacement_arity_evidence(
@@ -1439,6 +1481,140 @@ impl<'a> VisibilityIndex<'a> {
         let parsed = Arc::new(parsed);
         cache.insert(key, Arc::clone(&parsed));
         parsed
+    }
+
+    /// Recover a typed local declared by an active C function-like macro.
+    ///
+    /// This is intentionally narrower than macro expansion. The replacement
+    /// must parse as one declaration, and the invocation must bind every
+    /// formal parameter to one structured argument. That is sufficient for
+    /// declaration macros such as `THIS(StorageAzure)`. An unavailable include
+    /// can make the binding provisional without erasing its last known
+    /// definition; an explicit conflicting definition still replaces it with
+    /// Unsupported. Malformed and statement-producing macros also fail closed.
+    pub fn function_macro_local_binding<'tree>(
+        &self,
+        file: &ProjectFile,
+        statement: Node<'tree>,
+        source: &str,
+    ) -> Option<MacroLocalBinding<'tree>> {
+        if !is_c_source_file(file) {
+            return None;
+        }
+        let call = match statement.kind() {
+            "call_expression" => statement,
+            "expression_statement" if statement.named_child_count() == 1 => {
+                statement.named_child(0)?
+            }
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let actuals = argument_children(arguments).collect::<Vec<_>>();
+        let environment = self.macro_environment(file, call.start_byte());
+        let function_name = node_text(function, source);
+        let binding = environment.binding(function_name)?;
+        let MacroDefinition::Function {
+            parameters,
+            replacement,
+        } = &binding.definition
+        else {
+            return None;
+        };
+        if actuals.len() != parameters.len() {
+            return None;
+        }
+        let template = self.macro_local_binding_template(binding, parameters, replacement)?;
+        let (type_name, type_node) = match &template.declared_type {
+            MacroLocalBindingTypeTemplate::Parameter(index) => {
+                let actual = *actuals.get(*index)?;
+                if !macro_expansion_shape_is_safe(actual, source, &[], &environment) {
+                    return None;
+                }
+                (node_text(actual, source).trim().to_string(), Some(actual))
+            }
+            MacroLocalBindingTypeTemplate::Fixed(type_name) => (type_name.clone(), None),
+        };
+        if type_name.is_empty() {
+            return None;
+        }
+        Some(MacroLocalBinding {
+            name: template.name.clone(),
+            type_name,
+            type_node,
+            pointer_depth: template.pointer_depth,
+        })
+    }
+
+    fn macro_local_binding_template(
+        &self,
+        binding: &MacroBinding,
+        parameters: &[String],
+        replacement: &str,
+    ) -> Option<Arc<MacroLocalBindingTemplate>> {
+        let key = (binding.source.clone(), binding.declaration_byte);
+        let mut cache = self
+            .macro_local_binding_templates
+            .lock()
+            .expect("C++ macro local-binding cache poisoned");
+        if let Some(template) = cache.get(&key) {
+            return template.clone();
+        }
+        let sentinel = format!("void __bifrost_macro_local() {{ {replacement}; }}");
+        let template = (|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(&sentinel, None)?;
+            if tree.root_node().has_error() {
+                return None;
+            }
+            let function = first_descendant_of_kind(tree.root_node(), "function_definition")?;
+            let body = function.child_by_field_name("body")?;
+            if body.named_child_count() != 1 {
+                return None;
+            }
+            let declaration = body.named_child(0)?;
+            if declaration.kind() != "declaration" {
+                return None;
+            }
+            let type_node = declaration
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(declaration))?;
+            let declarator = declaration.child_by_field_name("declarator").or_else(|| {
+                let mut cursor = declaration.walk();
+                declaration.named_children(&mut cursor).find_map(|child| {
+                    if child.kind() == "init_declarator" {
+                        child.child_by_field_name("declarator")
+                    } else {
+                        is_declarator_node(child).then_some(child)
+                    }
+                })
+            })?;
+            let name = extract_variable_name(declarator, &sentinel)?;
+            let pointer_depth =
+                declared_name_indirection(declaration, type_node, &name, &sentinel)?;
+            let type_text = node_text(type_node, &sentinel).trim();
+            let declared_type = parameters
+                .iter()
+                .position(|parameter| parameter == type_text)
+                .map(MacroLocalBindingTypeTemplate::Parameter)
+                .unwrap_or_else(|| MacroLocalBindingTypeTemplate::Fixed(type_text.to_string()));
+            Some(Arc::new(MacroLocalBindingTemplate {
+                name,
+                declared_type,
+                pointer_depth,
+            }))
+        })();
+        cache.insert(key, template.clone());
+        template
     }
 
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
@@ -1713,14 +1889,17 @@ impl<'a> VisibilityIndex<'a> {
                 conditional,
                 byte,
             } => {
-                environment.insert(
-                    name.clone(),
-                    if *conditional {
-                        MacroBinding::ambiguous(file, *byte)
-                    } else {
-                        binding.clone()
-                    },
-                );
+                if *conditional {
+                    Self::merge_conditional_macro_definition(
+                        environment,
+                        name,
+                        binding,
+                        file,
+                        *byte,
+                    );
+                } else {
+                    environment.insert(name.clone(), binding.clone());
+                }
             }
             MacroEvent::Undef {
                 name,
@@ -1761,7 +1940,7 @@ impl<'a> VisibilityIndex<'a> {
             }
             MacroEvent::Invalidate { byte } => {
                 for binding in environment.bindings.values_mut() {
-                    *binding = MacroBinding::ambiguous(file, *byte);
+                    *binding = MacroBinding::uncertain_from(binding, file, *byte);
                 }
             }
         }
@@ -1808,10 +1987,13 @@ impl<'a> VisibilityIndex<'a> {
             self.macro_event_application_count
                 .fetch_add(1, Ordering::Relaxed);
             match event {
-                MacroEvent::Define { name, .. } => {
-                    environment.insert(
-                        name.clone(),
-                        MacroBinding::ambiguous(conditional_file, conditional_byte),
+                MacroEvent::Define { name, binding, .. } => {
+                    Self::merge_conditional_macro_definition(
+                        environment,
+                        name,
+                        binding,
+                        conditional_file,
+                        conditional_byte,
                     );
                 }
                 MacroEvent::Undef { name, .. } => {
@@ -1839,11 +2021,38 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 MacroEvent::Invalidate { .. } => {
                     for binding in environment.bindings.values_mut() {
-                        *binding = MacroBinding::ambiguous(conditional_file, conditional_byte);
+                        *binding = MacroBinding::uncertain_from(
+                            binding,
+                            conditional_file,
+                            conditional_byte,
+                        );
                     }
                 }
             }
         }
+    }
+
+    fn merge_conditional_macro_definition(
+        environment: &mut MacroEnvironment,
+        name: &str,
+        possible_binding: &MacroBinding,
+        conditional_file: &ProjectFile,
+        conditional_byte: usize,
+    ) {
+        // A conditional include can revisit an already-active guarded header.
+        // If the possible branch defines the exact same macro, both outcomes
+        // leave the binding unchanged; degrading it to Unknown would discard
+        // proof because of an unrelated unresolved macro name (#2092).
+        if environment.binding(name).is_some_and(|current| {
+            current.definition != MacroDefinition::Unsupported
+                && current.definition == possible_binding.definition
+        }) {
+            return;
+        }
+        environment.insert(
+            name.to_string(),
+            MacroBinding::ambiguous(conditional_file, conditional_byte),
+        );
     }
 
     pub fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {

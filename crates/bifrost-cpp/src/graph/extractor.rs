@@ -345,9 +345,45 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
         "for_range_loop" => seed_range_binding(node, ctx),
+        "expression_statement" => seed_function_macro_local_binding(node, ctx),
         "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
     }
+}
+
+fn seed_function_macro_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(binding) = ctx
+        .visibility
+        .function_macro_local_binding(ctx.file, node, ctx.source)
+    else {
+        return;
+    };
+    if ctx.spec.kind == TargetKind::Type {
+        ctx.bindings.declare_shadow(binding.name);
+        return;
+    }
+    let normalized = normalize_cpp_type_name(&binding.type_name);
+    let unit = binding
+        .type_node
+        .and_then(|type_node| {
+            ctx.visibility
+                .resolve_type_node_result(ctx.file, type_node, ctx.source)
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            ctx.visibility
+                .canonical_type_for_reference(ctx.file, &normalized)
+        })
+        .or_else(|| ctx.visibility.resolve_type(ctx.file, &normalized));
+    ctx.bindings.seed_symbol(
+        binding.name,
+        CppScanBinding::from_type_name(
+            normalized,
+            unit,
+            binding.pointer_depth + cpp_type_text_pointer_depth(&binding.type_name),
+        ),
+    );
 }
 
 fn indexed_recovered_class_field_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

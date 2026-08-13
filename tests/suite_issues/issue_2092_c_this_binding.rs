@@ -185,6 +185,122 @@ int read_field(struct S *this, struct Other *other) {
 }
 
 #[test]
+fn c_this_declared_by_an_active_function_macro_is_typed_after_the_invocation() {
+    let source = r#"#include "object.h"
+#include "unavailable-generated.h"
+#include "repeat.h"
+
+typedef struct Storage {
+    int field;
+} Storage;
+
+void consume(void *value);
+
+int read_field(void *thisVoid) {
+    THIS(Storage);
+    consume(this); // macro-local
+    return this->field; // macro-field
+}
+
+#include "conflict.h"
+int conflicted(void *thisVoid) {
+    THIS(Storage);
+    return this->field; // ambiguous-macro
+}
+
+#undef THIS
+int unresolved(void *thisVoid) {
+    THIS(Storage);
+    return this->field; // inactive-macro
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "object.h",
+            r#"#ifndef OBJECT_H
+#define OBJECT_H
+#define THIS(type) type *this = thisVoid
+#endif
+"#,
+        )
+        .file(
+            "repeat.h",
+            r#"#ifndef REPEAT_H
+#define REPEAT_H
+#include "object.h"
+#endif
+"#,
+        )
+        .file(
+            "conflict.h",
+            r#"#if MAYBE_REDEFINE_THIS
+#define THIS(type) type *other = thisVoid
+#endif
+"#,
+        )
+        .file("macro_binding.c", source)
+        .build();
+
+    let member_start = occurrence(source, "    return this->field; // macro-field", "field");
+    let member = definition_at_offset(&project, "macro_binding.c", source, member_start);
+    assert_eq!(member["status"], "resolved", "{member:#}");
+    assert_eq!(
+        member["definitions"][0]["fqn"], "Storage.field",
+        "{member:#}"
+    );
+
+    let direct = definition_at_offset(
+        &project,
+        "macro_binding.c",
+        source,
+        occurrence(source, "    consume(this); // macro-local", "this"),
+    );
+    assert_eq!(direct["status"], "no_definition", "{direct:#}");
+    assert_eq!(
+        direct["diagnostics"][0]["kind"], "local_variable_reference",
+        "the unindexed macro declaration must still adjudicate the local use: {direct:#}"
+    );
+
+    let inactive_start = occurrence(source, "    return this->field; // inactive-macro", "field");
+    let inactive = definition_at_offset(&project, "macro_binding.c", source, inactive_start);
+    assert_eq!(inactive["status"], "no_definition", "{inactive:#}");
+    assert!(
+        inactive["definitions"].as_array().is_none_or(Vec::is_empty),
+        "an invocation after #undef must not create a binding: {inactive:#}"
+    );
+
+    let ambiguous_start = occurrence(
+        source,
+        "    return this->field; // ambiguous-macro",
+        "field",
+    );
+    let ambiguous = definition_at_offset(&project, "macro_binding.c", source, ambiguous_start);
+    assert_eq!(ambiguous["status"], "no_definition", "{ambiguous:#}");
+    assert!(
+        ambiguous["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a conflicting conditional definition must fail closed: {ambiguous:#}"
+    );
+
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("macro_binding.c");
+    let ranges = authoritative_ranges(&analyzer, &field(&analyzer, "Storage", "field"), &file);
+    assert!(
+        ranges.contains(&(member_start, member_start + "field".len())),
+        "the targeted graph must use the same macro-local owner: {ranges:?}"
+    );
+    assert!(
+        !ranges.contains(&(inactive_start, inactive_start + "field".len())),
+        "an inactive declaration macro must not create a targeted hit: {ranges:?}"
+    );
+    assert!(
+        !ranges.contains(&(ambiguous_start, ambiguous_start + "field".len())),
+        "a conflicting declaration macro must not create a targeted hit: {ranges:?}"
+    );
+}
+
+#[test]
 fn cpp_this_keeps_implicit_receiver_semantics() {
     let source = r#"struct Widget {
     int field;

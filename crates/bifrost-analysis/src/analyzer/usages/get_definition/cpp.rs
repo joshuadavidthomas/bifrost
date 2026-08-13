@@ -7184,7 +7184,10 @@ fn cpp_seed_active_path(
         "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
             cpp_seed_variable_declaration(ctx, node, cutoff_start, bindings)
         }
-        "expression_statement" if node.end_byte() <= cutoff_start => {
+        "expression_statement"
+            if node.end_byte() <= cutoff_start
+                && !cpp_seed_function_macro_local_binding(ctx, node, bindings) =>
+        {
             cpp_seed_recovered_statement_declaration(
                 ctx.analyzer,
                 ctx.support,
@@ -7205,6 +7208,35 @@ fn cpp_seed_active_path(
         }
         cpp_seed_active_path(ctx, child, cutoff_start, bindings);
     }
+}
+
+fn cpp_seed_function_macro_local_binding(
+    ctx: CppLookupCtx<'_, '_>,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CppType>,
+) -> bool {
+    let Some(binding) = ctx
+        .visibility
+        .function_macro_local_binding(ctx.file, node, ctx.source)
+    else {
+        return false;
+    };
+    cpp_seed_binding(
+        ctx.analyzer,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        cpp_lexical_namespace(node, ctx.source).as_deref(),
+        &binding.name,
+        Some(&binding.type_name),
+        binding.type_node,
+        binding.pointer_depth,
+        None,
+        None,
+        bindings,
+    );
+    true
 }
 
 fn cpp_local_scope_node(node: Node<'_>) -> bool {

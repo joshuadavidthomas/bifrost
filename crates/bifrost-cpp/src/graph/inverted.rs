@@ -1140,7 +1140,34 @@ fn seed_declaration(
         }
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx, bindings),
         "for_range_loop" => seed_range_binding(node, ctx, bindings),
+        "expression_statement" => seed_function_macro_local_binding(node, ctx, bindings),
         _ => {}
+    }
+}
+
+fn seed_function_macro_local_binding(
+    node: Node<'_>,
+    ctx: &CppScan<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(binding) = ctx
+        .visibility
+        .function_macro_local_binding(ctx.file, node, ctx.source)
+    else {
+        return;
+    };
+    let unit = binding
+        .type_node
+        .and_then(|type_node| resolve_type_node_with_recovered_scope(type_node, ctx))
+        .or_else(|| {
+            binding
+                .type_node
+                .and_then(|type_node| ctx.resolve_type_node_result(type_node).ok().flatten())
+        })
+        .or_else(|| ctx.resolve_type(&binding.type_name));
+    match unit {
+        Some(unit) => bindings.seed_symbol(binding.name, unit),
+        None => bindings.declare_shadow(binding.name),
     }
 }
 
