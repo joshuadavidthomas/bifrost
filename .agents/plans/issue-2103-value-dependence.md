@@ -17,13 +17,17 @@ The behavior is visible in checked-in fixtures. For a small function containing 
 - [x] (2026-08-13 14:20Z) Read `.agents/PLANS.md`, the #2099 epic plan, the #2101 semantic relation plan, live issue #2103, and its empty comment thread.
 - [x] (2026-08-13 14:45Z) Audited the existing semantic value-flow relation model, stable carrier keys, demand provider/cache, plan construction, call bindings, heap/access paths, summary integration, solver uncertainty, completion logic, result meetings, fixtures, and measurement tests at commit `4496c7f95`.
 - [x] (2026-08-13 15:10Z) Fixed the contract as source-backed may-dependence occurrences produced through the #2101 snapshot model, distinct from raw carrier-transfer rows and from policy-specific source/sink queries.
-- [ ] Add stable public value-dependence subtypes, occurrence roles, evidence kinds, boundaries, request refinements, and validators to the #2101 model.
-- [ ] Implement automatic source/use observation discovery and bounded intraprocedural may-dependence through existing semantic events and value-flow transfer machinery.
+- [x] (2026-08-13 18:58Z) Stacked `dave/issue-2103-value-dependence` on #2101 PR #2116 at `95ccbb83e`, after #2100 PR #2113 published the parent boundary.
+- [x] (2026-08-13 19:08Z) Added stable public value-dependence subtypes, occurrence roles/phases, carrier envelopes, structured edge detail, request refinements, and digest/alias/subtype validators to the exact #2101 model.
+- [ ] Implement automatic source/use observation discovery and bounded intraprocedural may-dependence through existing semantic events and value-flow transfer machinery (completed: direct structured procedure value-flow projection; remaining: reaching-definition gen/kill and merge witnesses).
 - [ ] Add precise overwrite/merge and heap/access-path treatment with typed alias and unsupported boundaries.
 - [ ] Add bounded interprocedural parameter, receiver, normal/exceptional return, call-result, and summary projections only where existing ICFG/binding/summary evidence proves the advertised quality.
 - [ ] Integrate canonical JSON/JSONL, direct-versus-serialized parity, behavior fixtures, near misses, property/reference checks, and lifecycle measurements.
 - [ ] Run focused featureless tests, dependency checks, formatting, package seam validation when applicable, and the pre-push gate before any authorized push.
+- [x] (2026-08-13 19:18Z) Passed `cargo test -p brokk-bifrost-runtime` (2 unit, 1 runtime integration, 9 extension integration, 3 doctests), workspace dependency validation, and its 15 Node tests.
 - [ ] Record commits, test counts, canonical hashes, measurement evidence, PR/CI state, and issue closure evidence here.
+- [x] (2026-08-13 19:42Z) Pushed commits `ffc5a0978` and `9f2f76ea7`; opened mergeable ready stacked PR #2117 against #2101's branch. Initial CI impact is queued and the code-smells scan is running.
+- [x] (2026-08-13 21:05Z) After #2100/#2101 and adjacent #2102/#2104 work merged, rebased PR #2117 onto `origin/master` at `a88e106fe`, preserved both control- and value-dependence projection, adapted #2104 observation mapping to the new explicit value limits, and passed the expanded runtime suite (2 unit, 1 runtime integration, 18 extension integration, 3 doctests).
 
 ## Surprises & Discoveries
 
@@ -53,6 +57,9 @@ The behavior is visible in checked-in fixtures. For a small function containing 
 
 - Observation: Bifrost MCP code-intelligence tools advertised by the installed skills were unavailable in this task, so the audit used bounded `rg` and `sed` reads.
   Evidence: the available tool inventory exposed no Bifrost search, summary, or source calls.
+
+- Observation: Merging #2104 before rebasing #2103 exposed an explicit `SemanticRelationLimits` initializer that correctly failed compilation when #2103 added three required value-flow bounds.
+  Evidence: `crates/bifrost-runtime/src/extension/observation.rs` now derives definition/use limits from `max_candidate_nodes` and gives its one-edge control-flow probe a positive value-dependence edge bound; the focused runtime suite passes after the integration.
 
 ## Decision Log
 
@@ -98,7 +105,13 @@ The behavior is visible in checked-in fixtures. For a small function containing 
 
 ## Outcomes & Retrospective
 
-Planning is complete; no implementation exists. The principal outcome is a stable definition of value dependence as bounded source-backed may influence, produced automatically from existing semantic structure and returned through #2101. The implementation must still prove automatic observation semantics, overwrite/merge correctness, heap uncertainty, interprocedural boundaries, serialization parity, and bounded cost before #2103 can close.
+Planning is complete and implementation has begun. The principal outcome is a stable definition of value dependence as bounded source-backed may influence, produced automatically from existing semantic structure and returned through #2101. The implementation must still prove automatic observation semantics, overwrite/merge correctness, heap uncertainty, interprocedural boundaries, serialization parity, and bounded cost before #2103 can close.
+
+Implementation is now stacked on the published #2101 contract. The first vertical slice projects bounded procedure-local semantic value-flow rows as validated `value_dependence` edges, and the runtime extension suite passes 9/9 including a TypeScript assignment/return behavior test. Reaching-definition gen/kill, heap uncertainty, interprocedural propagation, measurements, and the broader gates remain.
+
+The carrier projection now derives from `ValueFlowCarrierKey`, so the public digest does not depend on run-local carrier IDs or live handle identity. Decode validation rejects empty subtype chains, occurrence/edge alias mismatches, and carrier digest tampering. Capability discovery advertises the current value-dependence family as partial rather than implying that the remaining reaching-definition and interprocedural milestones are complete.
+
+The parent stack and adjacent semantic work are now merged. PR #2117 has been rebased directly onto master, with #2102 control-dependence evidence and #2104 observation mapping retained. The post-rebase runtime gate covers 18 extension integration tests and confirms that the shared projector and the new required limits compose cleanly.
 
 ## Context and Orientation
 
@@ -319,6 +332,22 @@ Initial implementation evidence at `4496c7f95`:
 
 Implementation must append concise evidence here: one stable definition/use pair, one assignment edge, one killed overwrite, one merge with two definitions, one weak-update uncertainty, one call/return edge, one authored-summary edge, one incomplete empty response, canonical hashes, property-test bound/seed, local/interprocedural measurements, and PR/CI links.
 
+Current implementation evidence at `9f2f76ea7`:
+
+    PR #2117
+        https://github.com/BrokkAi/bifrost/pull/2117
+        ready and mergeable, stacked on #2101 PR #2116
+
+    cargo test -p brokk-bifrost-runtime
+        2 unit, 1 runtime integration, 9 extension integration, and 3 doctests passed
+
+    node scripts/check-workspace-dependencies.mjs
+    node --test scripts/check-workspace-dependencies.test.mjs
+        dependency graph valid; 15 tests passed
+
+    semantic_value_dependence_projects_structured_value_flow
+        TypeScript assignment/return fixture emitted validated value-dependence detail from semantic value-flow rows
+
 ## Interfaces and Dependencies
 
 Use the #2100 workspace/version/generation types and #2101 relation snapshot model. Extend, rather than duplicate, equivalents of these public types:
@@ -437,3 +466,5 @@ No new crate or external dependency is required. #2103 depends strictly on #2100
 Plan revision note (2026-08-13): Created the initial API-only #2103 plan after inspecting the live issue, #2099/#2101 plans, and current semantic value-flow, heap, call-binding, summary, solver, completion, cache, fixture, and measurement substrate. The plan defines stable source-backed may-dependence occurrences, automatic policy-free observation discovery, exact-versus-weak overwrite behavior, conditional bounded interprocedural projection, one shared #2101 graph/codec, and explicit dependency ordering without a new crate or persistence promise.
 
 Plan revision note (2026-08-13): Reconciled package direction with #2100/#2101. Analysis produces runtime-independent dependence records; `brokk-bifrost-runtime::extension` owns stable public types, validation, and projection.
+
+Plan revision note (2026-08-13): Began implementation on #2101 PR #2116's exact head. Added the portable value-dependence vocabulary and validated direct semantic value-flow projection; recorded the remaining solver, heap, interprocedural, and measurement work explicitly rather than overstating the initial vertical slice.

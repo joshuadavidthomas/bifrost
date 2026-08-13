@@ -1,11 +1,13 @@
 use super::*;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    SemanticBudget, SemanticOutcome, SemanticRequest,
-    cfg_algorithms::derive_procedure_control_dependence,
+    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProofStatus, SemanticBudget,
+    SemanticOutcome, SemanticRequest, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind,
+    WorkspaceSemanticOracle, cfg_algorithms::derive_procedure_control_dependence,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryExecutionLimits, execute_workspace_request_with_cancellation,
 };
+use brokk_bifrost_analysis::analyzer::value_flow::ValueFlowCarrier;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, FilesystemProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
 };
@@ -70,6 +72,7 @@ pub enum CapabilitySupport {
 pub struct LanguageCapabilityReport {
     pub language: Box<str>,
     pub control_flow: CapabilitySupport,
+    pub value_dependence: CapabilitySupport,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationCapability {
@@ -148,6 +151,7 @@ impl ExtensionWorkspace {
                     .to_ascii_lowercase()
                     .into_boxed_str(),
                 control_flow: CapabilitySupport::Complete,
+                value_dependence: CapabilitySupport::Partial,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -164,6 +168,11 @@ impl ExtensionWorkspace {
                     id: capability("experimental.semantic.control_flow"),
                     stability: ApiStability::Experimental { since_minor: 0 },
                     support: CapabilitySupport::Complete,
+                },
+                OperationCapability {
+                    id: capability("experimental.semantic.value_dependence"),
+                    stability: ApiStability::Experimental { since_minor: 0 },
+                    support: CapabilitySupport::Partial,
                 },
             ]
             .into_boxed_slice(),
@@ -281,7 +290,14 @@ impl ExtensionWorkspace {
             .validate()
             .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
         let stability = ApiStability::Experimental { since_minor: 0 };
-        let operation = "experimental.semantic.control_flow";
+        let operation = if request
+            .relations
+            .contains(&SemanticRelationKind::ValueDependence)
+        {
+            "experimental.semantic.value_dependence"
+        } else {
+            "experimental.semantic.control_flow"
+        };
         if cancellation.is_cancelled() {
             return Ok(make_outcome(
                 None,
@@ -360,7 +376,10 @@ impl ExtensionWorkspace {
                 ExtensionWork::default(),
             ));
         };
-        let truncated = procedure.points().len() > values.max_nodes as usize
+        let wants_value = request
+            .relations
+            .contains(&SemanticRelationKind::ValueDependence);
+        let mut truncated = procedure.points().len() > values.max_nodes as usize
             || procedure.control_edges().len() > values.max_edges as usize;
         let nodes = procedure
             .points()
@@ -443,6 +462,7 @@ impl ExtensionWorkspace {
                         target: edge.target_point.index() as u32,
                         kind: SemanticRelationKind::ControlFlow,
                         subtype: Some(edge.kind.label().into()),
+                        detail: SemanticRelationDetail::Generic,
                         proof: SemanticProof::Proven,
                         completeness: SemanticRelationCompleteness::Complete,
                         evidence: vec![edge_evidence(edge)].into_boxed_slice(),
@@ -471,6 +491,7 @@ impl ExtensionWorkspace {
                         target: governed.index() as u32,
                         kind: SemanticRelationKind::ControlDependence,
                         subtype: Some(edge.kind.label().into()),
+                        detail: SemanticRelationDetail::Generic,
                         proof: SemanticProof::Proven,
                         completeness: SemanticRelationCompleteness::Complete,
                         evidence: vec![edge_evidence(edge)].into_boxed_slice(),
@@ -489,6 +510,86 @@ impl ExtensionWorkspace {
                     evidence: Box::new([]),
                 }
             }));
+        }
+        if wants_value {
+            let procedure_handle = artifact
+                .procedure_handle(procedure.id())
+                .expect("selected procedure belongs to the materialized artifact");
+            let oracle = WorkspaceSemanticOracle::with_limits(
+                &self.analyzer,
+                brokk_bifrost_analysis::analyzer::semantic::OracleLimits::default(),
+            );
+            let outcome = oracle
+                .procedure_relations(
+                    &procedure_handle,
+                    &OracleCallContext::empty(),
+                    &mut semantic_request,
+                )
+                .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
+            if let Some(snapshot) = outcome.available_value() {
+                truncated |= snapshot.relations().len()
+                    > values.max_value_dependence_edges as usize
+                    || snapshot.coverage() != CandidateCoverage::Exhaustive;
+                for relation in snapshot
+                    .relations()
+                    .iter()
+                    .take(values.max_value_dependence_edges as usize)
+                {
+                    let point_index = relation.point().id().index();
+                    let Some(point_node) = nodes.get(point_index) else {
+                        continue;
+                    };
+                    let source = value_occurrence(
+                        relation.source.clone(),
+                        point_node,
+                        relation.event_index(),
+                        true,
+                    )?;
+                    let target = value_occurrence(
+                        relation.target.clone(),
+                        point_node,
+                        relation.event_index(),
+                        false,
+                    )?;
+                    let proof = match relation.proof {
+                        ProofStatus::Proven => SemanticProof::Proven,
+                        _ => SemanticProof::Unproven {
+                            reason: "semantic value-flow proof is incomplete".into(),
+                        },
+                    };
+                    let completeness = match relation.completeness {
+                        EvidenceCompleteness::Complete => SemanticRelationCompleteness::Complete,
+                        _ => SemanticRelationCompleteness::Partial {
+                            reason: "semantic value-flow evidence is incomplete".into(),
+                        },
+                    };
+                    edges.push(SemanticRelationEdge {
+                        source: point_index as u32,
+                        target: point_index as u32,
+                        kind: SemanticRelationKind::ValueDependence,
+                        subtype: None,
+                        detail: SemanticRelationDetail::ValueDependence {
+                            subtypes: vec![value_subtype(relation.kind)].into_boxed_slice(),
+                            source,
+                            target,
+                            may: if matches!(proof, SemanticProof::Proven) {
+                                ValueDependenceMayStatus::Proven
+                            } else {
+                                ValueDependenceMayStatus::Unproven
+                            },
+                        },
+                        proof: proof.clone(),
+                        completeness: completeness.clone(),
+                        evidence: vec![SemanticEvidence {
+                            kind: "semantic_value_flow".into(),
+                            mappings: vec![point_node.span.clone()].into_boxed_slice(),
+                            proof,
+                            completeness,
+                        }]
+                        .into_boxed_slice(),
+                    });
+                }
+            }
         }
         let derived_edge_count = edges.len();
         edges.truncate(values.max_edges as usize);
@@ -542,6 +643,55 @@ impl ExtensionWorkspace {
             stability,
             work,
         ))
+    }
+}
+
+fn value_occurrence(
+    endpoint: ValueFlowEndpoint,
+    node: &SemanticNodeOccurrence,
+    event_ordinal: u32,
+    definition: bool,
+) -> Result<ValueOccurrence, ExtensionError> {
+    let projection = format!(
+        "{:?}",
+        ValueFlowCarrier::from(endpoint)
+            .stable_key()
+            .map_err(|error| ExtensionError::Execution(error.to_string().into()))?
+    );
+    let digest = value_carrier_digest(&projection)
+        .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
+    Ok(ValueOccurrence {
+        node: node.local_id,
+        carrier: StableValueCarrier {
+            digest,
+            projection: projection.into(),
+        },
+        role: if definition {
+            ValueOccurrenceRole::Definition
+        } else {
+            ValueOccurrenceRole::Use
+        },
+        phase: if definition {
+            ValueObservationPhase::AfterEffects
+        } else {
+            ValueObservationPhase::BeforeEffects
+        },
+        event_ordinal,
+    })
+}
+
+const fn value_subtype(kind: ValueFlowRelationKind) -> ValueDependenceSubtype {
+    match kind {
+        ValueFlowRelationKind::Assignment => ValueDependenceSubtype::Assignment,
+        ValueFlowRelationKind::Parameter => ValueDependenceSubtype::Parameter,
+        ValueFlowRelationKind::Receiver => ValueDependenceSubtype::Receiver,
+        ValueFlowRelationKind::NormalReturn => ValueDependenceSubtype::NormalReturn,
+        ValueFlowRelationKind::ExceptionalReturn => ValueDependenceSubtype::ExceptionalReturn,
+        ValueFlowRelationKind::Allocation => ValueDependenceSubtype::Allocation,
+        ValueFlowRelationKind::MemoryLoad => ValueDependenceSubtype::FieldLoad,
+        ValueFlowRelationKind::MemoryStore => ValueDependenceSubtype::FieldStore,
+        ValueFlowRelationKind::Capture => ValueDependenceSubtype::Capture,
+        ValueFlowRelationKind::LanguageDefined => ValueDependenceSubtype::LanguageDefined,
     }
 }
 

@@ -57,6 +57,9 @@ pub struct SemanticRelationLimits {
     pub max_materialized_files: u32,
     pub max_traversal_steps: u64,
     pub max_source_bytes: u64,
+    pub max_value_definitions: u32,
+    pub max_value_uses: u32,
+    pub max_value_dependence_edges: u32,
 }
 impl SemanticRelationLimits {
     pub fn validate(self) -> Result<(), RelationCodecError> {
@@ -70,6 +73,9 @@ impl SemanticRelationLimits {
             || self.max_materialized_files == 0
             || self.max_traversal_steps == 0
             || self.max_source_bytes == 0
+            || self.max_value_definitions == 0
+            || self.max_value_uses == 0
+            || self.max_value_dependence_edges == 0
         {
             return Err(RelationCodecError::new(
                 "every semantic relation limit must be positive",
@@ -91,6 +97,9 @@ impl From<ExtensionLimitValues> for SemanticRelationLimits {
             max_materialized_files: v.semantic_files,
             max_traversal_steps: v.traversal_steps,
             max_source_bytes: v.source_bytes,
+            max_value_definitions: v.semantic_nodes,
+            max_value_uses: v.semantic_nodes,
+            max_value_dependence_edges: v.semantic_edges,
         }
     }
 }
@@ -204,6 +213,81 @@ pub struct SemanticNodeOccurrence {
     pub role: Box<str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueOccurrenceRole {
+    Definition,
+    Use,
+    Observation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueObservationPhase {
+    BeforeEffects,
+    AfterEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableValueCarrier {
+    pub digest: StableDigest,
+    pub projection: Box<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueOccurrence {
+    pub node: u32,
+    pub carrier: StableValueCarrier,
+    pub role: ValueOccurrenceRole,
+    pub phase: ValueObservationPhase,
+    pub event_ordinal: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueDependenceSubtype {
+    Assignment,
+    Parameter,
+    Receiver,
+    NormalReturn,
+    ExceptionalReturn,
+    Allocation,
+    FieldStore,
+    FieldLoad,
+    IndexStore,
+    IndexLoad,
+    StaticStore,
+    StaticLoad,
+    Capture,
+    CallArgument,
+    CallReceiver,
+    CallResult,
+    SummaryTransfer,
+    Merge,
+    LanguageDefined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueDependenceMayStatus {
+    Proven,
+    Unproven,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticRelationDetail {
+    Generic,
+    ValueDependence {
+        subtypes: Box<[ValueDependenceSubtype]>,
+        source: ValueOccurrence,
+        target: ValueOccurrence,
+        may: ValueDependenceMayStatus,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticRelationEdge {
@@ -211,6 +295,7 @@ pub struct SemanticRelationEdge {
     pub target: u32,
     pub kind: SemanticRelationKind,
     pub subtype: Option<Box<str>>,
+    pub detail: SemanticRelationDetail,
     pub proof: SemanticProof,
     pub completeness: SemanticRelationCompleteness,
     pub evidence: Box<[SemanticEvidence]>,
@@ -312,6 +397,11 @@ impl SemanticRelationSnapshot {
                 .and_then(|id| canonical_ids.get(id))
                 .copied()
                 .ok_or_else(|| RelationCodecError::new("dangling input edge target"))?;
+            if let SemanticRelationDetail::ValueDependence { source, target, .. } = &mut edge.detail
+            {
+                source.node = edge.source;
+                target.node = edge.target;
+            }
         }
         edges.sort_by(|a, b| {
             (a.kind, &a.subtype, a.source, a.target).cmp(&(b.kind, &b.subtype, b.source, b.target))
@@ -352,6 +442,33 @@ impl SemanticRelationSnapshot {
             if edge.evidence.is_empty() {
                 return Err(RelationCodecError::new("edge evidence must be nonempty"));
             }
+            if let SemanticRelationDetail::ValueDependence {
+                subtypes,
+                source,
+                target,
+                ..
+            } = &edge.detail
+            {
+                if edge.kind != SemanticRelationKind::ValueDependence || subtypes.is_empty() {
+                    return Err(RelationCodecError::new(
+                        "value dependence requires a nonempty subtype chain",
+                    ));
+                }
+                if source.node != edge.source || target.node != edge.target {
+                    return Err(RelationCodecError::new(
+                        "value occurrence aliases must match edge endpoints",
+                    ));
+                }
+                for carrier in [&source.carrier, &target.carrier] {
+                    if carrier.digest != value_carrier_digest(&carrier.projection)? {
+                        return Err(RelationCodecError::new("value carrier digest mismatch"));
+                    }
+                }
+            } else if edge.kind == SemanticRelationKind::ValueDependence {
+                return Err(RelationCodecError::new(
+                    "value dependence edge requires value detail",
+                ));
+            }
         }
         if self.status == SemanticRelationStatus::Complete && !self.boundaries.is_empty() {
             return Err(RelationCodecError::new(
@@ -363,6 +480,13 @@ impl SemanticRelationSnapshot {
     pub fn authoritative_absence(&self) -> bool {
         self.status == SemanticRelationStatus::Complete && self.edges.is_empty()
     }
+}
+
+pub(crate) fn value_carrier_digest(projection: &str) -> Result<StableDigest, RelationCodecError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"brokk-bifrost-extension-value-carrier-v1\0");
+    hasher.update(projection.as_bytes());
+    StableDigest::parse(format!("{:x}", hasher.finalize())).map_err(RelationCodecError::new)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

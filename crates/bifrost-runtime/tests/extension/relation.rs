@@ -1,7 +1,7 @@
 use brokk_bifrost_runtime::extension::{
     NormalizedRelativePath, SemanticDirection, SemanticEvidence, SemanticNodeOccurrence,
-    SemanticProof, SemanticRelationCompleteness, SemanticRelationEdge, SemanticRelationKind,
-    SemanticRelationLimits, SemanticRelationRequest, SemanticRelationScope,
+    SemanticProof, SemanticRelationCompleteness, SemanticRelationDetail, SemanticRelationEdge,
+    SemanticRelationKind, SemanticRelationLimits, SemanticRelationRequest, SemanticRelationScope,
     SemanticRelationSnapshot, SemanticRelationStatus, SemanticSeed, SourceSpan, StableDigest,
     WorkspaceGeneration, decode_relation_request_json, decode_relation_snapshot_json,
     encode_relation_request_json, encode_relation_snapshot_json, read_relation_snapshot_jsonl,
@@ -34,6 +34,9 @@ fn limits() -> SemanticRelationLimits {
         max_materialized_files: 4,
         max_traversal_steps: 1000,
         max_source_bytes: 100_000,
+        max_value_definitions: 20,
+        max_value_uses: 20,
+        max_value_dependence_edges: 40,
     }
 }
 
@@ -86,6 +89,7 @@ fn snapshot_json_and_jsonl_are_equivalent() {
         target: 98,
         kind: SemanticRelationKind::ControlFlow,
         subtype: Some("normal".into()),
+        detail: SemanticRelationDetail::Generic,
         proof: SemanticProof::Proven,
         completeness: SemanticRelationCompleteness::Complete,
         evidence: vec![evidence].into_boxed_slice(),
