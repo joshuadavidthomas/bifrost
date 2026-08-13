@@ -16,7 +16,7 @@ After this change, `get_definitions_by_location` resolves bare names inside such
 - [x] (2026-08-13 23:15Z) Ran the focused issue test and the four named regression controls; all five tests pass.
 - [x] (2026-08-13 23:18Z) Ran the Rust crate tests, formatting, focused isolated Clippy, dependency-boundary check, and diff check. All 53 Rust crate tests pass and every other gate is clean.
 - [x] (2026-08-13 23:26Z) Built the release FIRD runner and exactly replayed all 12 issue-owned production rows with ephemeral caches. All 12 are resolved, consistent, byte-exact inverse hits with zero actionable findings and zero file errors.
-- [ ] Commit only issue #2031 files with a detailed multiline message, push the current branch to `master`, and close #2031 with evidence.
+- [x] (2026-08-13 23:30Z) Committed issue #2031 as `be9be80f22aabca399f151d6055677eeecdaf4d4`, pushed it to `origin/master`, rebuilt from the clean published head, and reproduced all 12 exact rows with clean Bifrost and repository metadata. Issue closure follows this plan-record checkpoint.
 
 ## Surprises & Discoveries
 
@@ -43,7 +43,7 @@ After this change, `get_definitions_by_location` resolves bare names inside such
 
 The resolver now uses physical file/inline-module syntax scope for current-module candidates and checks all recorded declaration ranges. The new public-tool fixture proves helpers, unit-struct constructors, and a synthetic module static inside an impl for another module's type, with owner-file and nested-inline-module decoys plus free-function controls. The red baseline failed on the first impl-local helper; the corrected implementation passes.
 
-Local acceptance is clean: the issue test and four named controls pass, `brokk-bifrost-rust` passes 53/53 plus doctests, formatting is clean, focused isolated Clippy for `brokk-bifrost-rust` and `brokk-bifrost-analysis` is clean, the workspace dependency graph is valid, and `git diff --check` is clean. The 12 pinned serde-json production rows all changed from `no_definition` to resolved/consistent with exact inverse hits and zero actionable findings. Publication and issue closure remain.
+Local acceptance is clean: the issue test and four named controls pass, `brokk-bifrost-rust` passes 53/53 plus doctests, formatting is clean, focused isolated Clippy for `brokk-bifrost-rust` and `brokk-bifrost-analysis` is clean, the workspace dependency graph is valid, and `git diff --check` is clean. The 12 pinned serde-json production rows all changed from `no_definition` to resolved/consistent with exact inverse hits and zero actionable findings. Commit `be9be80f22aabca399f151d6055677eeecdaf4d4` is published on `origin/master`; clean-head production evidence is recorded below.
 
 ## Context and Orientation
 
@@ -121,6 +121,16 @@ Durable campaign evidence remains outside the repository below `/mnt/optane/tmp/
     target/release/bifrost_reference_differential
       pre-commit validation binary SHA-256 6c4899f95d018e5b51654945bd85c1cdd5d2927c2774267f9183f29f51a0977e
 
+Clean published-head acceptance artifacts are:
+
+    /mnt/optane/tmp/bifrost-fird/issue-2031-be9be80f/issue-2031-exact-replay.jsonl
+      12 completed/resolved/consistent/exact rows; actionable 0; file errors 0
+      Bifrost be9be80f22aabca399f151d6055677eeecdaf4d4, dirty false
+      serde-json 827a315bf2198558f0325b07bcc1e2cd973aba2f, dirty false
+      SHA-256 43eb5ba9590d94cdcc54735f7d48cee3a0c7669785a22dec3fcacd88101f4ce7
+    target/release/bifrost_reference_differential
+      clean-head binary SHA-256 5d94f4d9f0beeefc83f6f83e6a52031c483085d5e3e285715bb09e41200824ee
+
 The accepted replay uses serde-json `827a315bf2198558f0325b07bcc1e2cd973aba2f`, ephemeral caches, the original paths and byte ranges, and Bifrost source at `c4268c4f` with the uncommitted issue patch (`bifrost_dirty=true`). A clean published-head replay can be added before issue closure if publication metadata is required.
 
 ## Interfaces and Dependencies
@@ -130,3 +140,5 @@ No public interface or dependency changes are required. The existing internal fu
 Plan revision, 2026-08-13: Created the living issue #2031 implementation plan from the confirmed production diagnosis and current clean checkout. It records the required structured fix, behavior fixture, regression controls, local gates, exact replay contract, publication workflow, and recovery rules so work can resume from this file alone.
 
 Plan revision, 2026-08-13 (implementation complete): Recorded the red/green behavior proof, the physical-range implementation, all focused and crate-level validation, the recovered 12-row manifest, the exact production replay, and the stale-binary operational discovery. Publication and issue closure are the only remaining steps.
+
+Plan revision, 2026-08-13 (published): Recorded implementation commit `be9be80f`, its publication to `origin/master`, and a second 12-row exact replay from the clean published head. Every exact row is resolved, consistent, and byte-exact with zero actionable findings and clean provenance, so #2031 is ready to close.
