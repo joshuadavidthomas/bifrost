@@ -14,11 +14,16 @@ Extensions can safely join exact observation mappings to bounded semantic-relati
 
 - [x] (2026-08-13 14:00Z) Read `.agents/PLANS.md`, the epic plan, #2101's issue plan, live issue #2104, and the current semantic identity and source-range projection code.
 - [x] (2026-08-13 14:00Z) Fix the generic observation schema, terminal outcomes, exact range semantics, safe join, canonical serialization, fixtures, and dependency order in this plan.
-- [ ] Implement the validated observation document and mapping result domain types on the #2100 extension boundary.
-- [ ] Implement generation/path/content/range validation and bounded source-range-to-node mapping against #2101 identities.
-- [ ] Add canonical JSON/JSONL codecs and direct-versus-serialized equivalence.
-- [ ] Add two-language behavior fixtures and every terminal mapping outcome.
-- [ ] Run focused tests, formatting, dependency checks, and the pre-push gate; record exact evidence here.
+- [x] (2026-08-13 19:34Z) Attached `dave/issue-2104-observation-mapping` at exact #2101 head `95ccbb83ede5ac20710d3b018f7d98e66bc0412e` after verifying ready, mergeable PR #2116 and its #2113 base.
+- [x] (2026-08-13 19:49Z) Implemented the validated observation document, provenance, caller-owned scalar metadata, finite limits, record kinds, terminal outcomes, stable digests, and mapping result domain on the runtime extension boundary.
+- [x] (2026-08-13 19:49Z) Implemented generation/path/content/UTF-8-range validation and bounded exact-intersection mapping against #2101 stable node occurrences, with no duplicate-content path search.
+- [x] (2026-08-13 19:53Z) Added canonical JSON/JSONL codecs, terminal summaries, digest verification, and direct-versus-serialized dispatcher equivalence.
+- [x] (2026-08-13 19:53Z) Added Java/Python behavior fixtures plus stale content, malformed schema, and interrupted JSONL coverage in the existing runtime external-boundary harness.
+- [x] (2026-08-13 20:02Z) Passed `cargo fmt --check`, all 11 runtime extension tests (including 3 observation tests), `node scripts/check-workspace-dependencies.mjs`, runtime all-target clippy with `-D warnings`, and `git diff --check`.
+- [x] (2026-08-13 20:14Z) Ran `scripts/pre-push-gate.sh`: formatting and all workspace doctests passed; nextest was stopped by three sandbox-denied pre-existing `benchmark::mcp_session` stderr tests, and all-features clippy was blocked reading `/Users/dave/.cache/uv/sdists-v9/.git`. Focused runtime all-target clippy and all runtime extension tests remain green.
+- [x] (2026-08-13 20:17Z) Committed `069dcbbf4`, pushed the issue branch, and opened ready stacked PR #2119 against the #2101 branch.
+- [x] (2026-08-14 08:35Z) Triaged PR checks: the three Rust failures are inherited unchanged from #2116's TypeScript definition test; fixed #2104's two policy findings by materializing each distinct path once and collecting mapped nodes into canonical keyed order without a per-record sort. Focused tests, clippy, formatting, and dependency checks pass.
+- [ ] Push the policy fix, confirm the refreshed code-smells scan, then merge/retarget the stack as parent state permits.
 
 ## Surprises & Discoveries
 
@@ -36,6 +41,9 @@ Extensions can safely join exact observation mappings to bounded semantic-relati
 
 - Observation: mount identity currently derives from a normalized absolute root and therefore is not by itself portable across clean checkout locations.
   Evidence: `WorkspaceMountId::from_root` hashes `root.as_os_str().as_encoded_bytes()`. Observation documents must address a named mount from #2100's generation envelope, not recompute or serialize an arbitrary absolute root.
+
+- Observation: #2101 intentionally publishes stable node occurrences through `brokk-bifrost-runtime::extension::SemanticRelationSnapshot`; using that checked projection keeps #2104 from exposing semantic artifacts or dense analyzer handles.
+  Evidence: the mapper asks the existing bounded relation route for one file/range and retains only `StableDigest`, call context, public `SourceSpan`, and role. `cargo test -p brokk-bifrost-runtime --test extension observation` passes three tests across Java and Python.
 
 ## Decision Log
 
@@ -77,7 +85,23 @@ Extensions can safely join exact observation mappings to bounded semantic-relati
 
 ## Outcomes & Retrospective
 
-Planning is complete. Existing semantic locators and artifact fingerprints can support safe range mapping, but the current source-oracle helpers return internal handles for specialized questions and do not provide terminal per-record outcomes. Implementation therefore needs a bounded portable source-mapping index/projector layered on #2101, not a textual or nearest-line fallback.
+The runtime now accepts generic canonical observation documents, verifies exact source identity, maps ranges through #2101 stable semantic occurrences, preserves terminal non-success outcomes, round-trips JSON and JSONL, and dispatches serialized requests through the same mapper. Java and Python conformance plus stale duplicate-content protection are green. Remaining work is validation hardening and final package/pre-push evidence.
+
+Focused validation evidence at `95ccbb83e` plus the working changes:
+
+    cargo test -p brokk-bifrost-runtime --test extension
+    test result: ok. 11 passed; 0 failed
+
+    cargo clippy -p brokk-bifrost-runtime --all-targets -- -D warnings
+    Finished dev profile
+
+    node scripts/check-workspace-dependencies.mjs
+    workspace dependency graph is valid
+
+    scripts/pre-push-gate.sh
+    workspace doctests: passed, including 3 runtime compile-fail doctests
+    nextest: environmental failure in 3 pre-existing stderr-drain tests, Os PermissionDenied
+    all-features clippy: environmental failure reading /Users/dave/.cache/uv/sdists-v9/.git
 
 #2104 is blocked on the identity and generation contracts from #2100/#2101. It is independent of the implementations of #2102 and #2103: observation mappings target stable semantic nodes, and exact mappings can later join any relation kind published by #2101. #2105 consumes the canonical observation document/result digests, provenance, limits, completeness, and generation.
 
@@ -276,3 +300,5 @@ Dependency order is #2100 generation/application boundary, then #2101 stable sem
 Plan revision note (2026-08-13): Created this API-only plan after inspecting live #2104, the #2099/#2101 plans, portable semantic identities, source spans, current bounded source projection, and range validation. The plan requires path plus content identity, makes exact mapping a complete deterministic set rather than cardinality one, gives every record one terminal outcome, and permits joins only from exact generation-compatible mappings.
 
 Plan revision note (2026-08-13): Reconciled package ownership with #2100/#2101. Analysis owns only runtime-independent source mapping and evidence acquisition; `brokk-bifrost-runtime::extension` owns public observation types, codecs, validation, and projection.
+
+Plan revision note (2026-08-13): Recorded implementation against exact #2101 head `95ccbb83e`, the runtime-owned public model and bounded relation projection decision, initial Java/Python conformance, and the remaining validation work.

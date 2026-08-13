@@ -12,6 +12,10 @@ const OWNER = "BrokkAi";
 const REPO = "bifrost";
 const BINARY_NAME = "bifrost";
 
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export interface PlatformSpec {
   platform: NodeJS.Platform;
   arch: NodeJS.Architecture;
@@ -50,6 +54,46 @@ export interface ManagedBinarySelection {
   path: string;
   version: string;
   compatibilityMode: "exact" | "compatible";
+}
+
+export interface ManagedBinaryPreparation {
+  selected: ManagedBinarySelection;
+  preferredInstall: Promise<string | null> | null;
+}
+
+export async function selectManagedBinaryAndPreparePreferred(
+  findSelection: () => Promise<ManagedBinarySelection | null>,
+  installPreferred: () => Promise<string>,
+  log: (message: string) => void
+): Promise<ManagedBinaryPreparation | null> {
+  const selected = await findSelection();
+  if (!selected) {
+    return null;
+  }
+  if (selected.compatibilityMode === "exact") {
+    return { selected, preferredInstall: null };
+  }
+
+  const preferredInstall = Promise.resolve()
+    .then(installPreferred)
+    .catch((error: unknown) => {
+      log(`Preferred managed Bifrost preparation failed: ${formatError(error)}`);
+      return null;
+    });
+  return { selected, preferredInstall };
+}
+
+export async function activatePreparedManagedBinary(
+  preparation: ManagedBinaryPreparation,
+  isSelectedBinaryActive: (selectedPath: string) => boolean,
+  activate: (preferredPath: string) => Promise<void>
+): Promise<boolean> {
+  const preferredPath = await preparation.preferredInstall;
+  if (!preferredPath || !isSelectedBinaryActive(preparation.selected.path)) {
+    return false;
+  }
+  await activate(preferredPath);
+  return true;
 }
 
 export function releaseTargetFor(

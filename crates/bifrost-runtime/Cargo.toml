@@ -2,7 +2,7 @@
 name = "brokk-bifrost-runtime"
 version.workspace = true
 edition.workspace = true
-description = "Internal code-intelligence runtime for brokk-bifrost"
+description = "Protocol-neutral runtime and stable extension API for brokk-bifrost"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -12,9 +12,16 @@ exclude = ["tests/**"]
 [lib]
 name = "brokk_bifrost_runtime"
 
+[[test]]
+name = "extension"
+path = "tests/extension/main.rs"
+
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.9.4" }
 brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.9.4" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
 
 [dev-dependencies]
 serde_json = "1.0.145"

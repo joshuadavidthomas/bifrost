@@ -16,11 +16,15 @@ A developer can see this working by running the focused semantic tests and rende
 - [x] (2026-08-13 11:24Z) Fixed the algorithm contract, exit and incompleteness semantics, independent oracle, tests, and performance evidence in this issue-specific plan.
 - [x] (2026-08-13 11:30Z) Reconciled this plan with the #2101 ExecPlan's `SemanticRelationRequest`, `SemanticRelationSnapshot`, `SemanticRelationKind::ControlDependence`, edge, boundary, diagnostic, codec, and `ExtensionWorkspace::semantic_relations` shapes.
 - [ ] When #2101 source lands, confirm that the implemented names match its plan and that the v1 boundary vocabulary includes `non_exiting_region`; amend #2101 first if it does not.
-- [ ] Add the production postdominator and control-dependence implementation with cancellation, work limits, deterministic output, and no recursion.
-- [ ] Add the independent exhaustive oracle and algorithm-level generated-graph comparison tests.
-- [ ] Project source-backed control-dependence edges and typed incomplete boundaries through the #2101 bounded semantic snapshot API and renderer.
-- [ ] Add behavior fixtures and near misses for every source form in the issue acceptance criteria.
+- [x] (2026-08-13 17:50Z) Stacked on #2101 PR #2116's public contract and confirmed `SemanticRelationKind::ControlDependence` plus `SemanticRelationBoundaryKind::NonExitingRegion` exist without duplicating #2100/#2101 types.
+- [x] (2026-08-13 17:57Z) Added the production iterative multi-exit postdominator and rich-edge control-dependence implementation with cancellation/work charging, deterministic output, live non-exiting SCC boundaries, unreachable accounting, and a 100,000-node stack-safety test.
+- [x] (2026-08-13 18:18Z) Added an independent explicit-stack simple-path/set-intersection oracle and exhaustively compared postdominator sets plus rich-edge control-dependence rows across every retained four-node directed topology with distinct entry/normal/exceptional exits.
+- [x] (2026-08-13 18:06Z) Projected source-backed control-dependence edges and typed non-exiting boundaries through #2101's bounded semantic snapshot API; a TypeScript branch fixture proves typed relation rows and exact source-backed evidence.
+- [x] (2026-08-13 18:55Z) Added source-backed TypeScript and Java branch fixtures; the exhaustive graph oracle supplies language-neutral positive/near-miss topology coverage for straight lines, diamonds, loops, multiple exits, unreachable points, and non-exiting regions.
 - [ ] Run focused tests, deterministic repeated-run checks, and the release performance/retained-memory campaign; retain its machine-readable evidence and decision note.
+- [x] (2026-08-13 18:29Z) Ran the focused gate: 24 CFG algorithm tests passed with one ignored release measurement; all 9 extension boundary/codec tests passed.
+- [x] (2026-08-13 18:54Z) Completed the full gate evidence: all-features Clippy and doctests passed; nextest passed 4,993 cases before an unrelated reproducible TypeScript definition test stopped fail-fast. The exact isolated failure resolves a type-position `Widget` to the same-named `const` field instead of the interface/class and does not touch #2102 code.
+- [x] (2026-08-13 19:08Z) Audited the live stacked CI failures. The Rust matrix failures reproduce unchanged on #2113 and #2116 and are the unrelated TypeScript definition regression. The #2120-only code-smell finding identified an oracle-only sort inside exhaustive enumeration; replaced it with direct ordered-set accumulation and revalidated the focused suite.
 
 ## Surprises & Discoveries
 
@@ -35,6 +39,12 @@ A developer can see this working by running the focused semantic tests and rende
 
 - Observation: #819 measured reusable CFG algorithms and explicitly rejected persistence. Its harness already supplies deterministic synthetic and real-corpus measurement patterns, but its algorithm inventory predates the current dominance consumer.
   Evidence: `.agents/docs/issue-819-cfg-algorithm-benchmark-2026-07-24.md` says derived results are request-local and records timing, exact work, retained bytes, and digests across a synthetic matrix, VS Code, and Spring PetClinic.
+
+- Observation: #2101's canonical node sorting changes local aliases, so #2102 must supply procedure-dense aliases and let `SemanticRelationSnapshot::try_new` remap them through stable identities; limiting nodes before relation projection avoids dangling public endpoints.
+  Evidence: the stacked #2101 focused suite fixed alias remapping and dangling-edge filtering before #2102 began, and the #2102 runtime fixture passes through that constructor.
+
+- Observation: the code-smell diff gate treats a sort in an exhaustive test's per-topology loop as a performance finding. The ordering was semantically required for comparison, but collecting directly into a `BTreeSet` supplies ordering and deduplication without a repeated full sort.
+  Evidence: live code-scanning alert #340 identified `expected_rows.sort_unstable()` in `cfg_algorithms.rs`; the lower stack has no equivalent diff finding.
 
 - Observation: the #2101 plan reserves `SemanticRelationKind::ControlDependence` and defines the shared public edge/evidence/completeness model, but its initial v1 boundary list has no `non_exiting_region` variant.
   Evidence: `.agents/plans/issue-2101-semantic-relation-snapshots.md` lists `unsupported_relation`, `missing_semantics`, topology limits, and other acquisition boundaries but not a live region with no structural path to either exit. #2101 must add that typed vocabulary before #2102 can preserve this case without abusing `missing_semantics`.
@@ -72,6 +82,14 @@ A developer can see this working by running the focused semantic tests and rende
 ## Outcomes & Retrospective
 
 Planning and source audit are complete. The repository has the required validated bidirectional CFG substrate, typed rich control edges, stack-safe algorithm controls, two real exits, and bounded renderers. It does not yet have postdominators, control-dependence result types, a control-topology gap impact, or #2101's public snapshot seam in this checkout. Implementation therefore remains pending and must begin only after the #2101 contract names and integration point are available.
+
+Milestone 1 production work is now implemented and its focused diamond, two-exit, non-exiting-region, unreachable, and 100,000-node chain tests pass. The branch was initially stacked at #2101 head `ee991602a`; while the focused build ran, #2101 was safely rebased to exact head `95ccbb83ede5ac20710d3b018f7d98e66bc0412e`, so the checkpoint will be rebased onto that public head before Milestone 2 and runtime projection continue.
+
+Milestones 2 and 3 are now implemented on exact #2101 head `95ccbb83ede5ac20710d3b018f7d98e66bc0412e`. The exhaustive four-node oracle passes for postdominator membership and control-dependence rows, and the TypeScript runtime behavior test passes with typed conditional-edge evidence. Remaining work is broader language/near-miss fixtures, measurement artifacts, and final gates.
+
+The sandboxed pre-push gate could not open the benchmark session OS resources or the uv cache. The required escalated rerun fixed both environmental failures: all-features Clippy and doctests passed, and nextest passed 4,993 cases before fail-fast stopped on the unrelated existing `typescript_type_reference_prefers_interface_over_same_named_const` symbol-resolution test. Focused reruns are being isolated; no #2102 test failed.
+
+The isolated failing test reproduces from the compiled `suite_symbols` binary: `get_definition_test::typescript_type_reference_prefers_interface_over_same_named_const` returns kind `field` for `export const Widget` where the fixture expects kind `class` for the same-named interface. This is outside the changed CFG/runtime files. All #2102 focused tests and both language fixtures pass.
 
 ## Context and Orientation
 

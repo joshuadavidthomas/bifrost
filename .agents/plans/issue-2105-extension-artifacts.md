@@ -18,12 +18,15 @@ A developer can observe the behavior by running one hermetic fixture through the
 - [x] (2026-08-13 12:55Z) Audited the extension version/generation design, semantic artifact lifecycle matrix, evaluation and reproduction documentation, framed Git provenance, rollout artifacts, benchmark reports, and byte-stable OWASP artifact precedent.
 - [x] (2026-08-13 12:55Z) Fixed the canonical bundle, manifest identity, validation, reproduction, purpose classifications, deviation semantics, and exact test matrix in this plan.
 - [x] (2026-08-13 13:05Z) Reconciled this plan with #2104's `ObservationDocument`, `ObservationMappingResult`, producer/configuration identity, canonical JSON/JSONL codecs, terminal outcomes, work, limits, and planned document/result digests.
-- [ ] When #2104 source lands, confirm its concrete digest accessors and canonical media/schema identifiers match the plan; reference them rather than duplicating observation fields.
-- [ ] Implement the manifest domain model, canonical codec, strict validator, and bundle index in `brokk-bifrost-runtime::extension`.
-- [ ] Implement capture helpers that bind #2100 identity and #2101/#2104 canonical artifacts without importing analyzer internals.
-- [ ] Implement read-only bundle verification and reproduction with typed prerequisite mismatches and atomic output publication.
-- [ ] Add hermetic model, codec, tamper, completeness, purpose, deviation, cross-platform path, direct/serialized parity, and clean-process determinism tests.
-- [ ] Update public reproduction/evaluation documentation; defer external-template CI and `CITATION.cff` acceptance until license migration.
+- [x] (2026-08-13 18:30Z) Waited for the genuine dependency chain and attached `dave/issue-2105-extension-artifacts` at #2104 commit `069dcbbf4`, which contains #2101 PR #2116 and #2100 PR #2113 rather than copied contracts.
+- [x] (2026-08-13 18:50Z) Confirmed #2104's concrete `ObservationDocument::digest`, `ObservationMappingResult::{input_digest,result_digest}`, canonical JSON/JSONL encoders, and #2101 request/snapshot digests; the manifest references these through canonical component descriptors.
+- [x] (2026-08-13 19:20Z) Implemented the manifest model, purpose/status/cache/deviation validation, canonical strict codec, deterministic-versus-volatile digest, component DAG, and builder in `brokk-bifrost-runtime::extension`.
+- [x] (2026-08-13 19:20Z) Implemented bounded streaming bundle verification with path/symlink/tamper rejection and typed, canonically ordered reproduction preflight plus atomic non-overwriting execution.
+- [x] (2026-08-13 19:35Z) Added four hermetic runtime tests for canonical/volatile identity, aggregate completeness, bundle tampering, and multi-mismatch ordering; all four pass.
+- [x] (2026-08-13 19:40Z) Updated public reproduction, evaluation, and citation guidance while explicitly deferring external-template CI and extension `CITATION.cff` until Apache-2.0.
+- [x] (2026-08-13 20:30Z) Validation passed: runtime extension suite 15/15, artifact subset 4/4, focused runtime Clippy, workspace dependency graph, formatting, diff check, all workspace doctests, and authorized all-features workspace Clippy. Full nextest was not clean because sandbox-denied process/git tests plus known unrelated analyzer failures remain; exact evidence is recorded below.
+- [x] (2026-08-13 20:05Z) Created checkpoint commit `58e133b9a` with the implementation, tests, living plan, and public documentation.
+- [x] (2026-08-13 20:31Z) Pushed head `11c486d21a4f125087ef4ec4b525550ab2d5f1c7` and opened mergeable ready PR #2121 against `dave/issue-2104-observation-mapping`; CI impact, Docs, and code-smells checks started in progress.
 
 ## Surprises & Discoveries
 
@@ -44,6 +47,12 @@ A developer can observe the behavior by running one hermetic fixture through the
 
 - Observation: #2104 defines one canonical `ObservationDocument` and one canonical `ObservationMappingResult`, with a terminal outcome for every admitted record and domain digests over the document/result.
   Evidence: `.agents/plans/issue-2104-observation-mapping.md` defines `encode_observation_document_json`, JSONL mapping framing, exact/ambiguous/unmapped/stale/unsupported/truncated outcomes, and names #2105 as the consumer of its digests, provenance, limits, work, and completeness.
+
+- Observation: the real #2100/#2101/#2104 stack exposes the required canonical domain digests but does not expose a packaged `EngineBuildIdentity`; #2105 therefore accepts explicit validated engine/workspace identities and binds them to `ExtensionWorkspaceDescription` generation/API equality.
+  Evidence: #2104 head `069dcbbf4` exports `StableDigest`, `WorkspaceGeneration`, relation request/snapshot digests, observation document/result digests, and `ExtensionWorkspaceDescription`; no build-time engine identity value exists in the public runtime package.
+
+- Observation: the comprehensive nextest gate is not reliable inside this sandbox for tests that spawn processes or create Git commits, and the stack also carries unrelated analyzer regressions already visible in parent validation.
+  Evidence: `target/nextest/default/junit.xml` records `Operation not permitted` for benchmark pipe/process tests and many Git-fixture commits. It also records the known `typescript_type_reference_prefers_interface_over_same_named_const` failure from #2101 plus unrelated watcher and Python usage-graph failures. The #2105-owned runtime suite passes 15/15 and all-features workspace Clippy passes.
 
 ## Decision Log
 
@@ -85,7 +94,7 @@ A developer can observe the behavior by running one hermetic fixture through the
 
 ## Outcomes & Retrospective
 
-Planning is complete. The current repository has strong ingredients—framed provenance, exact semantic identities, canonical relation plans, lifecycle completeness rules, and public methodology—but no single authoritative extension artifact contract. Implementation awaits #2100/#2101 source and must align observation descriptors with #2104. External template use and `CITATION.cff` remain deferred by the Apache-2.0 constraint, not removed from final epic acceptance.
+The API implementation is complete and published as mergeable ready PR #2121 on the genuine #2104 stack. It adds one authoritative manifest model and codec, content-addressed external components, bounded read-only verification, typed reproduction preflight, and atomic execution publication. The complete stacked runtime extension suite passes 15/15 and all-features workspace Clippy passes. Full nextest remains non-clean for sandbox-denied process/Git tests and unrelated analyzer regressions documented above. External template use and extension `CITATION.cff` remain deferred by the Apache-2.0 constraint, not removed from final epic acceptance.
 
 ## Context and Orientation
 
@@ -328,3 +337,9 @@ The runtime model depends on #2100 versions, digests, normalized paths, workspac
 Dependency order is: #2100 establishes the extension package and immutable identity; #2101 establishes canonical semantic request/snapshot artifacts; #2102/#2103 fill relation kinds without changing the manifest envelope; #2104 establishes canonical observation and mapping components; #2105 composes all of them. API model/codec work can begin after #2100/#2101; full reproduction fixtures wait for #2104. External template CI and `CITATION.cff` wait for Apache-2.0 publication authorization.
 
 Plan revision note (2026-08-13): Created the initial API-only #2105 ExecPlan after auditing the live issue, extension plans, current provenance/evidence artifacts, lifecycle policy, and public reproduction guidance. It fixes one shared canonical codec, external content-addressed components, deterministic-versus-volatile identity, three purpose contracts, fail-closed aggregate completeness, typed multi-mismatch preflight, and atomic non-overwriting reproduction while deferring public-template citation proof until license migration.
+
+Plan revision note (2026-08-13): Recorded implementation on the exact #2104/#2101/#2100 stack, the concrete public digest types, completed manifest/bundle/reproduction behavior, focused test evidence, and documentation changes. The remaining work is validation and ready stacked PR publication; external-template citation proof remains deferred.
+
+Plan revision note (2026-08-13): Recorded final local validation, including the 15/15 stacked runtime extension suite, clean all-features workspace Clippy/doctests/dependency/formatting checks, and the exact sandbox and unrelated analyzer failures that prevent a clean full-nextest claim.
+
+Plan revision note (2026-08-13): Recorded ready PR #2121, its exact head and #2119 stack base, mergeable state, and initial CI checks.

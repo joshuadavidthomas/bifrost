@@ -17,12 +17,13 @@ The behavior is visible by building and running the package-archive consumer add
 - [x] (2026-08-13 13:30Z) Read `.agents/PLANS.md`, the #2099 epic plan, live issue #2100, and the related #2101 boundary.
 - [x] (2026-08-13 13:45Z) Audited the root facade, `brokk-bifrost-runtime`, workspace construction, semantic identities, capability tables, bounded semantic outcomes, and package-archive consumer checks at commit `4496c7f95`.
 - [x] (2026-08-13 14:05Z) Selected the existing publishable runtime crate as the stable extension package and fixed the ownership split between #2100 and #2101.
-- [ ] Implement the stable version, workspace, identity, capability, limit, cancellation, metadata, diagnostic, provenance, and canonical JSON types in `crates/bifrost-runtime/src/extension/`.
-- [ ] Add the narrow analysis-to-runtime generation and capability projections without exposing stores, adapters, arenas, or language modules.
-- [ ] Wrap structural execution and add the explicitly experimental bounded control-flow seam request.
-- [ ] Add focused unit, integration, compile-fail, package-archive, dependency-boundary, and cross-platform CI coverage.
-- [ ] Run focused featureless validation, package checks, dependency checks, formatting, and the full pre-push gate before any authorized push.
-- [ ] Record implementation commits, exact test counts, archive-consumer output, CI links, and review outcome here.
+- [x] (2026-08-13 15:18Z) Re-read the repository and ExecPlan instructions, fetched `origin`, verified #2100 is open and assigned, found no overlapping pull request, and attached the clean worktree at current `origin/master` to `dave/issue-2100-extension-sdk-boundary`.
+- [x] (2026-08-13 16:02Z) Implemented the stable version, workspace, identity, capability, limit, cancellation, metadata, diagnostic, provenance, and canonical JSON types in `crates/bifrost-runtime/src/extension/`.
+- [x] (2026-08-13 16:28Z) Added an immutable source-capture boundary: `ExtensionWorkspace::open` freezes the bounded filesystem inventory in an `OverlayProject` snapshot before analyzer construction, and generation hashing reads only that same frozen project state without exposing stores, adapters, arenas, or language modules.
+- [x] (2026-08-13 16:02Z) Wrapped bounded structural execution and added the explicitly experimental procedure-local control-flow seam with source-backed stable node identities.
+- [x] (2026-08-13 16:31Z) Added focused unit/integration tests, rustdoc compile-fail privacy cases, an archive-only consumer and dependency-tree assertion, platform-neutral path fixtures, and a Linux/macOS/Windows CI matrix.
+- [ ] Run focused featureless validation, package checks, dependency checks, formatting, and the full pre-push gate before any authorized push (completed: focused runtime 7/7, extension 5/5, compile-fail 3/3, Clippy, formatting, dependency checks 15/15, archive-only consumer; blocked outside this diff: the escalated full gate ran 4,990 passing tests before the existing deterministic `typescript_type_reference_prefers_interface_over_same_named_const` failure, which also failed alone; no analyzer source differs from `origin/master`).
+- [ ] Record implementation commits, exact test counts, archive-consumer output, CI links, and review outcome here (completed: rebased commits, local evidence, ready PR #2113; remaining: CI and review outcome).
 
 ## Surprises & Discoveries
 
@@ -43,6 +44,12 @@ The behavior is visible by building and running the package-archive consumer add
 
 - Observation: The Bifrost MCP code-intelligence tools advertised by the installed skills were not callable in this task. Source inspection therefore used bounded `rg` and `sed` reads.
   Evidence: the available tool inventory contained no Bifrost search, summary, or source tool.
+
+- Observation: The package archive gate's full-feature facade consumer is substantially slower than its new runtime-only extension consumer.
+  Evidence: all 19 archives packaged successfully; after the full-feature build completed, the runtime-only consumer printed API major `1`, a generation digest, and `src/lib.rs`, and the complete script passed with a transport-free dependency tree.
+
+- Observation: The sandboxed pre-push run cannot exercise three pipe-backed MCP benchmark tests or uv's Python cache.
+  Evidence: the first run failed only with macOS `Operation not permitted` in `mcp_session.rs` and uv cache access. The escalated rerun passed those tests and continued through the full suite.
 
 ## Decision Log
 
@@ -78,9 +85,15 @@ The behavior is visible by building and running the package-archive consumer add
   Rationale: Protocol-neutral equivalence concerns values and encoding. Process hosting is a separate transport concern and would violate the minimal boundary.
   Date/Author: 2026-08-13 / Codex
 
+- Decision: Freeze every bounded filesystem source into an `OverlayProject` snapshot before analyzer construction and derive the generation from that same frozen project.
+  Rationale: This uses the repository's existing immutable project-snapshot abstraction, prevents post-build filesystem edits from racing generation construction, and avoids widening analyzer/store APIs merely to reveal internal file-state rows. A fresh `open` captures a fresh snapshot; an existing workspace remains immutable.
+  Date/Author: 2026-08-13 / Codex
+
 ## Outcomes & Retrospective
 
-Planning is complete for the API boundary. No implementation exists yet. The principal architectural outcome is that the existing runtime package, rather than a new crate or the transport-heavy facade, owns the supported application seam. The implementation must still prove generation correctness, public/private separation, serialized equivalence, and archive-only consumption before #2100 can close.
+The existing runtime package, rather than a new crate or the transport-heavy facade, now owns the supported application seam. The implementation proves immutable generation behavior, public/private separation, serialized equivalence, bounded source-backed structural and experimental control-flow execution, and archive-only consumption without transport dependencies.
+
+Implementation is now checkpointed around the supported `brokk_bifrost_runtime::extension` seam. Direct and JSON-decoded structural execution are byte-equivalent, experimental control flow produces source-backed nodes and edges, immutable generations change on a source edit, cancellation and noncanonical paths are typed, and an unpacked runtime-only consumer builds and runs without MCP or LSP. Remaining work is the analyzer-owned captured-state generation projection, compile-fail/cross-platform pins, completion of the full gate, and final review/CI evidence.
 
 ## Context and Orientation
 
@@ -281,6 +294,39 @@ Initial source evidence at `4496c7f95`:
         archive creation and external-style temporary consumers
 
 Implementation evidence must be appended here as concise transcripts: the negotiated version, one generation digest, a capability excerpt, one structural result, one experimental control-flow edge, distinct incomplete statuses, canonical JSON hash, transport-free dependency tree excerpt, package archive hash, and CI links.
+
+Checkpoint and local validation evidence on 2026-08-13:
+
+    commit 048117906
+        Establish the extension SDK boundary
+
+    completion commit
+        Complete extension boundary validation (rebased onto 11f0c2f43)
+
+    pull request
+        https://github.com/BrokkAi/bifrost/pull/2113 (ready, base master)
+
+    cargo test -p brokk-bifrost-runtime
+        7 passed; 0 failed
+
+    cargo test -p brokk-bifrost-runtime --test extension
+        5 passed; 0 failed
+
+    cargo test -p brokk-bifrost-runtime --doc
+        3 compile-fail tests passed
+
+    node --test scripts/check-workspace-dependencies.test.mjs
+        15 passed; 0 failed
+
+    scripts/check-workspace-packages.sh
+        Packaged brokk-bifrost-runtime: 26164 bytes
+        1 04373d64b684dcd8f8b377d23b6d7635f4a1b0a0cbaf20e79e119fbee2c7ca8f src/lib.rs
+        archive-only extension consumer passed; cargo tree contained no MCP or LSP
+
+    scripts/pre-push-gate.sh
+        sandbox run: permission failures only
+        escalated run: 4990 passed before unrelated TypeScript definition failure
+        focused rerun reproduced the same existing analyzer failure alone
 
 ## Interfaces and Dependencies
 

@@ -14,9 +14,14 @@ The same logical request is available as Rust values and canonical JSON or JSON 
 
 - [x] (2026-08-13 13:00Z) Read `.agents/PLANS.md`, the epic plan, live issue #2101, and the current semantic identity, provider-outcome, ICFG, rendering, and lifecycle-evidence implementations.
 - [x] (2026-08-13 13:00Z) Fix the public identity, bounds, proof/completeness, boundary, canonical serialization, test, and measurement design in this issue-specific plan.
-- [ ] Implement the versioned request and result model on top of the #2100 extension boundary.
+- [x] (2026-08-13 16:53Z) Re-read the repository and ExecPlan instructions, refreshed live #2100/#2101 and PR state, confirmed no overlapping #2101 PR, and waited for #2100's validated local checkpoint `3f5a9d676` rather than duplicating its contract.
+- [x] (2026-08-13 17:04Z) Attached this worktree to `dave/issue-2101-semantic-relation-snapshots`, genuinely stacked first on #2100 checkpoint `3f5a9d676`; ready parent PR #2113 subsequently published exact head `0800ef224` for the next rebase.
+- [x] (2026-08-13 17:15Z) Implemented the first complete versioned request/result model, positive finite semantic-specific limits, canonical node ordering/local IDs, typed evidence and boundaries, authoritative-absence semantics, and canonical JSON/JSONL codecs.
 - [ ] Project bounded control-flow, call, and return relations without exposing semantic artifacts or run-local handles.
-- [ ] Implement canonical JSON and JSONL codecs and the serialized dispatcher route.
+- [x] (2026-08-13 17:15Z) Implemented canonical JSON and JSONL codecs on the shared domain value; focused runtime extension tests pass 7/7, including strict request decoding, JSON/JSONL equivalence, digest binding, and complete-versus-incomplete empty results.
+- [x] (2026-08-13 17:32Z) Rebased the stack onto ready #2100 PR #2113 exact head `0800ef224`, fixed canonical endpoint remapping and truncation after the final-parent tests exposed dangling aliases, then passed all runtime tests (2 unit, 1 runtime, 8 extension, 3 doctests), `cargo fmt --check`, and the workspace dependency graph check.
+- [x] (2026-08-13 17:48Z) Ran `scripts/pre-push-gate.sh`: all-features Clippy and all doctests passed; nextest stopped after 4,991 passes on the unrelated pre-existing `typescript_type_reference_prefers_interface_over_same_named_const` definition-resolution failure, leaving 5,562 tests unrun.
+- [x] (2026-08-13 17:52Z) Pushed `dave/issue-2101-semantic-relation-snapshots` and opened ready stacked PR #2116 against #2100 PR #2113's branch; notified the #2102 task that the public child head is available.
 - [ ] Add behavior, identity, limit, cancellation, stale-generation, canonicalization, and route-equivalence tests.
 - [ ] Add cold, warm, retained-byte, edge-count, and canonical-byte measurements following the existing evidence protocol.
 - [ ] Run focused tests, formatting, dependency checks, the pre-push gate, and record exact evidence here.
@@ -37,6 +42,15 @@ The same logical request is available as Rust values and canonical JSON or JSON 
 
 - Observation: there is no authoritative semantic-relation JSON/JSONL codec today. Existing semantic rendering is diagnostic and test-oriented, and incidental `serde_json` calls do not define canonical wire bytes.
   Evidence: targeted search found no semantic relation schema or JSONL dispatcher in `crates/bifrost-analysis/src/analyzer/semantic` or `crates/bifrost-runtime/src`.
+
+- Observation: #2100's validated checkpoint already owns the stable extension workspace, generation, compatibility, cancellation, completion, capability, generic JSON envelope, and a deliberately minimal source-backed control-flow seam.
+  Evidence: local parent commit `3f5a9d676` passed focused behavior tests and the archive-only runtime consumer before this branch was stacked. #2101 must extend those runtime-owned types instead of creating a second workspace or outcome contract.
+
+- Observation: canonical node ordering must remap every edge endpoint through the node's stable identity, and topology truncation must discard edges whose endpoints were not retained.
+  Evidence: the first final-parent test run failed with `Execution("dangling input edge target")` under a one-node budget. Remapping old aliases after sort and filtering edges to retained nodes made the final-parent extension suite pass 8/8.
+
+- Observation: the full pre-push gate is currently red outside the extension surface.
+  Evidence: after 4,991 nextest passes, `get_definition_test::typescript_type_reference_prefers_interface_over_same_named_const` expected kind `class` but received the same-named exported const as kind `field`. This branch changes only `brokk-bifrost-runtime::extension`; all-features Clippy, doctests, runtime tests, formatting, and dependency checks pass.
 
 ## Decision Log
 
@@ -286,3 +300,7 @@ Dependency order is strict: #2100 supplies the stable entry point and generation
 Plan revision note (2026-08-13): Created this issue-specific API-only plan after inspecting live issue #2101 and the current semantic identities, ICFG, provider outcomes, rendering seams, and lifecycle evidence rules. The plan fixes stable identity as generation plus exact artifact validity plus portable source locator, makes every wire limit explicit and finite, separates edge evidence from acquisition completeness, and defines one canonical domain model for Rust, JSON, and JSONL. Later the same day, added the `non_exiting_region` boundary required by #2102 so control-dependence derivation cannot turn an entry-reachable region with no structural exit path into authoritative absence or fabricate a synthetic escape edge.
 
 Plan revision note (2026-08-13): Reconciled package ownership with #2100. `brokk-bifrost-runtime::extension` owns the stable model, schema codecs, and public projection; analysis owns only downward, runtime-independent acquisition algorithms and internal evidence records.
+
+Plan revision note (2026-08-13): Recorded the genuine stacked implementation base after #2100 produced validated checkpoint `3f5a9d676`. This preserves the parent contract and makes the temporary PR dependency explicit until #2100 merges.
+
+Plan revision note (2026-08-13): Recorded ready stacked PR #2116 and the exact validation boundary. Retarget it to `master` after #2113 merges, provided the rebase does not require semantic conflict resolution.
