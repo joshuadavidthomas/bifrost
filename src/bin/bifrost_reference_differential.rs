@@ -1139,11 +1139,22 @@ fn repository_metadata(root: &Path) -> Result<RepositoryMetadata, String> {
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false);
-    let dirty = !repo
+    let dirty = repo
         .statuses(Some(&mut options))
         .map_err(|err| format!("failed to inspect status for `{}`: {err}", root.display()))?
-        .is_empty();
+        .iter()
+        .any(|entry| {
+            entry
+                .path()
+                .is_none_or(|path| !is_generated_analyzer_state(Path::new(path)))
+        });
     Ok(RepositoryMetadata { head, dirty })
+}
+
+fn is_generated_analyzer_state(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        component.as_os_str() == ".bifrost" || component.as_os_str() == ".brokk"
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1444,8 +1455,11 @@ fn print_common_options() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReferenceDifferentialReport, RepositoryMetadata, catch_engine_panic, repository_record,
+        ReferenceDifferentialReport, RepositoryMetadata, catch_engine_panic, repository_metadata,
+        repository_record,
     };
+    use git2::{IndexAddOption, Repository, Signature};
+    use std::fs;
 
     #[test]
     fn repository_engine_panic_becomes_an_engine_error_and_next_run_continues() {
@@ -1490,5 +1504,36 @@ mod tests {
             value["message"],
             "analyzer panicked: fixture analyzer panic"
         );
+    }
+
+    #[test]
+    fn repository_metadata_ignores_only_generated_analyzer_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(temp.path()).expect("init repository");
+        fs::write(temp.path().join("tracked.rs"), "fn original() {}\n").expect("tracked file");
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["tracked.rs"], IndexAddOption::DEFAULT, None)
+            .expect("stage tracked file");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let signature = Signature::now("FIRD Test", "fird@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .expect("commit");
+        drop(tree);
+
+        fs::create_dir_all(temp.path().join(".bifrost/cache")).expect("bifrost cache directory");
+        fs::write(temp.path().join(".bifrost/cache/state"), "cache").expect("bifrost cache");
+        fs::create_dir_all(temp.path().join(".brokk")).expect("legacy cache directory");
+        fs::write(temp.path().join(".brokk/state"), "cache").expect("legacy cache");
+        assert!(!repository_metadata(temp.path()).expect("metadata").dirty);
+
+        fs::write(temp.path().join("notes.txt"), "user file").expect("untracked file");
+        assert!(repository_metadata(temp.path()).expect("metadata").dirty);
+        fs::remove_file(temp.path().join("notes.txt")).expect("remove untracked file");
+
+        fs::write(temp.path().join("tracked.rs"), "fn changed() {}\n").expect("tracked edit");
+        assert!(repository_metadata(temp.path()).expect("metadata").dirty);
     }
 }

@@ -318,6 +318,11 @@ pub struct InversePrecisionFinding {
     pub snippet: String,
     pub expected_names: Vec<String>,
     pub targets: Vec<StableDeclarationIdentity>,
+    /// A forward-resolved census site whose target query produced this hit.
+    /// Re-running this exact site reproduces the inverse query without needing
+    /// a separate target-identity CLI syntax.
+    #[serde(default)]
+    pub trigger_site: Option<ExactReferenceSite>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1320,13 +1325,27 @@ fn compare_inverse(
                     result,
                     &prepared.candidate_files,
                 );
-                drop(records);
+                let trigger_sites = prepared
+                    .group
+                    .site_indexes
+                    .iter()
+                    .map(|index| {
+                        let record = &records[*index];
+                        ExactReferenceSite {
+                            path: record.path.clone(),
+                            start_byte: record.start_byte,
+                            end_byte: Some(record.end_byte),
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 let findings = inverse_precision_findings(
                     analyzer,
                     &prepared.group.targets,
                     &proven,
                     census_membership,
+                    &trigger_sites,
                 );
+                drop(records);
                 if !findings.is_empty() {
                     precision_findings
                         .lock()
@@ -1463,6 +1482,7 @@ fn inverse_precision_findings(
     targets: &[CodeUnit],
     hits: &[UsageHit],
     census_membership: &CensusMembership,
+    trigger_sites: &[ExactReferenceSite],
 ) -> Vec<InversePrecisionFinding> {
     let mut expected_names = targets
         .iter()
@@ -1477,6 +1497,11 @@ fn inverse_precision_findings(
     hits.iter()
         .filter_map(|hit| {
             let path = rel_path_string(&hit.file);
+            let trigger_site = trigger_sites
+                .iter()
+                .find(|site| site.path == path)
+                .or_else(|| trigger_sites.first())?
+                .clone();
             let source = analyzer.indexed_source(&hit.file)?;
             let literal = source.get(hit.start_offset..hit.end_offset)?;
             if !expected_names.iter().any(|name| name == literal) {
@@ -1502,6 +1527,7 @@ fn inverse_precision_findings(
                 snippet: hit.snippet.clone(),
                 expected_names: expected_names.clone(),
                 targets: stable_targets.clone(),
+                trigger_site: Some(trigger_site),
             })
         })
         .collect()
@@ -2076,9 +2102,22 @@ mod tests {
             std::slice::from_ref(&target),
             std::slice::from_ref(&hit),
             &empty_membership,
+            &[ExactReferenceSite {
+                path: "lib.rs".to_string(),
+                start_byte: start,
+                end_byte: Some(start + "target".len()),
+            }],
         );
         assert_eq!(unbacked.len(), 1, "{unbacked:#?}");
         assert_eq!(unbacked[0].expected_names, ["target"]);
+        assert_eq!(
+            unbacked[0]
+                .trigger_site
+                .as_ref()
+                .expect("trigger site")
+                .path,
+            "lib.rs"
+        );
 
         let mut membership = HashMap::default();
         membership.insert(
@@ -2089,7 +2128,20 @@ mod tests {
                     .collect(),
             ),
         );
-        assert!(inverse_precision_findings(analyzer, &[target], &[hit], &membership).is_empty());
+        assert!(
+            inverse_precision_findings(
+                analyzer,
+                &[target],
+                &[hit],
+                &membership,
+                &[ExactReferenceSite {
+                    path: "lib.rs".to_string(),
+                    start_byte: start,
+                    end_byte: Some(start + "target".len()),
+                }],
+            )
+            .is_empty()
+        );
     }
 
     #[test]

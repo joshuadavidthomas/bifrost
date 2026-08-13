@@ -94,10 +94,11 @@ git -C /home/jonathan/Projects/brokkbench/clones/REPOSITORY_SLUG status --short
 git -C /home/jonathan/Projects/brokkbench/clones/REPOSITORY_SLUG rev-parse HEAD
 ```
 
-Persisted analyzer caches live below each clone in `.brokk/bifrost_cache.db`. If `.brokk/` is
-untracked, exclude it locally in the clone's `.git/info/exclude` so cache creation does not make an
-otherwise clean evidence record appear dirty. Do not delete `.brokk` as a retry strategy; diagnose
-epoch or migration failures at their source.
+Persisted analyzer caches live below each clone in `.bifrost/cache`; older checkouts can also contain
+legacy `.brokk/` state. FIRD excludes those two generated top-level directories from repository
+dirtiness metadata. Every other tracked or untracked path remains material and makes the record
+dirty. Do not delete analyzer state as a retry strategy; diagnose epoch or migration failures at
+their source.
 
 ## Build the runner
 
@@ -343,9 +344,12 @@ python3 scripts/fird-report-ledger.py \
 sha256sum RUN-missing-ledger.jsonl > RUN-missing-ledger.sha256
 ```
 
-The script records one row per raw finding. It adds a failure signature, an occurrence key, minimal
-source evidence, and a single-line exact rerun command. Fill the `disposition` field only after the
-exact audit. Preserve the raw ledger and its checksum.
+The script streams one row per raw finding into a new output file and refuses to overwrite an
+existing raw ledger. It adds a failure signature, an occurrence key, the originating configuration,
+minimal source evidence, and a single-line exact rerun command. Inverse-precision findings retain the
+forward census site that triggered their inverse query, so their command deterministically reproduces
+that query as well. Fill dispositions in a separate audited copy after the exact audit. Preserve the
+immutable raw ledger and its checksum.
 
 Do not infer that a large cluster is one bug merely because source text looks similar. Conversely, do
 not file one issue per symptom when structured tracing proves a shared resolver invariant.
@@ -399,7 +403,8 @@ cargo fmt --all -- --check
 scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 UV_CACHE_DIR=/tmp/bifrost-uv-cache \
   BIFROST_SEMANTIC_INDEX=off \
-  scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+  scripts/with-isolated-cargo-target.sh \
+  uv run --python 3.12 -- cargo test --features nlp,python
 ```
 
 Run focused behavior suites before the broad gates, then rebuild the release runner from the exact
@@ -416,7 +421,7 @@ Exact probes and a dirty integration-candidate corpus are not closure evidence. 
 
 1. reconcile and publish the integrated head according to the repository's Git instructions;
 2. rebuild the release runner from that exact clean pushed head;
-3. run the complete selected corpus into new head-scoped JSONL and log files;
+3. run the not-yet-completed portion of the selected corpus into new head-scoped JSONL and log files;
 4. exhaustively audit every final raw `missing` row;
 5. verify all expected exact witnesses are `consistent` or honestly fail closed as `unproven`/
    `inconclusive` with zero actionable discrepancy;
@@ -433,7 +438,7 @@ rerun and independently audited.
 Keep large, resumable raw artifacts outside the repository:
 
 ```text
-/mnt/optane/tmp/reference-differential/
+/mnt/optane/tmp/bifrost-fird/
   <language>-<campaign>-<bifrost-head>.jsonl
   <language>-<campaign>-<bifrost-head>.log
   ...-missing-audit.jsonl
@@ -493,9 +498,10 @@ and write to a new head-scoped output.
 
 ### Clone becomes dirty during a persisted run
 
-If only `.brokk/` is untracked, add a local `.git/info/exclude` entry and rerun the accepted record. If
-tracked source changed, restore or re-create the pinned clone through the normal corpus workflow; do
-not accept the dirty record.
+Generated top-level `.bifrost/` and legacy `.brokk/` analyzer state is ignored by the record metadata.
+Any other untracked path or tracked source change is material. Restore a clean clone through the
+normal corpus workflow or use a clean alternate worktree at the pinned commit; do not discard user
+changes or accept the dirty record.
 
 ### Progress is quiet for several minutes
 
