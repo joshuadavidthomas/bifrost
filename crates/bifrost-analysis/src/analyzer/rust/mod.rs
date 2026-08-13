@@ -95,13 +95,12 @@ pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
-#[cfg(test)]
-pub(crate) use brokk_bifrost_rust::usage::usage_candidate_files_while;
 pub(crate) use brokk_bifrost_rust::usage::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
-    usage_binding_seeds, usage_crate_export_targets, usage_declaration_visible_at,
-    usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    usage_binding_seeds, usage_candidate_files_while, usage_crate_export_targets,
+    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
+    usage_importers, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
 };
 
 #[derive(Clone)]
