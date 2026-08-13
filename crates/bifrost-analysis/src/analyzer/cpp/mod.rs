@@ -52,6 +52,8 @@ pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
+use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
+use brokk_bifrost_cpp::graph::resolver::SourceUsingIndex;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
@@ -62,6 +64,7 @@ use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{
     weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
     weight_project_file_set, weight_reconcile_candidates, weight_reconciled_groups,
+    weight_source_using_index,
 };
 use clones::build_clone_candidate_data;
 
@@ -84,6 +87,12 @@ pub struct CppAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    /// The per-file structured using index behind
+    /// [`CppSource::source_using_index`]. Memoized here rather than on
+    /// `VisibilityIndex` because a fresh visibility index is built per usage
+    /// query, and rebuilding this index per query re-walked a 9.5 MB
+    /// amalgamation's AST once per candidate (issue #1927).
+    source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
     unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
@@ -126,6 +135,10 @@ pub struct CppAnalyzer {
     cpp_parent_resolution_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     visible_type_units_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    source_using_index_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    using_guard_context_inspection_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Identifier-index scans issued for reconciliation. One per member
@@ -229,6 +242,10 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            source_using_index_by_file: build_weighted_cache(
+                memo_budget / 8,
+                weight_source_using_index,
+            ),
             unconditional_include_reachability: build_weighted_cache(
                 memo_budget / 8,
                 weight_include_reachability,
@@ -258,6 +275,10 @@ impl CppAnalyzer {
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -346,6 +367,10 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            source_using_index_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_source_using_index,
+            ),
             unconditional_include_reachability: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_include_reachability,
@@ -375,6 +400,10 @@ impl CppAnalyzer {
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -655,6 +684,23 @@ impl CppAnalyzer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Per-file structured using-index builds; a cache hit does not count
+    /// (#1927).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn source_using_index_build_count_for_test(&self) -> usize {
+        self.source_using_index_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Guard-ancestry inspections performed inside per-file using-index
+    /// builds. Only structured using declarations may inspect guard ancestry;
+    /// a rebuild-free query keeps this constant (#1927).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn using_guard_context_inspection_count_for_test(&self) -> usize {
+        self.using_guard_context_inspection_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #1908: reset both reconcile counters together. They are two halves of
     /// one measurement -- scans and the candidates those scans fed -- and a
     /// test that reset one and read the other would report a ratio it never
@@ -752,6 +798,15 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::visible_type_units_while(self, file, keep_going)
     }
 
+    fn source_using_index(&self, file: &ProjectFile) -> Arc<SourceUsingIndex> {
+        self.source_using_index_by_file.get_with_by_ref(file, || {
+            #[cfg(any(test, feature = "test-support"))]
+            self.source_using_index_build_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(build_source_using_index(self, file))
+        })
+    }
+
     fn file_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.file_source(file)
     }
@@ -825,6 +880,12 @@ impl CppSource for CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     fn record_cpp_class_strength_parse_for_test(&self) {
         CppAnalyzer::record_cpp_class_strength_parse_for_test(self);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_using_guard_context_inspection_for_test(&self) {
+        self.using_guard_context_inspection_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

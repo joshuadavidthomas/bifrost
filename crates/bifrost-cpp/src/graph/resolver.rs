@@ -765,10 +765,6 @@ pub struct VisibilityIndex<'a> {
     #[cfg(any(test, feature = "test-support"))]
     using_name_candidate_inspection_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
-    using_source_index_walk_count: AtomicUsize,
-    #[cfg(any(test, feature = "test-support"))]
-    using_guard_context_inspection_count: AtomicUsize,
-    #[cfg(any(test, feature = "test-support"))]
     callable_reference_spec_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
@@ -1089,8 +1085,6 @@ impl<'a> VisibilityIndex<'a> {
             using_donor_activation_count: AtomicUsize::new(0),
             using_namespace_lookup_count: AtomicUsize::new(0),
             using_name_candidate_inspection_count: AtomicUsize::new(0),
-            using_source_index_walk_count: AtomicUsize::new(0),
-            using_guard_context_inspection_count: AtomicUsize::new(0),
             callable_reference_spec_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
@@ -1223,10 +1217,6 @@ impl<'a> VisibilityIndex<'a> {
             using_namespace_lookup_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             using_name_candidate_inspection_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_source_index_walk_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_guard_context_inspection_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             callable_reference_spec_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -2698,34 +2688,13 @@ impl<'a> VisibilityIndex<'a> {
     pub fn note_using_name_candidate_inspection_for_test(&self) {}
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn note_using_source_index_walk_for_test(&self) {
-        self.using_source_index_walk_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
-    pub fn note_using_source_index_walk_for_test(&self) {}
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn note_using_guard_context_inspection_for_test(&self) {
-        self.using_guard_context_inspection_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
-    pub fn note_using_guard_context_inspection_for_test(&self) {}
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize, usize, usize) {
+    pub fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize) {
         (
-            self.using_source_index_walk_count.load(Ordering::Relaxed),
             self.using_donor_activation_count.load(Ordering::Relaxed),
             self.using_namespace_lookup_count.load(Ordering::Relaxed),
             self.callable_reference_spec_build_count
                 .load(Ordering::Relaxed),
             self.using_name_candidate_inspection_count
-                .load(Ordering::Relaxed),
-            self.using_guard_context_inspection_count
                 .load(Ordering::Relaxed),
         )
     }
