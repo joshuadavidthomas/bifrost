@@ -158,8 +158,10 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         // declarations may participate in receiver typing. A narrow exact-site
         // query can still reach an interface through embedded structs declared
         // in other files/packages (#2072), so build resolution facts from the
-        // complete analyzed Go workspace while retaining/scanning only the
-        // requested candidate trees.
+        // candidate/target packages and their transitive workspace imports,
+        // while retaining/scanning only the requested candidate trees. The
+        // complete file inventory lets the Go crate discover that dependency
+        // closure without parsing unrelated packages.
         let resolution_files = analyzed_files_for_language(analyzer, Language::Go);
         union_candidate_usages(overloads, max_usages, |target| {
             // The graph is seeded from the candidate's own file, so a target

@@ -1311,25 +1311,52 @@ pub fn build_go_graph(
         .cloned()
         .chain(std::iter::once(target_file.clone()))
         .collect();
-    let all_files: BTreeSet<ProjectFile> = resolution_files
+    let available_files: BTreeSet<ProjectFile> = resolution_files
         .iter()
         .filter(|file| language_for_file(file) == Language::Go)
         .cloned()
         .chain(scoped_files.iter().cloned())
         .collect();
+    let available_dir_index = build_parent_dir_index(available_files.iter());
+    let workspace_paths = source.workspace_paths;
+    let mut pending: Vec<ProjectFile> = scoped_files.iter().cloned().collect();
+    let mut queued: HashSet<ProjectFile> = pending.iter().cloned().collect();
     let mut all_parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
 
-    for file in all_files {
+    while let Some(file) = pending.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
         if language_for_file(&file) != Language::Go {
             continue;
         }
+        let directory = file.parent().to_string_lossy().replace('\\', "/");
+        if let Some(siblings) = available_dir_index.get(&directory) {
+            for sibling in siblings {
+                if queued.insert(sibling.clone()) {
+                    pending.push(sibling.clone());
+                }
+            }
+        }
         let parsed_file = match parse_go_file(&file) {
             Some(parsed_file) => parsed_file,
             None => continue,
         };
+        for import in &parsed_file.imports {
+            let Some(path) = go_import_path(import) else {
+                continue;
+            };
+            for representative in workspace_paths.import_files(&file, &path) {
+                let directory = representative.parent().to_string_lossy().replace('\\', "/");
+                if let Some(imported_files) = available_dir_index.get(&directory) {
+                    for imported_file in imported_files {
+                        if queued.insert(imported_file.clone()) {
+                            pending.push(imported_file.clone());
+                        }
+                    }
+                }
+            }
+        }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
@@ -1345,7 +1372,6 @@ pub fn build_go_graph(
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed))
         .collect();
-    let workspace_paths = source.workspace_paths;
     let edge_index = build_go_edge_index_from_parsed(source, &parsed_refs);
     let package_names: HashMap<ProjectFile, String> = all_parsed
         .iter()
@@ -1450,8 +1476,8 @@ fn import_binder_of(
                         let mut names: Vec<_> = resolved
                             .iter()
                             .filter_map(|target| package_names.get(target))
-                            .cloned()
                             .filter(|name| !name.is_empty())
+                            .cloned()
                             .collect();
                         names.sort();
                         names.dedup();
