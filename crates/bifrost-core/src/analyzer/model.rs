@@ -450,6 +450,14 @@ pub struct SignatureMetadata {
     return_type_text: Option<String>,
     #[serde(default)]
     return_type_identity: Option<StructuredTypeIdentity>,
+    /// The declared type's structured right-hand side, such as the
+    /// `[256]*operation` in `type JumpTable [256]*operation`.
+    ///
+    /// This is distinct from a callable or field return type and from an
+    /// embedded supertype. Consumers use it to retain container shape through
+    /// a named type without accidentally treating its element as inheritance.
+    #[serde(default)]
+    underlying_type_identity: Option<StructuredTypeIdentity>,
     #[serde(default)]
     declaration_only: bool,
     #[serde(default)]
@@ -1713,6 +1721,7 @@ impl SignatureMetadata {
             parameters,
             return_type_text: None,
             return_type_identity: None,
+            underlying_type_identity: None,
             declaration_only: false,
             callable_arity: None,
             type_parameters: Vec::new(),
@@ -1875,6 +1884,14 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_underlying_type_identity(
+        mut self,
+        underlying_type_identity: Option<StructuredTypeIdentity>,
+    ) -> Self {
+        self.underlying_type_identity = underlying_type_identity;
+        self
+    }
+
     pub fn with_declaration_only(mut self, declaration_only: bool) -> Self {
         self.declaration_only = declaration_only;
         self
@@ -1982,6 +1999,14 @@ impl SignatureMetadata {
 
     pub fn into_return_type_identity(self) -> Option<StructuredTypeIdentity> {
         self.return_type_identity
+    }
+
+    pub fn underlying_type_identity(&self) -> Option<&StructuredTypeIdentity> {
+        self.underlying_type_identity.as_ref()
+    }
+
+    pub fn into_underlying_type_identity(self) -> Option<StructuredTypeIdentity> {
+        self.underlying_type_identity
     }
 
     pub fn is_declaration_only(&self) -> bool {

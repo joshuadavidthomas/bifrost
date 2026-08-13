@@ -304,19 +304,28 @@ fn receiver_type_name(receiver_parameter: Node<'_>) -> Option<Node<'_>> {
         }
     }
 }
-/// Return the structured owner type for a keyed composite-literal element.
-///
-/// An elided value such as `[1]Owner{{Field: value}}` has no type node at the
-/// inner literal boundary. Its type is nevertheless explicit in the enclosing
-/// array/slice element, map key, or map value. Walk through only those AST
-/// relationships and peel one container type per elided boundary; do not infer
-/// an owner from the field spelling.
-pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
-    enum ContainerStep {
-        ElementOrValue,
-        MapKey,
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositeLiteralContainerStep {
+    ElementOrValue,
+    MapKey,
+}
 
+pub struct CompositeLiteralOwnerPath<'tree> {
+    pub type_node: Node<'tree>,
+    pub steps: Vec<CompositeLiteralContainerStep>,
+}
+
+/// Return the explicit outer type and the structured container path from that
+/// type to the keyed element's owner. Unlike
+/// [`composite_literal_owner_type_for_key`], this retains unapplied steps when
+/// the outer literal names a declared container type whose underlying shape is
+/// available only from the declaration index. An elided value such as
+/// `[1]Owner{{Field: value}}` has no type node at the inner literal boundary;
+/// every returned step comes only from the surrounding array, slice, map key,
+/// or map value structure, never from the field spelling.
+pub fn composite_literal_owner_path_for_key(
+    node: Node<'_>,
+) -> Option<CompositeLiteralOwnerPath<'_>> {
     let keyed = keyed_element_for_key(node)?;
     let mut literal = keyed
         .parent()
@@ -327,24 +336,21 @@ pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> 
         let parent = literal.parent()?;
         match parent.kind() {
             "composite_literal" => {
-                let mut owner = parent.child_by_field_name("type")?;
-                for step in steps.into_iter().rev() {
-                    owner = match step {
-                        ContainerStep::ElementOrValue => go_container_element_or_value_type(owner)?,
-                        ContainerStep::MapKey => go_map_key_type(owner)?,
-                    };
-                }
-                return Some(owner);
+                steps.reverse();
+                return Some(CompositeLiteralOwnerPath {
+                    type_node: parent.child_by_field_name("type")?,
+                    steps,
+                });
             }
             "keyed_element" => {
                 let value = parent.child_by_field_name("value")?;
                 let step = if same_node(value, literal) {
-                    ContainerStep::ElementOrValue
+                    CompositeLiteralContainerStep::ElementOrValue
                 } else if parent
                     .child_by_field_name("key")
                     .is_some_and(|key| same_node(key, literal))
                 {
-                    ContainerStep::MapKey
+                    CompositeLiteralContainerStep::MapKey
                 } else {
                     return None;
                 };
@@ -355,7 +361,7 @@ pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> 
             }
             "literal_value" => {
                 literal = parent;
-                steps.push(ContainerStep::ElementOrValue);
+                steps.push(CompositeLiteralContainerStep::ElementOrValue);
             }
             "literal_element" => {
                 let container = parent.parent()?;
@@ -363,12 +369,12 @@ pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> 
                     "keyed_element" => {
                         let value = container.child_by_field_name("value")?;
                         let step = if same_node(value, parent) {
-                            ContainerStep::ElementOrValue
+                            CompositeLiteralContainerStep::ElementOrValue
                         } else if container
                             .child_by_field_name("key")
                             .is_some_and(|key| same_node(key, parent))
                         {
-                            ContainerStep::MapKey
+                            CompositeLiteralContainerStep::MapKey
                         } else {
                             return None;
                         };
@@ -384,12 +390,26 @@ pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> 
                     .parent()
                     .is_some_and(|node| node.kind() == "literal_value")
                 {
-                    steps.push(ContainerStep::ElementOrValue);
+                    steps.push(CompositeLiteralContainerStep::ElementOrValue);
                 }
             }
             _ => return None,
         }
     }
+}
+
+pub fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
+    let path = composite_literal_owner_path_for_key(node)?;
+    let mut owner = path.type_node;
+    for step in path.steps {
+        owner = match step {
+            CompositeLiteralContainerStep::ElementOrValue => {
+                go_container_element_or_value_type(owner)?
+            }
+            CompositeLiteralContainerStep::MapKey => go_map_key_type(owner)?,
+        };
+    }
+    Some(owner)
 }
 fn go_map_key_type(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {

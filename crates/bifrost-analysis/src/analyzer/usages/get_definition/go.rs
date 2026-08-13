@@ -747,9 +747,11 @@ fn go_composite_label_owner_fqn(
         }
         owner = match step {
             GoCompositeOwnerStep::ContainerElementOrValue => {
-                go_composite_owner_container_step(analyzer, support, owner)?
+                go_composite_owner_container_step(analyzer, support, file, source, owner)?
             }
-            GoCompositeOwnerStep::MapKey => go_composite_owner_map_key_step(support, owner)?,
+            GoCompositeOwnerStep::MapKey => {
+                go_composite_owner_map_key_step(analyzer, support, file, source, owner)?
+            }
             GoCompositeOwnerStep::KeyedValue(field) => go_composite_owner_keyed_value_step(
                 analyzer,
                 support,
@@ -783,13 +785,20 @@ fn go_composite_label_owner_fqn(
 }
 
 fn go_composite_owner_map_key_step<'tree>(
+    analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
     owner: GoCompositeOwnerRef<'tree>,
 ) -> Option<GoCompositeOwnerRef<'tree>> {
     match owner {
-        GoCompositeOwnerRef::Syntax(owner_type) => Some(GoCompositeOwnerRef::Syntax(
-            go_composite_map_key_type(support, owner_type)?,
-        )),
+        GoCompositeOwnerRef::Syntax(owner_type) => {
+            if let Some(key) = go_composite_map_key_type(support, owner_type) {
+                return Some(GoCompositeOwnerRef::Syntax(key));
+            }
+            go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)?
+                .and_then_map_key(support)
+        }
         GoCompositeOwnerRef::IndexedType {
             file,
             package,
@@ -805,14 +814,21 @@ fn go_composite_owner_map_key_step<'tree>(
 }
 
 fn go_composite_owner_container_step<'tree>(
-    _analyzer: &dyn IAnalyzer,
+    analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
     owner: GoCompositeOwnerRef<'tree>,
 ) -> Option<GoCompositeOwnerRef<'tree>> {
     match owner {
-        GoCompositeOwnerRef::Syntax(owner_type) => Some(GoCompositeOwnerRef::Syntax(
-            go_composite_container_element_or_value_type(support, owner_type)?,
-        )),
+        GoCompositeOwnerRef::Syntax(owner_type) => {
+            if let Some(element) = go_composite_container_element_or_value_type(support, owner_type)
+            {
+                return Some(GoCompositeOwnerRef::Syntax(element));
+            }
+            go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)?
+                .and_then_container_element(support)
+        }
         GoCompositeOwnerRef::IndexedType {
             file,
             package,
@@ -825,6 +841,83 @@ fn go_composite_owner_container_step<'tree>(
                 identity,
             }),
     }
+}
+
+impl<'tree> GoCompositeOwnerRef<'tree> {
+    fn and_then_container_element(self, support: &dyn GoDefinitionProvider) -> Option<Self> {
+        match self {
+            Self::IndexedType {
+                file,
+                package,
+                identity,
+            } => identity
+                .into_container_element_with(|| support.scope_step())
+                .map(|identity| Self::IndexedType {
+                    file,
+                    package,
+                    identity,
+                }),
+            Self::Syntax(_) => None,
+        }
+    }
+
+    fn and_then_map_key(self, support: &dyn GoDefinitionProvider) -> Option<Self> {
+        match self {
+            Self::IndexedType {
+                file,
+                package,
+                identity,
+            } => identity
+                .into_map_key_with(|| support.scope_step())
+                .map(|identity| Self::IndexedType {
+                    file,
+                    package,
+                    identity,
+                }),
+            Self::Syntax(_) => None,
+        }
+    }
+}
+
+fn go_named_underlying_composite_owner<'tree>(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    owner_type: Node<'tree>,
+) -> Option<GoCompositeOwnerRef<'tree>> {
+    let owner_fqn = go_resolve_type_fqn(analyzer, support, file, source, owner_type)?;
+    let mut candidates = Vec::new();
+    for unit in support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+    {
+        if !support.scope_step() {
+            return None;
+        }
+        for metadata in support.signature_metadata(analyzer, &unit) {
+            if !support.scope_step() {
+                return None;
+            }
+            let Some(identity) = metadata.into_underlying_type_identity() else {
+                continue;
+            };
+            candidates.push((
+                unit.source().clone(),
+                unit.package_name().to_string(),
+                identity,
+            ));
+        }
+    }
+    let (file, package, identity) = (candidates.len() == 1)
+        .then(|| candidates.pop())
+        .flatten()?;
+    Some(GoCompositeOwnerRef::IndexedType {
+        file,
+        package,
+        identity,
+    })
 }
 
 fn go_composite_owner_keyed_value_step<'tree>(
@@ -842,20 +935,26 @@ fn go_composite_owner_keyed_value_step<'tree>(
                     go_composite_container_element_or_value_type(support, owner_type)?,
                 ));
             }
-            let identity = crate::analyzer::go::go_structured_type_identity_bounded(
-                owner_type,
-                source,
-                || support.scope_step(),
-            )?;
-            GoCompositeOwnerRef::IndexedType {
-                file: file.clone(),
-                package: go_package_name(
-                    support,
-                    file,
+            if let Some(owner) =
+                go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)
+            {
+                owner
+            } else {
+                let identity = crate::analyzer::go::go_structured_type_identity_bounded(
+                    owner_type,
                     source,
-                    Some(go_syntax_root(support, owner_type)?),
-                )?,
-                identity,
+                    || support.scope_step(),
+                )?;
+                GoCompositeOwnerRef::IndexedType {
+                    file: file.clone(),
+                    package: go_package_name(
+                        support,
+                        file,
+                        source,
+                        Some(go_syntax_root(support, owner_type)?),
+                    )?,
+                    identity,
+                }
             }
         }
         GoCompositeOwnerRef::IndexedType {

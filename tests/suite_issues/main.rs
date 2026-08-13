@@ -95,6 +95,7 @@ mod issue_2060_csharp_using_precedence;
 mod issue_2061_csharp_role_sensitive_lookup;
 mod issue_2062_csharp_alias_and_anonymous_key;
 mod issue_2066_js_lexical_binding_precedence;
+mod issue_2069_go_named_container_literals;
 mod issue_2070_go_nested_map_keys;
 mod issue_2071_go_elided_map_key_owner;
 mod issue_2092_c_this_binding;

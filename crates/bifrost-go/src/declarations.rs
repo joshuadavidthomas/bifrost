@@ -960,6 +960,17 @@ fn visit_go_type_spec(
         Some(code_unit.clone()),
     );
     parsed.add_signature(code_unit.clone(), go_type_signature(node, source));
+    if let Some(identity) = go_structured_type_identity(type_node, source) {
+        let metadata = SignatureMetadata::new(go_type_signature(node, source), Vec::new())
+            .with_underlying_type_identity(Some(identity));
+        let entries = parsed
+            .signature_metadata
+            .entry(code_unit.clone())
+            .or_default();
+        if !entries.contains(&metadata) {
+            entries.push(metadata);
+        }
+    }
     parsed.add_raw_supertypes(code_unit.clone(), go_embedded_type_texts(type_node, source));
     for embedded in go_embedded_type_nodes(type_node) {
         let label = go_node_text(embedded, source).trim().to_string();
