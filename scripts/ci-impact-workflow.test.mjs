@@ -12,6 +12,7 @@ test("CI is unconditional for pull requests and covers merge queues", () => {
   assert.match(workflow, /^  pull_request:\s*$/mu);
   assert.doesNotMatch(workflow, /^  pull_request:\n(?:    .*\n)*?    paths:/mu);
   assert.match(workflow, /^  merge_group:\n    types: \[checks_requested\]$/mu);
+  assert.match(workflow, /^  cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}$/mu);
 });
 
 test("CI has the classifier, canonical lint gate, and stable aggregation check", () => {
