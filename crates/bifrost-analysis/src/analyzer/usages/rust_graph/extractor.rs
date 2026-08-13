@@ -59,7 +59,8 @@ use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn effective_scan_files(
@@ -68,6 +69,7 @@ pub(super) fn effective_scan_files(
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
+    let _scope = crate::profiling::scope("rust_graph::effective_scan_files");
     let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
     let filtered_candidates: HashSet<_> = candidate_files
@@ -79,6 +81,7 @@ pub(super) fn effective_scan_files(
     let include_files: HashSet<_> = if scan_scope.is_authoritative() {
         HashSet::default()
     } else {
+        let _scope = crate::profiling::scope("rust_graph::include_candidate_discovery");
         RustIncludeRoutes::new(analyzer)
             .all_included_files()
             .iter()
@@ -95,6 +98,17 @@ pub(super) fn effective_scan_files(
             .collect()
     };
 
+    crate::profiling::note_with(|| {
+        format!(
+            "rust_graph candidates supplied={} analyzed={} filtered={} includes={} authoritative={}",
+            candidate_files.len(),
+            analyzed.len(),
+            filtered_candidates.len(),
+            include_files.len(),
+            scan_scope.is_authoritative()
+        )
+    });
+
     if scan_scope.is_authoritative() {
         return filtered_candidates;
     }
@@ -105,31 +119,69 @@ pub(super) fn effective_scan_files(
             .collect();
     }
 
+    let referencing_files = {
+        let _scope = crate::profiling::scope("rust_graph::reference_candidate_discovery");
+        analyzer.referencing_files_of(target.source())
+    };
     if !filtered_candidates.is_empty() {
+        let importers: HashSet<_> = if target.is_module() {
+            usage_importers(analyzer, seeds)
+        } else {
+            seeds.verified_importer_files().cloned().collect()
+        };
+        crate::profiling::note_with(|| {
+            format!(
+                "rust_graph augmented supplied candidates with importers={} referencing={}",
+                importers.len(),
+                referencing_files.len()
+            )
+        });
         return filtered_candidates
             .into_iter()
+            .chain(importers)
+            .chain(referencing_files)
             .chain(include_files)
+            .chain(std::iter::once(target.source().clone()))
             .collect();
     }
 
-    let textual_candidates = analyzed.into_iter().filter(|file| {
-        if scan_scope.is_cancelled() {
-            return false;
-        }
-        file.read_to_string().ok().is_some_and(|source| {
-            if scan_scope.is_cancelled() {
-                return false;
-            }
-            source.contains(target.identifier())
-                || seed_names
-                    .iter()
-                    .any(|seed_name| source.contains(seed_name))
-        })
+    let importers = {
+        let _scope = crate::profiling::scope("rust_graph::importer_candidate_discovery");
+        usage_importers(analyzer, seeds)
+    };
+
+    let textual_candidates: HashSet<_> = {
+        let _scope = crate::profiling::scope("rust_graph::textual_candidate_fallback");
+        analyzed
+            .into_iter()
+            .filter(|file| {
+                if scan_scope.is_cancelled() {
+                    return false;
+                }
+                file.read_to_string().ok().is_some_and(|source| {
+                    if scan_scope.is_cancelled() {
+                        return false;
+                    }
+                    source.contains(target.identifier())
+                        || seed_names
+                            .iter()
+                            .any(|seed_name| source.contains(seed_name))
+                })
+            })
+            .collect()
+    };
+    crate::profiling::note_with(|| {
+        format!(
+            "rust_graph inferred importers={} referencing={} textual={}",
+            importers.len(),
+            referencing_files.len(),
+            textual_candidates.len()
+        )
     });
 
-    usage_importers(analyzer, seeds)
+    importers
         .into_iter()
-        .chain(analyzer.referencing_files_of(target.source()))
+        .chain(referencing_files)
         .chain(include_files)
         .chain(textual_candidates)
         .chain(std::iter::once(target.source().clone()))
@@ -139,6 +191,41 @@ pub(super) fn effective_scan_files(
 struct UsageCapStop {
     proven_external_hits: AtomicUsize,
     max_usages: usize,
+}
+
+#[derive(Default)]
+struct RustScanPhaseTimings {
+    prepared_syntax_ns: AtomicU64,
+    reference_context_ns: AtomicU64,
+    lexical_scope_ns: AtomicU64,
+    ast_scan_ns: AtomicU64,
+}
+
+impl RustScanPhaseTimings {
+    fn start() -> Option<Instant> {
+        crate::profiling::enabled().then(Instant::now)
+    }
+
+    fn record(counter: &AtomicU64, started: Option<Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counter.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    fn report(&self, candidate_count: usize) {
+        crate::profiling::note_with(|| {
+            format!(
+                "rust_graph scan candidates={} prepared_syntax_ms={:.1} reference_context_ms={:.1} lexical_scope_ms={:.1} ast_scan_ms={:.1}",
+                candidate_count,
+                self.prepared_syntax_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.reference_context_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.lexical_scope_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.ast_scan_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            )
+        });
+    }
 }
 
 impl UsageCapStop {
@@ -180,6 +267,7 @@ pub(super) fn scan_files_for_target(
     let hits = Mutex::new(BTreeSet::new());
     let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
+    let timings = RustScanPhaseTimings::default();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
     // universe a hit can be written under.
@@ -196,9 +284,12 @@ pub(super) fn scan_files_for_target(
             return;
         }
         rust.note_scanned_candidate_file();
+        let started = RustScanPhaseTimings::start();
         let Some(prepared) = rust.prepared_syntax(file) else {
+            RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
+        RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
         let source = prepared.source();
         let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -212,11 +303,15 @@ pub(super) fn scan_files_for_target(
         // and every route it composes is memoized on the analyzer, so the
         // repeated construction costs no repeated work.
         let include_routes = RustIncludeRoutes::new(rust);
+        let started = RustScanPhaseTimings::start();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
+        RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        let started = RustScanPhaseTimings::start();
         let refs = rust.reference_context_of(file);
+        RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -269,11 +364,13 @@ pub(super) fn scan_files_for_target(
             cancellation_checks_remaining: 0,
             hits: &mut local_hits,
         };
+        let started = RustScanPhaseTimings::start();
         scan_node(tree.root_node(), &mut ctx);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         record_module_qualified_hits(tree.root_node(), &mut ctx);
+        RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -285,6 +382,8 @@ pub(super) fn scan_files_for_target(
             sink.extend(local_hits);
         }
     });
+
+    timings.report(files_vec.len());
 
     hits.into_inner().expect("poisoned Rust graph collector")
 }
@@ -1461,6 +1560,7 @@ pub(super) fn scan_files_for_member_target(
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
 
     let files_vec = files.into_iter().collect::<Vec<_>>();
+    let timings = RustScanPhaseTimings::default();
     // Parsing each file inside the scan, rather than prefetching every candidate
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
@@ -1469,20 +1569,27 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         rust.note_scanned_candidate_file();
+        let started = RustScanPhaseTimings::start();
         let Some(prepared) = rust.prepared_syntax(file) else {
+            RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
+        RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
         let source = prepared.source();
         let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         let line_starts = prepared.line_starts();
+        let started = RustScanPhaseTimings::start();
         let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
+        RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        let started = RustScanPhaseTimings::start();
         let refs = rust.reference_context_of(file);
+        RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -1580,7 +1687,9 @@ pub(super) fn scan_files_for_member_target(
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
+        let started = RustScanPhaseTimings::start();
         scan_member_node(tree.root_node(), &mut ctx);
+        RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -1598,6 +1707,8 @@ pub(super) fn scan_files_for_member_target(
             sink.extend(local_unproven_hits);
         }
     });
+
+    timings.report(files_vec.len());
 
     RustMemberScanResult {
         hits: hits.into_inner().expect("poisoned Rust member collector"),

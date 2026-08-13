@@ -34,6 +34,7 @@ mod issue_2026_php_direct_factory_receivers;
 mod issue_2055_python_module_qualified_attributes;
 mod issue_2056_python_module_receiver_root;
 mod issue_2073_go_package_variable_selector_base;
+mod issue_2112_rust_candidate_discovery;
 mod javascript_top30_residuals;
 mod kotlin_member_dispatch_trace;
 mod random_alias_recovery_test;

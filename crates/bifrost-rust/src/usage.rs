@@ -373,6 +373,10 @@ impl RustBindingSeeds {
             .map(|identity| identity.name.as_str())
     }
 
+    pub fn verified_importer_files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.edges_by_importer.keys()
+    }
+
     pub fn identities_in_file<'a>(
         &'a self,
         file: &'a ProjectFile,
