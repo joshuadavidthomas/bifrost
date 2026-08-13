@@ -15,6 +15,7 @@ use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_python::bindings::{
     PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
 };
+use brokk_bifrost_python::graph::resolver::annotation_reference_candidates_at_focus;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1411,6 +1412,27 @@ pub(super) fn resolve_python(
             format!("`{}` is not a Python reference site", site.text),
         );
     }
+    if let Some(candidates) = python_annotation_focus_candidates(
+        analyzer,
+        py,
+        file,
+        source,
+        node,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) {
+        return if candidates.is_empty() {
+            no_definition(
+                "no_indexed_definition",
+                format!(
+                    "annotation `{}` did not resolve to an indexed Python definition",
+                    site.text
+                ),
+            )
+        } else {
+            candidates_outcome(candidates)
+        };
+    }
 
     let ctx = context.python_context(py, file);
     let support = context.bounded_support();
@@ -1604,6 +1626,30 @@ pub(super) fn resolve_python(
             ),
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn python_annotation_focus_candidates(
+    analyzer: &dyn IAnalyzer,
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    focus_start: usize,
+    focus_end: usize,
+) -> Option<Vec<CodeUnit>> {
+    with_python_graph_source(analyzer, |graph| {
+        annotation_reference_candidates_at_focus(
+            &graph,
+            python,
+            file,
+            source,
+            node,
+            focus_start,
+            focus_end,
+            true,
+        )
+    })
 }
 
 /// Restore the exact synthetic identifier selected inside a deferred annotation.

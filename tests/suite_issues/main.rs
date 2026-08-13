@@ -87,6 +87,7 @@ mod issue_2038_typescript_export_alias;
 mod issue_2040_typescript_enum_initializer;
 mod issue_2047_java_nested_plain_type_names;
 mod issue_2049_java_class_interface_member_precedence;
+mod issue_2051_python_deferred_annotation_scope;
 mod issue_2052_python_class_body_scope;
 mod issue_2053_python_module_rebindings;
 mod issue_2058_python_literal_annotation_values;

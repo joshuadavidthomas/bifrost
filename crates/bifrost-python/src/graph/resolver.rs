@@ -8,7 +8,10 @@
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
 use crate::imports::resolve_fqn_candidates;
-use crate::syntax::{python_deferred_annotation_identifier_ranges, python_node_is_in_annotation};
+use crate::syntax::{
+    python_deferred_annotation_identifier_ranges, python_deferred_annotation_tree,
+    python_node_is_in_annotation,
+};
 use crate::usage_index::usage_seeds;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
@@ -178,7 +181,10 @@ fn resolve_bare_annotation_symbol(
     }
 
     if let Some(owner) = annotation_scope_owner_class(graph, file, source, node) {
-        let owner_candidates = exact_owner_annotation_members(graph, &owner, raw_symbol);
+        let owner_candidates: Vec<_> = exact_owner_annotation_members(graph, &owner, raw_symbol)
+            .into_iter()
+            .filter(|candidate| !candidate.is_function())
+            .collect();
         if !owner_candidates.is_empty() {
             return owner_candidates;
         }
@@ -213,6 +219,7 @@ fn resolve_bare_annotation_symbol(
             }),
     );
 
+    candidates.retain(|candidate| !candidate.is_function());
     candidates.sort();
     candidates.dedup();
     candidates
@@ -291,6 +298,132 @@ pub fn annotation_reference_candidates(
     candidates.sort();
     candidates.dedup();
     Some(candidates)
+}
+
+/// Resolve only the annotation identifier selected by one definition request.
+/// Quoted annotations are reparsed with original byte coordinates, while the
+/// original syntax node remains the lexical class-scope anchor.
+#[allow(clippy::too_many_arguments)]
+pub fn annotation_reference_candidates_at_focus(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    focus_start: usize,
+    focus_end: usize,
+    target_self_file: bool,
+) -> Option<Vec<CodeUnit>> {
+    if !is_annotation_reference_node(node) {
+        return None;
+    }
+
+    let deferred_tree = if node.kind() == "string_content" {
+        Some(python_deferred_annotation_tree(
+            node.parent()?,
+            source,
+            None,
+        )?)
+    } else {
+        None
+    };
+    let search_root = deferred_tree.as_ref().map_or(node, |tree| tree.root_node());
+    let focused = search_root.descendant_for_byte_range(focus_start, focus_end)?;
+    if focused.kind() != "identifier"
+        || focused.start_byte() != focus_start
+        || focused.end_byte() != focus_end
+    {
+        return Some(Vec::new());
+    }
+
+    let mut path = focused;
+    while let Some(parent) = path.parent() {
+        if parent.kind() != "attribute" {
+            break;
+        }
+        path = parent;
+    }
+    if path.kind() == "attribute" {
+        return Some(focused_annotation_attribute_candidates(
+            graph, python, file, source, node, path, focused,
+        ));
+    }
+
+    let symbol = node_text(focused, source);
+    let mut candidates = resolve_bare_annotation_symbol(graph, python, file, source, node, symbol);
+    if candidates.is_empty() {
+        candidates.extend(resolve_receiver_type(
+            graph,
+            python,
+            file,
+            symbol,
+            target_self_file,
+        ));
+    }
+    candidates.sort();
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn focused_annotation_attribute_candidates(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    scope_node: Node<'_>,
+    path: Node<'_>,
+    focused: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some((root, attributes)) = annotation_attribute_chain(path) else {
+        return Vec::new();
+    };
+    if root.id() == focused.id() {
+        return resolve_bare_annotation_symbol(
+            graph,
+            python,
+            file,
+            source,
+            scope_node,
+            node_text(root, source),
+        );
+    }
+
+    if attributes
+        .last()
+        .is_some_and(|node| node.id() == focused.id())
+    {
+        let candidates = namespace_qualified_declarations(graph, python, file, source, path);
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+
+    let owners: Vec<_> = resolve_bare_annotation_symbol(
+        graph,
+        python,
+        file,
+        source,
+        scope_node,
+        node_text(root, source),
+    )
+    .into_iter()
+    .filter(CodeUnit::is_class)
+    .collect();
+    let [owner] = owners.as_slice() else {
+        return Vec::new();
+    };
+    let mut owner = owner.clone();
+    for attribute in attributes {
+        let candidates = exact_nested_annotation_class(graph, &owner, node_text(attribute, source));
+        if attribute.id() == focused.id() {
+            return candidates;
+        }
+        let [next] = candidates.as_slice() else {
+            return Vec::new();
+        };
+        owner = next.clone();
+    }
+    Vec::new()
 }
 
 /// Return the exact qualifier token when a class target owns part of a
