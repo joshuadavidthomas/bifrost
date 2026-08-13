@@ -219,7 +219,7 @@ fn query_documentation_tracks_public_contracts() {
     for required in [
         "Version ``1`` is the only supported",
         "occurrence_target",
-        "reaching_binding",
+        "binding_of",
         "candidates_of",
         "candidate_target",
         "edges_of",

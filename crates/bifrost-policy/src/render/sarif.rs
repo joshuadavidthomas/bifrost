@@ -1138,7 +1138,7 @@ fn relationship_label(related: &RelatedPolicyLocation) -> &'static str {
         PolicyLocationRelationship::ExpectedOccurrence => "expected occurrence",
         PolicyLocationRelationship::SelectedCandidate => "selected candidate",
         PolicyLocationRelationship::ConsideredCandidate => "considered candidate",
-        PolicyLocationRelationship::ReachingBinding => "reaching binding",
+        PolicyLocationRelationship::BindingOf => "binding of",
         PolicyLocationRelationship::GenerationSite => "generation site",
         PolicyLocationRelationship::GeneratedDeclaration => "generated declaration",
         PolicyLocationRelationship::DeclaringScope => "declaring scope",

@@ -3,6 +3,9 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    ALIAS_SUBSTITUTION_RULE, RewriteOutcome, RewriteStep, RewriteTrace,
+};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar,
@@ -930,6 +933,27 @@ pub fn resolve_module_package(
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
+    resolve_module_package_traced(rust, importing_file, module_specifier, None)
+}
+
+/// [`resolve_module_package`], recording the import-alias chase into `trace`.
+///
+/// This is the *same* resolution: `resolve_module_package` is this function
+/// with no collector, so an instrumented run takes exactly the branches a
+/// production run takes. Every recording site is a no-op when `trace` is
+/// `None`, so an uninstrumented resolution allocates nothing for it.
+///
+/// The chase is the bounded rewrite domain `rust_import_alias` (#1480): the
+/// semantic state key is the specifier's root (the rewrite replaces only the
+/// root, so the specifier grows every hop and can never repeat), the declared
+/// bound is the binder's rewritable root count, and the terminal outcome is
+/// converged, cycle, or exceeded-budget.
+pub fn resolve_module_package_traced(
+    rust: &dyn RustSource,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    mut trace: Option<&mut RewriteTrace>,
+) -> Option<String> {
     let package = rust_package_name(importing_file);
     let crate_package = rust_crate_root_package(importing_file);
     if is_rooted_rust_module_path(module_specifier) {
@@ -953,32 +977,109 @@ pub fn resolve_module_package(
     // bounded by the binder's root count; a repeated root stops expanding
     // and the last specifier falls through to the path arithmetic.
     let mut seen_roots = HashSet::default();
+    // The visited roots in order, so a cycle can report the sequence that
+    // closes it. Only filled while tracing; an uninstrumented run leaves this
+    // an unallocated `Vec`.
+    let mut visited_order: Vec<String> = Vec::new();
+    // The binder's rewritable root count: the finite state space this chase
+    // walks, and therefore its declared bound. Computed on the first rewrite
+    // rather than up front, so a specifier that never engages the alias rule
+    // pays nothing for it.
+    let mut declared_bound: Option<usize> = None;
+    let mut steps_taken = 0usize;
     let mut current = module_specifier.to_string();
     loop {
         let root = current.split("::").next().unwrap_or(current.as_str());
         if !seen_roots.insert(root.to_string()) {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.finish(RewriteOutcome::Cycle {
+                    witness: cycle_witness(&visited_order, root),
+                });
+            }
             break;
         }
+        if trace.is_some() {
+            visited_order.push(root.to_string());
+        }
         let Some(aliased) = rust_apply_import_alias(rust, importing_file, &current) else {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.finish(RewriteOutcome::Converged {
+                    fixed_point: current.clone(),
+                });
+            }
             break;
         };
+        // Each rewrite consumes one distinct binder root, so `steps_taken`
+        // can never pass the bound while the visited set still admits a hop;
+        // this guard is the contract's explicit budget terminal rather than a
+        // reachable branch. Keeping it in the production path is deliberate:
+        // the instrumented chase and the production chase are one loop.
+        let bound = *declared_bound
+            .get_or_insert_with(|| rust.import_binder_of(importing_file).bindings.len());
+        if steps_taken >= bound {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.finish(RewriteOutcome::ExceededBudget {
+                    explored: steps_taken,
+                });
+            }
+            break;
+        }
+        steps_taken += 1;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.declare_bound(bound);
+            trace.record_step(RewriteStep {
+                state_key: root.to_string(),
+                input: current.clone(),
+                output: aliased.clone(),
+                rule: ALIAS_SUBSTITUTION_RULE,
+            });
+        }
         if let Some(package) =
             resolve_import_alias_exported_module_package(rust, importing_file, &aliased)
         {
+            finish_converged(trace, &aliased);
             return Some(package);
         }
         if is_rooted_rust_module_path(&aliased) {
+            finish_converged(trace, &aliased);
             return resolve_rust_module_path_with_crate(&package, &crate_package, &aliased);
         }
         if let Some(package) = rust
             .cargo_routes()
             .resolve_module_package(importing_file, &aliased)
         {
+            finish_converged(trace, &aliased);
             return Some(package);
         }
         current = aliased;
     }
     resolve_rust_module_path_with_crate(&package, &crate_package, &current)
+}
+
+/// The ordered state sequence that closes a cycle: the visited roots from the
+/// first occurrence of the repeated root onwards, with that root appended so
+/// the sequence's last state is the one it repeats.
+fn cycle_witness(visited_order: &[String], repeated: &str) -> Vec<String> {
+    let start = visited_order
+        .iter()
+        .position(|state| state == repeated)
+        .unwrap_or(0);
+    let mut witness: Vec<String> = visited_order[start..].to_vec();
+    witness.push(repeated.to_string());
+    witness
+}
+
+/// Record convergence on `fixed_point` when the chase is instrumented.
+///
+/// A chase that returns from inside the loop converged just as much as one
+/// that falls through: it reached a specifier the routing resolved, and no
+/// further rewrite was applied.
+fn finish_converged(trace: Option<&mut RewriteTrace>, fixed_point: &str) {
+    if let Some(trace) = trace {
+        trace.finish(RewriteOutcome::Converged {
+            fixed_point: fixed_point.to_string(),
+        });
+    }
 }
 
 fn resolve_import_alias_exported_module_package(

@@ -1,6 +1,6 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
-    CodeQueryExecutionMode, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm,
+    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm,
     RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
     binding_option_for_rql_label, candidate_option_for_rql_label,
     declaration_state_option_for_rql_label, export_field_for_rql_label,
@@ -992,7 +992,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             );
             append_step(expr, &items[items.len() - 1], step)
         }
-        RqlForm::BindingsIn | RqlForm::CandidatesOf | RqlForm::ReachingBinding => {
+        RqlForm::BindingsIn | RqlForm::CandidatesOf | RqlForm::BindingOf => {
             if items.len() < 2 {
                 return Err(lower_error(
                     expr,
@@ -1002,7 +1002,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             let kind = match form {
                 RqlForm::BindingsIn => EnvironmentFilterKind::Binding,
                 RqlForm::CandidatesOf => EnvironmentFilterKind::Candidate,
-                _ => EnvironmentFilterKind::ReachingBinding,
+                _ => EnvironmentFilterKind::BindingOf,
             };
             let mut step =
                 environment_filter_to_json(expr, head, &items[1..items.len() - 1], kind)?;
@@ -1097,6 +1097,63 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
+        RqlForm::StateEventsOf | RqlForm::FlowRelationsOf | RqlForm::RewritePathsOf => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let op = form
+                .query_step_op()
+                .expect("constrained-option wrappers declare a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
+                let option = op.option_for_rql_label(key).ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) accepts only {}", constrained_option_help(op)),
+                    )
+                })?;
+                let values = pair[1].as_sequence().ok_or_else(|| {
+                    lower_error(&pair[1], format!("({head} {key} ...) requires a vector"))
+                })?;
+                let labels = values
+                    .iter()
+                    .map(symbol_or_string)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|label| label.replace('-', "_"))
+                    .collect();
+                let field = option.field().label();
+                if step
+                    .insert(field.to_string(), array_of_strings(labels))
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
+        }
+        RqlForm::FlowSource | RqlForm::FlowTarget => {
+            expect_len(expr, items, 2, head)?;
+            let op = form
+                .query_step_op()
+                .expect("constrained-option wrappers declare a query step");
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            append_step(expr, &items[1], step)
+        }
         RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
@@ -1144,7 +1201,7 @@ enum EnvironmentFilterKind {
     Scope,
     Binding,
     Candidate,
-    ReachingBinding,
+    BindingOf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1261,7 +1318,7 @@ impl EnvironmentFilterKind {
             Self::Scope => ":kind",
             Self::Binding => ":kind, :name, and :hoisting",
             Self::Candidate => ":tier, :outcome, and :boundary",
-            Self::ReachingBinding => ":include-shadowed",
+            Self::BindingOf => ":include-shadowed",
         }
     }
 }
@@ -1298,8 +1355,8 @@ fn environment_filter_to_json(
             )
         };
         match kind {
-            EnvironmentFilterKind::ReachingBinding => {
-                let option = REACHING_BINDING_STEP_OPTIONS
+            EnvironmentFilterKind::BindingOf => {
+                let option = BINDING_OF_STEP_OPTIONS
                     .iter()
                     .copied()
                     .find(|option| option.accepts_rql_label(key))
@@ -1539,7 +1596,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingsIn
-        | RqlForm::ReachingBinding
+        | RqlForm::BindingOf
         | RqlForm::BindingOccurrence
         | RqlForm::CandidatesOf
         | RqlForm::CandidateHierarchy
@@ -1558,7 +1615,12 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ExportTarget
         | RqlForm::EdgesOf
         | RqlForm::EdgesFrom
-        | RqlForm::EdgeTarget => unreachable!("wrapper filtered above"),
+        | RqlForm::EdgeTarget
+        | RqlForm::StateEventsOf
+        | RqlForm::FlowRelationsOf
+        | RqlForm::FlowSource
+        | RqlForm::FlowTarget
+        | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
             unreachable!("wrapper filtered above")
         }
@@ -1834,6 +1896,17 @@ fn number_value(expr: &Expr, context: &str) -> LowerResult<Value> {
 
 fn array_of_strings(values: Vec<String>) -> Value {
     Value::Array(values.into_iter().map(Value::String).collect())
+}
+
+/// The option spellings one constrained-option wrapper accepts, for the error
+/// message an author sees. Read from the registry, so a new option cannot be
+/// missing from the help text.
+fn constrained_option_help(op: QueryStepOp) -> String {
+    op.options()
+        .iter()
+        .flat_map(|option| option.rql_labels().iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn head_symbol(items: &[Expr]) -> LowerResult<Option<&str>> {

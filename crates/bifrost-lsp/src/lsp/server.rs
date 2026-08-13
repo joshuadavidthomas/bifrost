@@ -1425,6 +1425,9 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ReferenceEdge { value } => &value.path,
                     CodeQueryResultValue::QualifiedPath { value } => &value.path,
                     CodeQueryResultValue::PathSegment { value } => &value.path,
+                    CodeQueryResultValue::StateEvent { value } => &value.path,
+                    CodeQueryResultValue::FlowRelation { value } => &value.path,
+                    CodeQueryResultValue::RewritePath { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),

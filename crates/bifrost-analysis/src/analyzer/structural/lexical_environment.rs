@@ -20,7 +20,7 @@
 //!   digest rather than on a range or a spelling.
 //! - Nothing is guessed. An adapter that cannot state an interval makes the
 //!   file's `BindingIntervals` axis incomplete, and
-//!   [`reaching_binding`] then refuses to answer instead of returning a
+//!   [`binding_of`] then refuses to answer instead of returning a
 //!   plausible winner.
 //!
 //! Rows are derived per request and never persisted; the facts snapshot
@@ -298,7 +298,7 @@ impl EnvironmentFileResult {
 
 /// Which binding of a name is in effect at a position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReachingBindingOutcome {
+pub enum BindingOfOutcome {
     /// Exactly one binding of the name is in effect. The payload indexes
     /// [`EnvironmentFileResult::bindings`].
     Reached(usize),
@@ -644,7 +644,7 @@ fn import_binder_rows(
 /// A wildcard introduces an unspecified set of names, so there is no single
 /// name it binds. The row still exists, because its target and its ambiguity
 /// are evidence the resolution trace needs, but it never matches a name:
-/// [`reaching_binding`] skips wildcard rows rather than letting this marker
+/// [`binding_of`] skips wildcard rows rather than letting this marker
 /// behave like an identifier.
 pub const WILDCARD_IMPORT_NAME: &str = "*";
 
@@ -834,20 +834,20 @@ fn language_spells_its_package(language: Language) -> bool {
 /// 4. The winner is the one declared in the nearest scope; ties inside one
 ///    scope go to the latest activation start, which is what makes a
 ///    re-binding of the same name win over its predecessor below it.
-pub fn reaching_binding(
+pub fn binding_of(
     env: &EnvironmentFileResult,
     name: &str,
     position_byte: usize,
     namespace: Option<Namespace>,
-) -> ReachingBindingOutcome {
+) -> BindingOfOutcome {
     if !env.completeness.covers(EnvironmentAxis::Scopes) {
-        return ReachingBindingOutcome::Incomplete(EnvironmentAxis::Scopes);
+        return BindingOfOutcome::Incomplete(EnvironmentAxis::Scopes);
     }
     if !env.completeness.covers(EnvironmentAxis::BindingIntervals) {
-        return ReachingBindingOutcome::Incomplete(EnvironmentAxis::BindingIntervals);
+        return BindingOfOutcome::Incomplete(EnvironmentAxis::BindingIntervals);
     }
     let Some(innermost) = env.innermost_scope(position_byte) else {
-        return ReachingBindingOutcome::NoBinding;
+        return BindingOfOutcome::NoBinding;
     };
     let ancestry = env.scope_ancestry(innermost);
 
@@ -868,7 +868,7 @@ pub fn reaching_binding(
         .map(|(index, _)| index)
         .collect();
     if candidates.is_empty() {
-        return ReachingBindingOutcome::NoBinding;
+        return BindingOfOutcome::NoBinding;
     }
     // Nearest scope first, then latest activation, then latest binder.
     candidates.sort_by_key(|&index| {
@@ -885,9 +885,9 @@ pub fn reaching_binding(
     });
     let winner = candidates[0];
     if candidates.len() == 1 {
-        ReachingBindingOutcome::Reached(winner)
+        BindingOfOutcome::Reached(winner)
     } else {
-        ReachingBindingOutcome::Shadowed {
+        BindingOfOutcome::Shadowed {
             winner,
             shadowed: candidates[1..].to_vec(),
         }
@@ -962,9 +962,9 @@ mod tests {
         name: &str,
         position: usize,
     ) -> &'env BindingRow {
-        match reaching_binding(env, name, position, None) {
-            ReachingBindingOutcome::Reached(index) => &env.bindings[index],
-            ReachingBindingOutcome::Shadowed { winner, .. } => &env.bindings[winner],
+        match binding_of(env, name, position, None) {
+            BindingOfOutcome::Reached(index) => &env.bindings[index],
+            BindingOfOutcome::Shadowed { winner, .. } => &env.bindings[winner],
             other => panic!(
                 "expected {name:?} to reach a binding at byte {position}, got {other:?}; \
                  bindings: {:?}",
@@ -1019,7 +1019,7 @@ mod tests {
 
     /// A Java parameter list sits outside the body block's byte range, so the
     /// scope that owns a parameter is the callable, not the block. The
-    /// reaching-binding walk climbs the ancestry, which is what makes the
+    /// binding-of walk climbs the ancestry, which is what makes the
     /// parameter reachable from inside the body regardless.
     #[test]
     fn java_parameters_belong_to_the_callable_and_reach_into_its_body() {
@@ -1105,8 +1105,8 @@ mod tests {
             second,
             "the read below the re-binding reaches the second"
         );
-        match reaching_binding(&env, "value", below, None) {
-            ReachingBindingOutcome::Shadowed { winner, shadowed } => {
+        match binding_of(&env, "value", below, None) {
+            BindingOfOutcome::Shadowed { winner, shadowed } => {
                 assert_eq!(env.bindings[winner].range.start_byte, second);
                 assert_eq!(
                     shadowed
@@ -1150,8 +1150,8 @@ mod tests {
             handle.node
         );
         assert_eq!(
-            reaching_binding(&env, "handle", fixture.at("after()"), None),
-            ReachingBindingOutcome::NoBinding,
+            binding_of(&env, "handle", fixture.at("after()"), None),
+            BindingOfOutcome::NoBinding,
             "the resource is out of effect below the try block"
         );
     }
@@ -1173,8 +1173,8 @@ mod tests {
         let env = fixture.environment();
 
         assert_eq!(
-            reaching_binding(&env, "later", fixture.at("later;\n        int later"), None),
-            ReachingBindingOutcome::NoBinding
+            binding_of(&env, "later", fixture.at("later;\n        int later"), None),
+            BindingOfOutcome::NoBinding
         );
         assert_eq!(
             reached(&env, "later", fixture.at("later;\n    }"))
@@ -1229,8 +1229,8 @@ mod tests {
             item.node
         );
         assert_eq!(
-            reaching_binding(&env, "item", fixture.at("doubled\n"), None),
-            ReachingBindingOutcome::NoBinding,
+            binding_of(&env, "item", fixture.at("doubled\n"), None),
+            BindingOfOutcome::NoBinding,
             "the comprehension target does not leak into the function body"
         );
 
@@ -1361,8 +1361,8 @@ mod tests {
             env.bindings
         );
         assert_eq!(
-            reaching_binding(&env, WILDCARD_IMPORT_NAME, fixture.at("class Widget"), None),
-            ReachingBindingOutcome::NoBinding,
+            binding_of(&env, WILDCARD_IMPORT_NAME, fixture.at("class Widget"), None),
+            BindingOfOutcome::NoBinding,
             "a wildcard row is evidence, never a name that reaches"
         );
     }
@@ -1441,8 +1441,8 @@ mod tests {
             assert!(!env.completeness.covers(axis), "{axis} claimed covered");
         }
         assert_eq!(
-            reaching_binding(&env, "label", 40, None),
-            ReachingBindingOutcome::Incomplete(EnvironmentAxis::Scopes),
+            binding_of(&env, "label", 40, None),
+            BindingOfOutcome::Incomplete(EnvironmentAxis::Scopes),
             "an uncovered environment refuses to answer instead of guessing"
         );
     }

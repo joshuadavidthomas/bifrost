@@ -586,6 +586,26 @@ pub(super) fn selected_site_quality(
                 proof_from_label(value.proof),
                 EvidenceCompleteness::Complete,
             ),
+            // A flow-state row is exactly what the derivation computed; its
+            // per-axis account is the row's own `completeness` field, so a
+            // partial derivation makes the selector's evidence partial rather
+            // than silently complete (#1480).
+            CodeQueryResultValue::StateEvent { value } => (
+                ProofStatus::Proven,
+                flow_state_completeness(value.completeness, &value.uncovered_axes),
+            ),
+            CodeQueryResultValue::FlowRelation { value } => (
+                ProofStatus::Proven,
+                flow_state_completeness(value.completeness, &value.uncovered_axes),
+            ),
+            // A rewrite-path row states its own per-domain completeness the
+            // same way, so a derivation that could not run makes the
+            // selector's evidence partial rather than silently complete
+            // (#1480).
+            CodeQueryResultValue::RewritePath { value } => (
+                ProofStatus::Proven,
+                rewrite_path_completeness(value.completeness, &value.uncovered_domains),
+            ),
             CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::FlowEndpoint { .. }
             | CodeQueryResultValue::FlowWitness { .. } => (
@@ -759,6 +779,46 @@ fn semantic_binding_quality(
         }
     };
     (proof, completeness)
+}
+
+/// The evidence completeness one flow-state row carries (#1480).
+///
+/// `partial` is never silently upgraded: the uncovered axes travel into the
+/// reason string so a policy reader sees which part of the derivation is
+/// missing rather than a bare "incomplete".
+fn flow_state_completeness(
+    completeness: &str,
+    uncovered_axes: &[&'static str],
+) -> EvidenceCompleteness {
+    if completeness == "complete" {
+        EvidenceCompleteness::Complete
+    } else {
+        EvidenceCompleteness::Partial(
+            format!(
+                "flow-state derivation does not cover [{}]",
+                uncovered_axes.join(", ")
+            )
+            .into(),
+        )
+    }
+}
+
+/// The evidence completeness one rewrite-path row carries (#1480).
+fn rewrite_path_completeness(
+    completeness: &str,
+    uncovered_domains: &[&'static str],
+) -> EvidenceCompleteness {
+    if completeness == "complete" {
+        EvidenceCompleteness::Complete
+    } else {
+        EvidenceCompleteness::Partial(
+            format!(
+                "rewrite-path derivation does not cover [{}]",
+                uncovered_domains.join(", ")
+            )
+            .into(),
+        )
+    }
 }
 
 fn proof_from_label(label: &str) -> ProofStatus {

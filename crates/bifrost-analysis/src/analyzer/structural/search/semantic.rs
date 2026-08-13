@@ -1209,6 +1209,12 @@ impl CfgQueryAdapter<'_, '_> {
 }
 
 impl SemanticProcedureValue {
+    /// The procedure's public wire identity, so a derived row family can name
+    /// the same procedure a `procedure` row does.
+    pub(super) fn wire_id(&self) -> String {
+        procedure_wire_id(&self.handle)
+    }
+
     pub(super) fn public(&self) -> CodeQueryProcedure {
         let procedure = self.handle.semantics();
         let mapping = procedure_source_mapping(&self.handle);

@@ -437,6 +437,18 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryReferenceEdge>,
     },
+    StateEvent {
+        #[serde(flatten)]
+        value: Box<CodeQueryStateEvent>,
+    },
+    FlowRelation {
+        #[serde(flatten)]
+        value: Box<CodeQueryFlowRelation>,
+    },
+    RewritePath {
+        #[serde(flatten)]
+        value: Box<CodeQueryRewritePath>,
+    },
     QualifiedPath {
         #[serde(flatten)]
         value: Box<CodeQueryQualifiedPath>,

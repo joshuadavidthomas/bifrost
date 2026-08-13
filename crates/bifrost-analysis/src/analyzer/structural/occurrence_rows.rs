@@ -20,7 +20,7 @@
 use super::facts::FileFacts;
 use super::kinds::NormalizedKind;
 use super::lexical_environment::{
-    EnvironmentFileResult, ReachingBindingOutcome, environment_for_file, reaching_binding,
+    BindingOfOutcome, EnvironmentFileResult, binding_of, environment_for_file,
 };
 use super::occurrences::{
     ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole, OccurrenceRoleSupport,
@@ -463,7 +463,7 @@ fn resolve_reference_targets(
 /// Add the bindings the lexical environment says are shadowed at this position.
 ///
 /// The resolver's own lexical fast path stops at the nearest binder and never
-/// enumerates the ones it passed, so the losers come from the reaching-binding
+/// enumerates the ones it passed, so the losers come from the binding-of
 /// algorithm instead -- the same derivation, asked for the whole answer rather
 /// than the winner. This is a producer consulting a producer, not the trace
 /// re-deciding anything: the winner it reports must be the binder the resolver
@@ -476,7 +476,7 @@ fn append_shadowed_bindings(
     let OccurrenceTarget::Lexical(selected) = &row.target else {
         return;
     };
-    let ReachingBindingOutcome::Shadowed { winner, shadowed } = reaching_binding(
+    let BindingOfOutcome::Shadowed { winner, shadowed } = binding_of(
         environment,
         row.effective_spelling(),
         row.range.start_byte,

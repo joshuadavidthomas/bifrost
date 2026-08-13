@@ -22,7 +22,7 @@ use std::fmt;
 labelled_enum! {
     /// When a binding starts being in effect, relative to where it is written.
     ///
-    /// This is the one input the general reaching-binding algorithm needs from a
+    /// This is the one input the general binding-of algorithm needs from a
     /// language: everything else (name equality, scope ancestry, nearest scope
     /// wins) is language-neutral.
     ///
@@ -262,10 +262,10 @@ labelled_enum! {
 /// it introduces, when that binding starts being in effect, and the exact byte
 /// interval over which it is in effect.
 ///
-/// This is the whole per-language input to the reaching-binding algorithm. The
+/// This is the whole per-language input to the binding-of algorithm. The
 /// algorithm itself (name equality, scope ancestry, nearest scope wins,
 /// rebinding order) is language-neutral and lives in the derivation layer, so
-/// an adapter that can answer this one question gets correct reaching bindings
+/// an adapter that can answer this one question gets correct binding-of answers
 /// without contributing any resolution logic.
 ///
 /// The kind travels with the interval rather than being classified by the

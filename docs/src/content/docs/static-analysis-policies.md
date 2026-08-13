@@ -240,7 +240,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
+| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
 
 ### Taint: broad libraries, specific findings
 
@@ -373,7 +373,7 @@ as the named one. `:forbid-tier TIER` removes one tier from the accepted range,
 and `:require-unique true` makes ambiguity a violation rather than a silent
 pick. A combination no tier can satisfy is rejected when the document loads.
 
-`(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside
+`(assert-binding-scope :id ID :at CAPTURE :role ROLE :declared inside|outside
 :relative-to CAPTURE2)` requires the binding actually in effect at the captured
 reference to be declared inside, or outside, a second captured node. This is the
 loop-invariance predicate: capture a loop and the receiver of a call inside it,
@@ -514,7 +514,7 @@ excluded.
 
 #### A worked loop-invariance rule
 
-The rule below is the reason `assert-reaching` exists. A structural rule that
+The rule below is the reason `assert-binding-scope` exists. A structural rule that
 only asks "is this call written inside a loop" cannot tell a collection built
 inside the loop and canonicalized once from a collection built before the loop
 and re-sorted on every pass; the second is the waste worth reporting and the
@@ -542,7 +542,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
 ; was itself created inside the loop, so the work is inherent to the iteration.
 ; The condition those rules actually want is loop *invariance* of the operand:
 ; the same value, created once, re-sorted on every pass. That is a
-; reaching-binding question, and this rule asks it -- the requirement is that
+; binding-of question, and this rule asks it -- the requirement is that
 ; the sorted receiver be declared inside the loop, so the violation is the half
 ; declared outside it.
 ;
@@ -586,7 +586,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
               (inside (loop :capture "region")
                       (call :callee (name "sort") :receiver (identifier :capture "target"))))))
       :asserts [
-        (assert-reaching :id declared-inside :at "target" :role receiver_position
+        (assert-binding-scope :id declared-inside :at "target" :role receiver_position
                          :declared inside :relative-to "region")
       ]))
 ```

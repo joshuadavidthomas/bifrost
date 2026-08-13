@@ -104,6 +104,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // The crate root's public re-export surface, the same class as `analyzer/mod.rs`
     // one level down.
     ("lib.rs", "crate-root re-export surface"),
+    // The bounded rewrite-domain derivation (#1480). A rewrite domain is a *declared*
+    // finite state space with a named production chase: the only domain declared today
+    // is `rust_import_alias`, whose chase lives in `brokk-bifrost-rust`. Naming the
+    // Rust analyzer here is the domain's own definition, not framework dispatch --
+    // a capability method would have exactly one implementor and would hide which
+    // language the domain claims. A second domain becomes a second arm that names its
+    // own analyzer, and that is when a capability starts carrying information.
+    (
+        "analyzer/structural/rewrite_paths.rs",
+        "per-domain derivation naming each declared domain's own production chase (#1480)",
+    ),
     // The per-language definition-resolution hub: an eleven-arm dispatch into its own
     // `<lang>` submodules plus the navigation and diagnostic helpers each contributes.
     // Census section 6 documents it for the extraction plan rather than milestone 1;

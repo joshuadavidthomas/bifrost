@@ -269,12 +269,12 @@ pub(super) struct BindingValue {
     pub(super) file: ProjectFile,
     pub(super) result: Arc<EnvironmentFileResult>,
     pub(super) index: usize,
-    /// `true` when the row was emitted as a binding the reaching binding
+    /// `true` when the row was emitted as a binding the binding-of answer
     /// shadows. A shadowed row is a distinct answer from the same binding
     /// reached in its own right, so it keys separately.
     pub(super) shadowed: bool,
-    /// The AST identity of the occurrence whose reaching binding this row is,
-    /// present exactly on rows the `reaching-binding` step produced. It is part
+    /// The AST identity of the occurrence whose binding-of answer this row is,
+    /// present exactly on rows the `binding-of` step produced. It is part
     /// of the dedup key because one binding reached from two occurrences is two
     /// answers, and a consumer that captured one of those tokens must be able
     /// to tell them apart.

@@ -100,7 +100,11 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::Export(_)
                     | PipelineValue::DeclarationState(_)
                     | PipelineValue::ReferenceEdge(_) => None,
-                    PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
+                    PipelineValue::StateEvent(_)
+                    | PipelineValue::FlowRelation(_)
+                    | PipelineValue::RewritePath(_)
+                    | PipelineValue::QualifiedPath(_)
+                    | PipelineValue::PathSegment(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -168,6 +172,9 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::Export(_)
                                 | PipelineValue::DeclarationState(_)
                                 | PipelineValue::ReferenceEdge(_)
+                                | PipelineValue::StateEvent(_)
+                                | PipelineValue::FlowRelation(_)
+                                | PipelineValue::RewritePath(_)
                                 | PipelineValue::QualifiedPath(_)
                                 | PipelineValue::PathSegment(_) => None,
                             })
@@ -244,7 +251,11 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::Export(_)
                         | PipelineValue::DeclarationState(_)
                         | PipelineValue::ReferenceEdge(_) => None,
-                        PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
+                        PipelineValue::StateEvent(_)
+                        | PipelineValue::FlowRelation(_)
+                        | PipelineValue::RewritePath(_)
+                        | PipelineValue::QualifiedPath(_)
+                        | PipelineValue::PathSegment(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -352,6 +363,8 @@ pub(super) fn apply_plan_step(
         &mut state.environment_cache,
         &mut state.materialization_cache,
         &mut state.edge_cache,
+        &mut state.flow_state_cache,
+        &mut state.rewrite_path_cache,
         &mut state.path_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
@@ -847,6 +860,8 @@ pub(super) fn apply_pipeline_step(
     environment_cache: &mut EnvironmentTraversalCache,
     materialization_cache: &mut materialization::MaterializationTraversalCache,
     edge_cache: &mut EdgeTraversalCache,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    rewrite_path_cache: &mut RewritePathTraversalCache,
     path_cache: &mut PathTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
@@ -1972,8 +1987,8 @@ pub(super) fn apply_pipeline_step(
                     })
                     .collect()
             }
-            (PipelineValue::Occurrence(value), QueryStep::ReachingBinding(options)) => {
-                reaching_binding_expansions(
+            (PipelineValue::Occurrence(value), QueryStep::BindingOf(options)) => {
+                binding_of_expansions(
                     analyzer,
                     environment_cache,
                     &value.row,
@@ -2075,6 +2090,72 @@ pub(super) fn apply_pipeline_step(
                     diagnostics,
                     &mut row_exhausted,
                 )
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::StateEventsOf(filter),
+            ) => state_event_expansions(
+                workspace.expect("flow-state steps require a semantic workspace"),
+                flow_state_cache,
+                procedure,
+                filter,
+                cancellation,
+                diagnostics,
+            ),
+            (PipelineValue::Declaration(declaration), QueryStep::StateEventsOf(filter)) => {
+                let procedures = semantic
+                    .as_mut()
+                    .expect("CFG query service exists for semantic steps")
+                    .cfg()
+                    .procedure_of_declaration(declaration);
+                let workspace = workspace.expect("flow-state steps require a semantic workspace");
+                procedures
+                    .iter()
+                    .flat_map(|procedure| {
+                        state_event_expansions(
+                            workspace,
+                            flow_state_cache,
+                            procedure,
+                            filter,
+                            cancellation,
+                            diagnostics,
+                        )
+                    })
+                    .collect()
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::FlowRelationsOf(filter),
+            ) => flow_relation_expansions(
+                workspace.expect("flow-state steps require a semantic workspace"),
+                flow_state_cache,
+                procedure,
+                filter,
+                cancellation,
+                diagnostics,
+            ),
+            (PipelineValue::StateEvent(value), QueryStep::FlowRelationsOf(filter)) => {
+                flow_relations_of_event(value, filter)
+            }
+            (PipelineValue::File(file), QueryStep::RewritePathsOf(filter)) => {
+                rewrite_path_expansions(
+                    analyzer,
+                    rewrite_path_cache,
+                    file,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                )
+            }
+            (PipelineValue::FlowRelation(value), QueryStep::FlowSource) => {
+                vec![pipeline_expansion(PipelineValue::StateEvent(Box::new(
+                    value.endpoint(false),
+                )))]
+            }
+            (PipelineValue::FlowRelation(value), QueryStep::FlowTarget) => {
+                vec![pipeline_expansion(PipelineValue::StateEvent(Box::new(
+                    value.endpoint(true),
+                )))]
             }
             (PipelineValue::ReferenceEdge(value), QueryStep::EdgeTarget) => {
                 vec![pipeline_expansion(PipelineValue::Declaration(

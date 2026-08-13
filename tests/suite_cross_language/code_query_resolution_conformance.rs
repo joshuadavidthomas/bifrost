@@ -141,7 +141,7 @@ const READ_BEFORE_DECLARATION: &str = "class Order {\n    int run() {\n        i
 
 /// The two halves are the same four tokens in a different order. A Java local
 /// is in effect only after its declarator, so the read below the declaration
-/// has a reaching binding and the read above it has none -- and "none" is a
+/// has a binding-of answer and the read above it has none -- and "none" is a
 /// complete answer, not a gap.
 #[test]
 fn a_local_read_reaches_its_binder_only_after_the_declaration() {
@@ -151,7 +151,7 @@ fn a_local_read_reaches_its_binder_only_after_the_declaration() {
         // reference role, including ones Java's adapter declares unsupported,
         // and an unrelated gap would then decide this verdict.
         "occurrences": { "role": ["value_reference"] },
-        "steps": [{ "op": "reaching_binding" }]
+        "steps": [{ "op": "binding_of" }]
     });
 
     let after = complete(&[("app/Order.java", READ_AFTER_DECLARATION)], query.clone());
@@ -189,11 +189,11 @@ const RUST_INNER_NAMESAKE: &str = "fn render() -> usize {\n    let value = 1;\n 
 /// binding is the only thing that can differ -- which is exactly the predicate
 /// the loop-invariance rule is built on.
 #[test]
-fn a_namesake_in_a_nested_block_moves_the_reaching_binding_into_that_block() {
+fn a_namesake_in_a_nested_block_moves_the_binding_of_into_that_block() {
     let query = json!({
         "languages": ["rust"],
         "occurrences": { "role": ["value_reference"] },
-        "steps": [{ "op": "reaching_binding" }, { "op": "scope_of" }]
+        "steps": [{ "op": "binding_of" }, { "op": "scope_of" }]
     });
 
     let outer = complete(&[("src/render.rs", RUST_OUTER_NAMESAKE)], query.clone());
@@ -221,7 +221,7 @@ fn a_namesake_in_a_nested_block_moves_the_reaching_binding_into_that_block() {
         json!({
             "languages": ["rust"],
             "occurrences": { "role": ["value_reference"] },
-            "steps": [{ "op": "reaching_binding", "include_shadowed": true }]
+            "steps": [{ "op": "binding_of", "include_shadowed": true }]
         }),
     );
     assert!(
@@ -257,7 +257,7 @@ fn a_type_operand_never_reaches_the_value_binding_that_shares_its_spelling() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["type_operand"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     assert!(
@@ -270,7 +270,7 @@ fn a_type_operand_never_reaches_the_value_binding_that_shares_its_spelling() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["receiver_position"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     assert_eq!(
@@ -291,7 +291,7 @@ fn a_type_operand_never_reaches_the_value_binding_that_shares_its_spelling() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["receiver_position"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     assert!(
@@ -606,7 +606,7 @@ fn a_call_inside_a_closure_inside_a_loop_is_a_lexical_positive_by_construction()
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["value_reference", "receiver_position"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     let rows_binding = rows(&reached)

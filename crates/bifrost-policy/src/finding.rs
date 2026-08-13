@@ -1489,7 +1489,7 @@ pub enum PolicyLocationRelationship {
     /// One further candidate the resolver considered for that reference.
     ConsideredCandidate,
     /// The binding in effect at the asserted reference.
-    ReachingBinding,
+    BindingOf,
     /// The lexical scope that binding is declared in.
     DeclaringScope,
     /// The generation site a generation assert fired on (#1476).

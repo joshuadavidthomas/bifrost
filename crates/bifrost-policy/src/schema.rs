@@ -226,7 +226,7 @@ policy_records! {
     RowAssertSelectedInWinningTier { labels: ["assert-selected-in-winning-tier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME [:cardinality (exactly|at-least|at-most N)])", description: "Require the selected candidate of every overload-selection row to sit in the winning applicability tier, meaning the set of candidates the resolver's own applicability check accepted. Authoring sugar: it lowers to one inner join on site_ast_id, one group keyed on the site, one counting aggregate over selected applicable candidates, and one cardinality assertion, and adds no evaluation rule of its own." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
-    AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
+    AssertBindingScope { labels: ["assert-binding-scope"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-binding-scope :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the binding of one captured reference to be declared inside or outside a second captured node." }
     AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
     AssertGeneration { labels: ["assert-generation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-generation :id ID :at CAPTURE [:kind KIND] [:cardinality (exactly N)] [:forbid-dynamic true|false])", description: "Require one captured generation site to materialize an exact generated set, optionally forbidding dynamic inputs." }
     AssertDeclarationState { labels: ["assert-declaration-state"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-declaration-state :id ID :at CAPTURE [:origin ORIGIN] [:declaration-only true|false] [:config-gated true|false])", description: "Require one captured declaration's state row to carry an expected origin, declaration-only flag, or configuration gate." }
@@ -235,6 +235,8 @@ policy_records! {
     AssertCanonical { labels: ["assert-canonical"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-canonical :id ID :at CAPTURE :role ROLE :equals CAPTURE :equals-role ROLE [:distinct true|false])", description: "Require two captured tokens' resolved declarations to share, or not share, one canonical identity." }
     AssertRoute { labels: ["assert-route"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-route :id ID :at CAPTURE :role ROLE :to CAPTURE :to-role ROLE [:via HOP] [:forbid HOP])", description: "Require an identity route from the captured site to a second capture's declaration, optionally via or never via one hop kind." }
     AssertRoundTrip { labels: ["assert-round-trip"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-round-trip :id ID :at CAPTURE :role ROLE)", description: "Require forward resolution and inverse enumeration to round-trip the captured site." }
+    AssertFlowEstablishment { labels: ["assert-flow-establishment"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-flow-establishment :id ID :at CAPTURE :role ROLE [:require dominated|reached] [:forbid-same-evaluation true|false])", description: "Require control flow to have established the captured subject before the read: some path carries an establishment to it (:require reached, the default), or every entry-to-read path passes one (:require dominated). Optionally forbid an establishment from serving a read of its own evaluation." }
+    AssertRewriteTermination { labels: ["assert-rewrite-termination"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-rewrite-termination :id ID :domain DOMAIN [:scope CAPTURE])", description: "Require every bounded rewrite chase of one declared finite domain to converge within the bound the domain declares for itself. A repeated semantic state is a finding with its ordered witness; an exhausted budget is absence of evidence and makes the run inconclusive." }
     CardinalityExactly { labels: ["exactly"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(exactly N)", description: "Require exactly N joined occurrence rows." }
     CardinalityAtLeast { labels: ["at-least"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-least N)", description: "Require at least N joined occurrence rows." }
     CardinalityAtMost { labels: ["at-most"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-most N)", description: "Require at most N joined occurrence rows." }
@@ -484,6 +486,8 @@ macro_rules! value_shapes {
                     Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
                     Self::UsageSurface => Some(AtomDomain::UsageSurface),
                     Self::EdgeClassAxis => Some(AtomDomain::EdgeClassAxis),
+                    Self::EstablishmentRequirement => Some(AtomDomain::EstablishmentRequirement),
+                    Self::RewriteDomain => Some(AtomDomain::RewriteDomain),
                     Self::RouteHop => Some(AtomDomain::RouteHop),
                     Self::RowExpansionStep => Some(AtomDomain::RowExpansionStep),
                     Self::RowJoinKind => Some(AtomDomain::RowJoinKind),
@@ -672,7 +676,7 @@ macro_rules! value_shapes {
                     Self::AssertEntries => &[
                         PolicyRecord::Assert,
                         PolicyRecord::AssertResolution,
-                        PolicyRecord::AssertReaching,
+                        PolicyRecord::AssertBindingScope,
                         PolicyRecord::AssertBoundary,
                         PolicyRecord::AssertGeneration,
                         PolicyRecord::AssertDeclarationState,
@@ -681,6 +685,8 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertCanonical,
                         PolicyRecord::AssertRoute,
                         PolicyRecord::AssertRoundTrip,
+                        PolicyRecord::AssertFlowEstablishment,
+                        PolicyRecord::AssertRewriteTermination,
                     ],
                     Self::AssertionPlanEntries => &[
                         PolicyRecord::Bind,
@@ -706,6 +712,8 @@ macro_rules! value_shapes {
                     | Self::BoundaryStrength
                     | Self::UsageSurface
                     | Self::EdgeClassAxis
+                    | Self::EstablishmentRequirement
+                    | Self::RewriteDomain
                     | Self::EdgeClassValues
                     | Self::RouteHop
                     | Self::Boolean
@@ -805,6 +813,8 @@ value_shapes! {
     BoundaryStrength => "external_declared_unindexed or external_unknown",
     UsageSurface => "external-usages or lsp-references",
     EdgeClassAxis => "relation, usage, site-class, or kind",
+    EstablishmentRequirement => "dominated or reached",
+    RewriteDomain => "one bounded rewrite domain from the analyzer registry",
     EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
     AssertionPlanEntries => "bind, join, group, relational assert, and assert-selected-in-winning-tier records",
@@ -1267,11 +1277,11 @@ policy_fields! {
     RoundTripAssertId { record: AssertRoundTrip, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
     RoundTripAssertAt { record: AssertRoundTrip, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose site is round-tripped." }
     RoundTripAssertRole { record: AssertRoundTrip, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the subject token's occurrence role; capability reporting narrows to exactly this role." }
-    ReachingAssertId { record: AssertReaching, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
-    ReachingAssertAt { record: AssertReaching, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reaching binding is asserted about." }
-    ReachingAssertRole { record: AssertReaching, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being reached from; capability reporting narrows to exactly this role." }
-    ReachingDeclared { record: AssertReaching, labels: ["declared"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DeclaredContainment, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":declared inside|outside", description: "Require the binding's declaring scope to be contained, or not contained, in the related capture." }
-    ReachingRelativeTo { record: AssertReaching, labels: ["relative-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":relative-to CAPTURE", description: "Name the second subject capture whose node interval the declaring scope is compared against." }
+    BindingScopeAssertId { record: AssertBindingScope, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    BindingScopeAssertAt { record: AssertBindingScope, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose binding-of answer is asserted about." }
+    BindingScopeAssertRole { record: AssertBindingScope, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being reached from; capability reporting narrows to exactly this role." }
+    BindingScopeDeclared { record: AssertBindingScope, labels: ["declared"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DeclaredContainment, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":declared inside|outside", description: "Require the binding's declaring scope to be contained, or not contained, in the related capture." }
+    BindingScopeRelativeTo { record: AssertBindingScope, labels: ["relative-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":relative-to CAPTURE", description: "Name the second subject capture whose node interval the declaring scope is compared against." }
     BoundaryAssertId { record: AssertBoundary, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
     BoundaryAssertAt { record: AssertBoundary, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reference the candidate rows are joined to." }
     BoundaryAssertRole { record: AssertBoundary, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being resolved; capability reporting narrows to exactly this role." }
@@ -1297,6 +1307,14 @@ policy_fields! {
     EdgeClassRequire { record: AssertEdgeClass, labels: ["require"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EdgeClassValues, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require [value ...]", description: "Every edge's value on the axis must be one of these labels." }
     EdgeClassForbid { record: AssertEdgeClass, labels: ["forbid"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EdgeClassValues, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid [value ...]", description: "No edge's value on the axis may be one of these labels." }
     EdgeClassSurface { record: AssertEdgeClass, labels: ["surface"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: UsageSurface, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":surface external-usages|lsp-references", description: "Classify only edges of one usage surface; omission classifies the complete row set." }
+    FlowEstablishmentId { record: AssertFlowEstablishment, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    FlowEstablishmentAt { record: AssertFlowEstablishment, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture; it must capture the identifier token whose read is asserted about." }
+    FlowEstablishmentRole { record: AssertFlowEstablishment, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the occurrence role the read is spelled at; capability reporting narrows to exactly this role." }
+    FlowEstablishmentRequire { record: AssertFlowEstablishment, labels: ["require"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EstablishmentRequirement, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require dominated|reached", description: "Require an establishment on some path (reached, the default) or on every entry-to-read path (dominated)." }
+    FlowEstablishmentForbidSameEvaluation { record: AssertFlowEstablishment, labels: ["forbid-same-evaluation"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-same-evaluation true|false", description: "Additionally forbid an establishment from serving a read inside its own evaluation." }
+    RewriteTerminationId { record: AssertRewriteTermination, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    RewriteTerminationDomain { record: AssertRewriteTermination, labels: ["domain"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RewriteDomain, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":domain DOMAIN", description: "Name the declared finite rewrite domain whose chases must converge." }
+    RewriteTerminationScope { record: AssertRewriteTermination, labels: ["scope"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":scope CAPTURE", description: "Narrow the file set to the files whose subject rows bind this capture; omission states the domain terminates on every analyzed file." }
     CardinalityExactlyValue { record: CardinalityExactly, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the exact required row count." }
     CardinalityAtLeastValue { record: CardinalityAtLeast, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive lower bound on the row count." }
     CardinalityAtMostValue { record: CardinalityAtMost, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: "N", description: "Provide the inclusive upper bound on the row count." }
@@ -1393,6 +1411,8 @@ pub enum AtomDomain {
     BoundaryStrength,
     UsageSurface,
     EdgeClassAxis,
+    EstablishmentRequirement,
+    RewriteDomain,
     RouteHop,
     Boolean,
     RowExpansionStep,
@@ -1563,6 +1583,9 @@ atom_values! {
     EdgeAxisSiteClass { domain: EdgeClassAxis, spellings: ["site-class", "site_class"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain whether the site is a use site or a declaration site." }
     EdgeAxisKind { domain: EdgeClassAxis, spellings: ["kind"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Constrain the structured source-reference kind of the edge." }
     BoundaryUnknown { domain: BoundaryStrength, spellings: ["external_unknown"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached ground nothing is known about." }
+    RequireReached { domain: EstablishmentRequirement, spellings: ["reached"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Some control-flow path carries an establishment to the read." }
+    RequireDominated { domain: EstablishmentRequirement, spellings: ["dominated"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Every entry-to-read path passes an establishment." }
+    RewriteDomainRustImportAlias { domain: RewriteDomain, spellings: ["rust-import-alias", "rust_import_alias"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The Rust import-alias specifier chase, keyed on the specifier root and bounded by the importing file's binder root count." }
     HopAlias { domain: RouteHop, spellings: ["alias"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A local respelling of a declaration: an import alias or a type alias." }
     HopImport { domain: RouteHop, spellings: ["import"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An import binding that brings a declaration's name into a file or scope." }
     HopExport { domain: RouteHop, spellings: ["export"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An export site that makes a local declaration reachable from outside its file or module." }

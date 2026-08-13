@@ -139,13 +139,13 @@ pub struct CodeQueryBinding {
     pub visibility: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<CodeQueryImportBinder>,
-    /// `true` when this row was emitted as a binding the reaching binding
-    /// shadows rather than as the winner. Only `reaching-binding
+    /// `true` when this row was emitted as a binding the binding-of answer
+    /// shadows rather than as the winner. Only `binding-of
     /// :include-shadowed` produces such rows.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub shadowed: bool,
-    /// The AST identity of the occurrence this row is the reaching binding
-    /// *of*, present exactly on rows the `reaching-binding` step produced.
+    /// The AST identity of the occurrence this row is the binding-of answer
+    /// *of*, present exactly on rows the `binding-of` step produced.
     ///
     /// Without it the step's answer is unjoinable: a correlated consumer that
     /// captured one token cannot tell which of several returned bindings
@@ -303,6 +303,159 @@ pub struct CodeQueryReferenceEdge {
     pub provenance: &'static str,
     /// The workspace generation the edge was derived in. A parity comparison
     /// refuses to relate rows from two generations.
+    pub generation: u64,
+}
+
+/// One flow-sensitive state event (#1480): an establishment, kill, or read of
+/// a binding or of a property of a canonical binding base, anchored to a
+/// program point of the production control-flow graph.
+///
+/// `completeness` and `uncovered_axes` travel on every row rather than on the
+/// response alone, so a row that survives a filter still states whether its
+/// derivation answered the axis it belongs to. Source order and containment are
+/// never evidence for anything on this row.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryStateEvent {
+    pub id: String,
+    /// The content-scoped AST identity of the event's own token; absent when
+    /// the lowering's provenance lands on no facts-arena node, in which case
+    /// `path` plus the byte range address it exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    /// The wire identity of the procedure whose control-flow graph the event
+    /// is anchored in; equal to a `procedure` row's `id`.
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// `establish`, `kill`, or `read`.
+    pub event_class: &'static str,
+    /// `binding` or `property`.
+    pub subject: &'static str,
+    /// The member a property subject names; absent for a binding subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The lowered value the subject is identified by: the binding itself, or
+    /// the canonical base a property hangs off. Two events of one subject
+    /// carry the same number inside one procedure.
+    pub subject_value: usize,
+    /// The dense program point of the procedure's control-flow graph.
+    pub program_point: usize,
+    /// The value the event moves: the assigned value for a write, the produced
+    /// value for a read.
+    pub value: usize,
+    /// `complete` or `partial`, from the derivation's own account.
+    pub completeness: &'static str,
+    /// The axes the derivation does not answer for. Empty exactly when
+    /// `completeness` is `complete`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_axes: Vec<&'static str>,
+    pub generation: u64,
+}
+
+/// One end of a flow relation, rendered inline so the relation is readable
+/// without a second query (#1480).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryStateEventRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub event_class: &'static str,
+    pub subject: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    pub program_point: usize,
+}
+
+/// One flow relation between two state events of one procedure (#1480).
+///
+/// `source` is always the establishment or kill end and `target` the read end.
+/// The row carries no subject of its own: a `same_evaluation` row legitimately
+/// relates two different subjects (a property write to a binding read).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryFlowRelation {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The relation's own display anchor: its target read.
+    pub range: CodeQueryRange,
+    /// `reaching`, `dominates`, or `same_evaluation`.
+    pub relation: &'static str,
+    /// `exact` when the relation holds on every path, `may` otherwise.
+    pub certainty: &'static str,
+    pub source: CodeQueryStateEventRef,
+    pub target: CodeQueryStateEventRef,
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_axes: Vec<&'static str>,
+    pub generation: u64,
+}
+
+/// One step of a bounded rewrite chase (#1480).
+///
+/// `state_key` is the *semantic* state the cycle check keys on, which is not
+/// the rewritten object: the object usually grows every hop and can never
+/// repeat, so keying on it would never detect a cycle.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryRewriteStep {
+    pub state_key: String,
+    pub input: String,
+    pub output: String,
+    /// The human-stable label of the rule that fired, so a step sequence reads
+    /// as a derivation rather than as a list of strings.
+    pub rule: &'static str,
+}
+
+/// One bounded chase through one declared finite rewrite domain (#1480).
+///
+/// The row states its own bound and its own work, so a reader can check the
+/// claim: `declared_bound` is the size of the finite state space the domain
+/// walks (not an arbitrary cap), and `steps` is the ordered derivation that
+/// bound governs.
+///
+/// The three outcomes mean different things. `converged` carries the
+/// `fixed_point` the chase stopped on. `cycle` carries the ordered `witness`
+/// whose last state repeats its first and closes the loop -- a concrete
+/// counterexample. `exceeded_budget` carries only `explored`: it is absence of
+/// evidence, never a proven cycle and never a clean convergence.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryRewritePath {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The origin site: the token that spells the object the chase started
+    /// from.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The declared rewrite domain, e.g. `rust_import_alias`.
+    pub domain: &'static str,
+    /// The object the chase started from, exactly as the source spells it.
+    pub origin_specifier: String,
+    pub declared_bound: usize,
+    pub step_count: usize,
+    pub steps: Vec<CodeQueryRewriteStep>,
+    /// `converged`, `cycle`, or `exceeded_budget`.
+    pub outcome: &'static str,
+    /// The fixed point of a converged chase; absent for the other outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_point: Option<String>,
+    /// The ordered repeated-state witness of a cycle; empty for the other
+    /// outcomes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub witness: Vec<String>,
+    /// The steps a budget-exhausted chase performed; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explored: Option<usize>,
+    /// `complete` or `partial`, from the derivation's own account.
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_domains: Vec<&'static str>,
     pub generation: u64,
 }
 

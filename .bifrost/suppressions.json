@@ -1870,6 +1870,28 @@
       "accepted_by": "codex",
       "accepted_at": "2026-08-11",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "4fd1752aaf50bcb73e678c3d5d8564b8a28a2f6069dda8f6e0acac39d402b26b",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "The :scope branch of assert-rewrite-termination sorts and dedups the capture-bound path list it just collected for this one assert; the list differs per assert and cannot move outside the loop. The loop-invariant workspace listing was already hoisted into the per-run memo.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "claude",
+      "accepted_at": "2026-08-13",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "3a172ecf290e8c7680601412b376f9b8dc207ea7fb907c7faf5ce078650a5546",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "The flow-establishment evaluator sorts the considered-establishment set it just filtered for one read event, to present an ordered witness in the finding; the collection is per-finding and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "claude",
+      "accepted_at": "2026-08-13",
+      "expires_at": null
     }
   ]
 }

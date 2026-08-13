@@ -9,7 +9,7 @@ pub(super) enum EnvironmentOptionKind {
     Scope,
     Binding,
     Candidate,
-    ReachingBinding,
+    BindingOf,
     GenerationSite,
     Export,
     DeclarationState,
@@ -21,7 +21,7 @@ impl EnvironmentOptionKind {
             Self::Scope => ":kind",
             Self::Binding => ":kind, :name, and :hoisting",
             Self::Candidate => ":tier, :outcome, and :boundary",
-            Self::ReachingBinding => ":include-shadowed",
+            Self::BindingOf => ":include-shadowed",
             Self::GenerationSite => ":kind and :input",
             Self::Export => ":form and :name",
             Self::DeclarationState => ":origin, :declaration-only, and :config-gated",
@@ -39,7 +39,7 @@ impl EnvironmentOptionKind {
                 .map(|option| EnvironmentOptionField::Step(option.field())),
             Self::Candidate => candidate_option_for_rql_label(label)
                 .map(|option| EnvironmentOptionField::Step(option.field())),
-            Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS
+            Self::BindingOf => BINDING_OF_STEP_OPTIONS
                 .iter()
                 .find(|option| option.accepts_rql_label(label))
                 .map(|option| EnvironmentOptionField::Step(option.field())),

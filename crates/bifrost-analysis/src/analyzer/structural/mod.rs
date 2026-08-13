@@ -15,9 +15,12 @@
 //! - [`occurrence_rows`]: per-file occurrence rows derived from the arena's
 //!   occurrence roles plus definition resolution (issue #1473).
 //! - [`lexical_environment`]: per-file scope, binding, import-binder and
-//!   package rows, plus the reaching-binding algorithm over them (issue #1474).
+//!   package rows, plus the binding-of algorithm over them (issue #1474).
 //! - [`qualified_paths`]: per-file qualified-path and path-segment rows with
 //!   opt-in per-segment prefix resolution (issue #1475).
+//! - `flow_state`: per-procedure binding/property state events and the
+//!   flow relations over the production CFG -- reaching definitions,
+//!   dominance and same-evaluation (issue #1480).
 //! - [`identity_routes`]: canonical identity projection, physical grouping,
 //!   per-file route relation rows and the bounded route traversal (#1475).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
@@ -34,6 +37,7 @@ pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
+pub mod flow_state;
 pub mod identity_routes;
 pub(crate) mod index;
 pub mod lexical_environment;
@@ -45,6 +49,7 @@ pub mod provider;
 pub mod qualified_paths;
 pub use brokk_bifrost_rql::query;
 pub mod reference_edges;
+pub mod rewrite_paths;
 pub mod rune_ir;
 pub mod search;
 
@@ -54,7 +59,7 @@ pub mod search;
 // production mechanics went to core, its test assertions stayed (see that
 // module).
 pub use brokk_bifrost_core::analyzer::structural::{
-    edges, kinds, materialization, occurrences, resolution, routes, spec,
+    edges, kinds, materialization, occurrences, resolution, rewrite_path, routes, spec,
 };
 
 pub use analysis_context::{
@@ -107,9 +112,9 @@ pub use identity_routes::{
 };
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use lexical_environment::{
-    BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
-    EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
-    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+    BindingOfOutcome, BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness,
+    EnvironmentFileResult, EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow,
+    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, binding_of, environment_for_file,
 };
 pub use materialization::{
     ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,

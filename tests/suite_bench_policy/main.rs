@@ -28,6 +28,7 @@ mod policy_assertion_per_file_completion;
 mod policy_baseline_evaluation;
 mod policy_docs;
 mod policy_edge_parity_assertions;
+mod policy_flow_state_assertions;
 mod policy_identity_assertions;
 mod policy_identity_conformance;
 mod policy_loading;
