@@ -85,20 +85,19 @@ mod effective_using_scale_tests {
         }
         let after_absent = visibility.using_work_counts_for_test();
         assert_eq!(
-            after_absent.0,
+            cpp.source_using_index_build_count_for_test(),
             visibility.all_visible_source_files().len(),
             "the union source index must walk each physical source once"
         );
         assert_eq!(
-            (
-                after_absent.1,
-                after_absent.2,
-                after_absent.3,
-                after_absent.4,
-                after_absent.5
-            ),
-            (0, 0, 0, 0, HEADER_COUNT),
-            "the project index must inspect guard ancestry only for the one structured using directive per header, never for unrelated AST nodes"
+            after_absent,
+            (0, 0, 0, 0),
+            "an absent-name projection must not activate donors, expand namespaces, build callable metadata, or inspect candidates"
+        );
+        assert_eq!(
+            cpp.using_guard_context_inspection_count_for_test(),
+            HEADER_COUNT,
+            "the per-file index must inspect guard ancestry only for the one structured using directive per header, never for unrelated AST nodes"
         );
         std::thread::scope(|scope| {
             for _ in 0..16 {
@@ -125,7 +124,7 @@ mod effective_using_scale_tests {
         });
         let after_projection = visibility.using_work_counts_for_test();
         assert!(
-            after_projection.4 <= HEADER_COUNT,
+            after_projection.3 <= HEADER_COUNT,
             "namespace validation must inspect only requested-name candidates, not the unrelated declaration population: {after_projection:?}"
         );
         let _ = effective_using_bindings_for_name(
@@ -169,9 +168,39 @@ mod effective_using_scale_tests {
             }
         });
         assert_eq!(
-            visibility.using_work_counts_for_test().3,
+            visibility.using_work_counts_for_test().2,
             1,
             "repeated logical callable lookup must hydrate default metadata once"
+        );
+
+        // #1927: the per-file using index is memoized on the analyzer, so a
+        // fresh visibility index -- one is built per usage query -- assembles
+        // its project index without re-walking any file's AST.
+        let builds_before_second_visibility = cpp.source_using_index_build_count_for_test();
+        let second_visibility =
+            VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
+        let second_imports = initialized_ordinary_type_imports(
+            root_node,
+            &CppDispatch::new(analyzer).source(),
+            &second_visibility,
+            &left,
+            prepared.source(),
+        );
+        assert!(
+            !effective_using_bindings_for_name(
+                &second_visibility,
+                &second_imports,
+                &left,
+                root_node,
+                prepared.source(),
+                "Call_0",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            cpp.source_using_index_build_count_for_test(),
+            builds_before_second_visibility,
+            "a fresh visibility index must reuse the memoized per-file using indexes instead of re-walking each source AST"
         );
     }
 

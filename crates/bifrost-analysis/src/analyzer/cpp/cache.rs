@@ -1,4 +1,7 @@
 use super::*;
+use brokk_bifrost_cpp::graph::resolver::{
+    EffectiveUsingTarget, OrdinaryTypeImport, PreprocessorGuard,
+};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -81,6 +84,81 @@ pub(super) fn weight_reconcile_candidates(
         })
         .saturating_add(value.bucketed_len().saturating_mul(size_of::<CodeUnit>()))
         .saturating_add(key.len());
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+fn weight_string_components(components: &[String]) -> usize {
+    components
+        .iter()
+        .fold(size_of::<Vec<String>>(), |acc, component| {
+            acc.saturating_add(size_of::<String>())
+                .saturating_add(component.len())
+        })
+}
+
+fn weight_ordinary_type_import(binding: &OrdinaryTypeImport) -> usize {
+    let target = match &binding.target {
+        EffectiveUsingTarget::Ordinary {
+            name,
+            target_components,
+            ..
+        } => name
+            .len()
+            .saturating_add(weight_string_components(target_components)),
+        EffectiveUsingTarget::Namespace {
+            namespace_components,
+            ..
+        } => weight_string_components(namespace_components),
+    };
+    let guards = binding.required_guards.iter().fold(
+        size_of::<HashSet<PreprocessorGuard>>(),
+        |acc, guard| {
+            let text = match guard {
+                PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name) => name.len(),
+                PreprocessorGuard::Expression(expression)
+                | PreprocessorGuard::NegatedExpression(expression) => expression.len(),
+                PreprocessorGuard::Constant(_) => 0,
+            };
+            acc.saturating_add(size_of::<PreprocessorGuard>())
+                .saturating_add(text)
+        },
+    );
+    size_of::<OrdinaryTypeImport>()
+        .saturating_add(target)
+        .saturating_add(binding.source.root().as_os_str().len())
+        .saturating_add(binding.source.rel_path().as_os_str().len())
+        .saturating_add(weight_string_components(&binding.declaration_namespace))
+        .saturating_add(
+            binding
+                .namespace_scope
+                .as_deref()
+                .map_or(0, weight_string_components),
+        )
+        .saturating_add(
+            binding
+                .resolved_target_components
+                .as_deref()
+                .map_or(0, weight_string_components),
+        )
+        .saturating_add(guards)
+}
+
+/// #1927: one entry is every structured using declaration one file carries,
+/// keyed by imported name plus the file's using-directives.
+pub(super) fn weight_source_using_index(_key: &ProjectFile, value: &Arc<SourceUsingIndex>) -> u32 {
+    let size = value
+        .ordinary_by_name
+        .iter()
+        .fold(size_of::<SourceUsingIndex>(), |acc, (name, bindings)| {
+            bindings
+                .iter()
+                .fold(acc.saturating_add(name.len()), |acc, binding| {
+                    acc.saturating_add(weight_ordinary_type_import(binding))
+                })
+        })
+        .saturating_add(value.directives.iter().fold(0usize, |acc, binding| {
+            acc.saturating_add(weight_ordinary_type_import(binding))
+        }));
     size.clamp(1, u32::MAX as usize) as u32
 }
 

@@ -26,6 +26,7 @@
 
 use crate::compile_context::CppCompileContext;
 use crate::graph::CppWorkspaceSource;
+use crate::graph::resolver::SourceUsingIndex;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
@@ -65,6 +66,17 @@ pub trait CppSource:
         file: &ProjectFile,
         keep_going: &dyn Fn() -> bool,
     ) -> Option<Arc<Vec<CodeUnit>>>;
+
+    /// The per-file structured using index (ordinary using declarations and
+    /// using-directives with their guard environments), memoized per file.
+    /// Built by [`crate::graph::extractor::build_source_using_index`], which is
+    /// a pure function of the file's parsed content.
+    ///
+    /// Memoized on the analyzer rather than on `VisibilityIndex` because a
+    /// fresh visibility index is built per usage query: rebuilding the index
+    /// per query re-walked a 9.5 MB amalgamation's AST once per candidate
+    /// (issue #1927).
+    fn source_using_index(&self, file: &ProjectFile) -> Arc<SourceUsingIndex>;
 
     /// The indexed source of `file` (`TreeSitterAnalyzer::file_source`).
     fn file_source(&self, file: &ProjectFile) -> Option<String>;
@@ -138,4 +150,9 @@ pub trait CppSource:
     /// [`Self::record_cpp_parent_resolution_for_test`].
     #[cfg(any(test, feature = "test-support"))]
     fn record_cpp_class_strength_parse_for_test(&self) {}
+
+    /// Count a guard-ancestry inspection during a per-file using-index build.
+    /// See [`Self::record_cpp_parent_resolution_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_using_guard_context_inspection_for_test(&self) {}
 }

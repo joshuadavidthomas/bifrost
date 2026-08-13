@@ -2323,7 +2323,7 @@ pub fn resolve_block_using_call_target(
         visibility,
         ordinary_type_imports,
         file,
-        root_node(function),
+        function,
         source,
         name,
     );
@@ -2346,6 +2346,7 @@ pub fn resolve_block_using_call_target(
             }
             LexicalScopeResolution::Missing => return None,
         };
+    let reference_guards = preprocessor_guard_environment(function, source);
     let active = block_bindings
         .into_iter()
         .filter(|binding| {
@@ -2353,7 +2354,7 @@ pub fn resolve_block_using_call_target(
                 binding,
                 function,
                 &lexical_scope,
-                source,
+                reference_guards.as_ref(),
                 visibility,
                 file,
             )
@@ -2478,10 +2479,18 @@ pub fn resolve_bare_call_target(
         visibility,
         ordinary_type_imports,
         file,
-        root_node(function),
+        function,
         source,
         name,
     );
+    // Guard ancestry climbs the whole ancestor chain and each `Node::parent`
+    // step re-descends from the root (#1927): with no bindings both filters
+    // below select nothing, so the environment is never consulted.
+    let function_guards = if bindings.is_empty() {
+        None
+    } else {
+        preprocessor_guard_environment(function, source)
+    };
     let active_bindings = bindings
         .iter()
         .filter(|binding| {
@@ -2489,13 +2498,12 @@ pub fn resolve_bare_call_target(
                 binding,
                 function,
                 &lexical_scope,
-                source,
+                function_guards.as_ref(),
                 visibility,
                 file,
             )
         })
         .collect::<Vec<_>>();
-    let function_guards = preprocessor_guard_environment(function, source);
     let transitive_bindings = bindings
         .iter()
         .filter(|binding| {
@@ -7358,29 +7366,54 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
 ) -> LexicalScopeResolution {
     #[cfg(any(test, feature = "test-support"))]
     LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(count.get() + 1));
-    let namespace = enclosing_namespace_components(node, source);
-    let mut scope = namespace.clone();
+    // One ancestor climb collects the namespace chain, the class chain, the
+    // nearest function definition and both displaced-class-shape facts.
+    // `Node::parent` re-descends from the root on every call (tree-sitter
+    // 0.24+), so the four separate climbs this replaces each cost another
+    // near-full-AST scan per reconstruction on a large flat file (#1927).
+    let mut namespaces = Vec::new();
     let mut classes = Vec::new();
     let mut function_definition = None;
+    let mut displaced_class_scope = false;
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) && let Some(name) = parent.child_by_field_name("name")
-        {
-            let mut components = Vec::new();
-            if append_cpp_name_components(name, source, &mut components).is_some() {
-                classes.push(components);
+        match parent.kind() {
+            "namespace_definition" => {
+                if let Some(name) = parent.child_by_field_name("name") {
+                    let mut components = Vec::new();
+                    if append_cpp_name_components(name, source, &mut components).is_some() {
+                        namespaces.push(components);
+                    }
+                }
             }
-        }
-        if function_definition.is_none() && parent.kind() == "function_definition" {
-            function_definition = Some(parent);
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name) = parent.child_by_field_name("name") {
+                    let mut components = Vec::new();
+                    if append_cpp_name_components(name, source, &mut components).is_some() {
+                        classes.push(components);
+                    }
+                }
+            }
+            "function_definition" => {
+                if function_definition.is_none() {
+                    function_definition = Some(parent);
+                }
+                displaced_class_scope = displaced_class_scope
+                    || parent.child_by_field_name("type").is_some_and(|type_node| {
+                        matches!(
+                            type_node.kind(),
+                            "class_specifier" | "struct_specifier" | "union_specifier"
+                        )
+                    })
+                    || is_malformed_wrapper_function_definition(parent);
+            }
+            _ => {}
         }
         current = parent.parent();
     }
-    let displaced_class_scope = has_recovered_class_shape_ancestor(node)
-        || has_malformed_wrapper_function_definition_ancestor(node);
+    namespaces.reverse();
+    let namespace: Vec<String> = namespaces.into_iter().flatten().collect();
+    let mut scope = namespace.clone();
     let has_qualified_function_owner = function_definition
         .and_then(function_definition_owner_lookup_node)
         .is_some_and(|owner| {
@@ -8303,12 +8336,27 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize, bool)> {
     None
 }
 
+/// Build the per-file structured using index for `file`.
+///
+/// The result is a pure function of the file's parsed content, which is what
+/// lets `CppSource::source_using_index` memoize it on the analyzer (#1927):
+/// a `VisibilityIndex` is rebuilt per usage query, and rebuilding this index
+/// per query re-walked a 9.5 MB amalgamation's AST for every candidate.
+pub fn build_source_using_index(cpp: &dyn CppSource, file: &ProjectFile) -> SourceUsingIndex {
+    let Some(prepared) = cpp.prepared_syntax(file) else {
+        return SourceUsingIndex::default();
+    };
+    collect_source_using_index(cpp, file, prepared.tree().root_node(), prepared.source())
+}
+
 fn collect_source_using_index(
-    visibility: &VisibilityIndex<'_>,
+    cpp: &dyn CppSource,
     source_file: &ProjectFile,
     root: Node<'_>,
     source: &str,
 ) -> SourceUsingIndex {
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = cpp;
     let mut index = SourceUsingIndex::default();
     let orphaned_namespaces = collect_orphaned_namespace_envelopes(root, source);
     let mut stack = vec![root];
@@ -8363,7 +8411,8 @@ fn collect_source_using_index(
             // structured using declarations need a guard environment. Keep the cheap target
             // classification ahead of both ancestor walks so non-using nodes remain a one-pass
             // walk and the total cost is O(nodes + using declarations * ancestor depth).
-            visibility.note_using_guard_context_inspection_for_test();
+            #[cfg(any(test, feature = "test-support"))]
+            cpp.record_using_guard_context_inspection_for_test();
             let required_guards = if callable_preprocessor_context_is_visible(node, source) {
                 Some(HashSet::default())
             } else {
@@ -8598,24 +8647,20 @@ fn orphaned_using_owner_name(node: Node<'_>, source: &str) -> Option<String> {
 fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIndex {
     let mut project = ProjectUsingIndex::default();
     for source_file in visibility.all_visible_source_files() {
-        visibility.note_using_source_index_walk_for_test();
-        let Some(prepared) = visibility.cpp().prepared_syntax(&source_file) else {
-            continue;
-        };
-        let source_index = collect_source_using_index(
-            visibility,
-            &source_file,
-            prepared.tree().root_node(),
-            prepared.source(),
-        );
-        for (name, bindings) in source_index.ordinary_by_name {
+        // The per-file index is memoized on the analyzer, so assembling the
+        // project index for a fresh `VisibilityIndex` copies bindings instead
+        // of re-walking each file's AST (#1927).
+        let source_index = visibility.cpp().source_using_index(&source_file);
+        for (name, bindings) in &source_index.ordinary_by_name {
             project
                 .ordinary_by_name
-                .entry(name)
+                .entry(name.clone())
                 .or_default()
-                .extend(bindings);
+                .extend(bindings.iter().cloned());
         }
-        project.directives.extend(source_index.directives);
+        project
+            .directives
+            .extend(source_index.directives.iter().cloned());
     }
     project
 }
@@ -8815,11 +8860,16 @@ fn project_using_binding_at_activation(
     }
 }
 
+/// `node` may be any node of `file`'s tree; the projection reaches the tree
+/// root itself when it needs one. `Node::parent` re-descends from the root on
+/// every call (tree-sitter 0.24+), so climbing to the root eagerly at each
+/// call site cost a near-full-AST scan per reference on a large flat file
+/// (#1927); a name with no candidate bindings never pays for it.
 pub fn effective_using_bindings_for_name(
     visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
-    root: Node<'_>,
+    node: Node<'_>,
     source: &str,
     name: &str,
 ) -> Arc<[OrdinaryTypeImport]> {
@@ -8827,10 +8877,13 @@ pub fn effective_using_bindings_for_name(
         .projection_cell(name)
         .get_or_init(|| {
             let project = project_using_index(visibility);
+            let name_bindings = project.ordinary_by_name.get(name);
+            if name_bindings.is_none() && project.directives.is_empty() {
+                return Arc::from(Vec::new());
+            }
+            let root = root_node(node);
             let mut projected = Vec::new();
-            for binding in project
-                .ordinary_by_name
-                .get(name)
+            for binding in name_bindings
                 .into_iter()
                 .flatten()
                 .chain(project.directives.iter())
@@ -8883,17 +8936,20 @@ fn root_node(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
+/// `reference_guards` is the reference node's guard environment, computed once
+/// by the caller and shared across every binding: recomputing it per binding
+/// repeated a full ancestor climb whose every `Node::parent` step re-descends
+/// from the root (#1927).
 fn effective_using_binding_active(
     binding: &OrdinaryTypeImport,
     node: Node<'_>,
     lexical_scope: &[String],
-    source: &str,
+    reference_guards: Option<&HashSet<PreprocessorGuard>>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> bool {
     binding.declaration_byte <= node.start_byte()
-        && preprocessor_guard_environment(node, source)
-            .is_some_and(|active| binding.required_guards.is_subset(&active))
+        && reference_guards.is_some_and(|active| binding.required_guards.is_subset(active))
         && visibility.preprocessor_guards_stable_between(
             file,
             0,
@@ -9097,15 +9153,27 @@ fn ordinary_type_import_resolution(
         return OrdinaryTypeImportResolution::Missing;
     }
     let name = &components[0];
-    let bindings =
-        effective_using_bindings_for_name(visibility, imports, file, root_node(node), source, name);
+    let bindings = effective_using_bindings_for_name(visibility, imports, file, node, source, name);
+    // Guard ancestry climbs the whole ancestor chain, and each `Node::parent`
+    // step re-descends from the root (#1927). A name with no bindings needs
+    // none of it, and one environment serves every binding of the reference.
+    if bindings.is_empty() {
+        return OrdinaryTypeImportResolution::Missing;
+    }
+    let reference_guards = preprocessor_guard_environment(node, source);
     let active = bindings
         .iter()
         .filter(|binding| {
-            effective_using_binding_active(binding, node, lexical_scope, source, visibility, file)
+            effective_using_binding_active(
+                binding,
+                node,
+                lexical_scope,
+                reference_guards.as_ref(),
+                visibility,
+                file,
+            )
         })
         .collect::<Vec<_>>();
-    let reference_guards = preprocessor_guard_environment(node, source);
     let transitive = bindings
         .iter()
         .filter(|binding| {
@@ -9468,6 +9536,12 @@ fn resolve_type_components_lexically_at_scoped(
     }
     if !global
         && components.len() == 1
+        // The two constant-time conditions run before the ancestor climb: each
+        // `Node::parent` step re-descends from the root (#1927).
+        && let Some(target) = direct_target
+        && lexical_scope
+            .last()
+            .is_none_or(|last| last != &components[0])
         // A recovered class may contain a real member function nested inside
         // the malformed outer wrapper (for example tinyxml2's macro-prefixed
         // XMLConstHandle).  The nearest function_definition is then the
@@ -9475,13 +9549,9 @@ fn resolve_type_components_lexically_at_scoped(
         // leaves an unqualified return type outside its namespace.  Walk the
         // complete ancestor chain for the malformed wrapper instead.
         && has_malformed_wrapper_function_definition_ancestor(node)
-        && let Some(target) = direct_target
         && let Some(indexed_namespace) =
             visibility.target_preserving_reference_namespace(analyzer, file, &components[0], target)
         && (lexical_scope.is_empty() || !lexical_scope.starts_with(&indexed_namespace))
-        && lexical_scope
-            .last()
-            .is_none_or(|last| last != &components[0])
     {
         // A malformed wrapper can make the indexed enclosing owner look like
         // the lexical namespace (for example XMLHandle around tinyxml2
