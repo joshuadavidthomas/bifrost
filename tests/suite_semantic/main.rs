@@ -41,6 +41,7 @@ mod framework_declaration_pack;
 mod generated_behavior_models;
 mod go_semantic_diagnostics;
 mod icfg_contract;
+mod issue_2074_go_declaration_probe_eligibility;
 mod java_semantic_diagnostics;
 mod js_ts_dependency_semantic_pack;
 mod js_ts_semantic_diagnostics;

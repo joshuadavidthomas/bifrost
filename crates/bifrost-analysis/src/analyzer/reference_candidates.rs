@@ -335,8 +335,13 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
         (matches!(
             parent.kind(),
             "field_declaration"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_elem"
                 | "type_alias"
                 | "type_spec"
+                | "var_spec"
+                | "const_spec"
                 | "import_spec"
                 | "package_clause"
                 | "parameter_declaration"
@@ -1030,6 +1035,53 @@ func run() {
             assert!(
                 offsets.contains(&reference),
                 "Go reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reference_frontier_excludes_interface_methods_and_value_declarations() {
+        let source = r#"package sample
+
+type Reader interface {
+    Read([]byte) (int, error)
+    Close() error
+}
+
+const Ready, Waiting = 1, 2
+
+func use(reader Reader) int {
+    _, _ = reader.Read(nil)
+    return Ready
+}
+"#;
+        let references = reference_candidate_offsets(Language::Go, "sample.go", source);
+        let census = census_offsets(Language::Go, "sample.go", source);
+        let declaration_offsets = [
+            source.find("Read([]byte)").expect("Read declaration"),
+            source.find("Close() error").expect("Close declaration"),
+            source.find("Ready, Waiting").expect("Ready declaration"),
+            source.find("Waiting =").expect("Waiting declaration"),
+        ];
+        for declaration in declaration_offsets {
+            assert!(
+                census.contains(&declaration),
+                "raw census must retain the declaration at {declaration}: {census:?}"
+            );
+            assert!(
+                !references.contains(&declaration),
+                "declaration at {declaration} entered the reference frontier: {references:?}"
+            );
+        }
+
+        for reference in [
+            source.rfind("Reader").expect("parameter type reference"),
+            source.rfind("Read").expect("method reference"),
+            source.rfind("Ready").expect("constant reference"),
+        ] {
+            assert!(
+                references.contains(&reference),
+                "reference at {reference} left the frontier: {references:?}"
             );
         }
     }
