@@ -16,7 +16,9 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 - [x] (2026-08-13 10:08Z) Committed and pushed the closure cache as `db1bebb6`, merged at `578ce51f`.
 - [x] (2026-08-13 10:37Z) Removed recursive local-binding reconstruction from initializer inference and added a 16-link behavior/cost regression.
 - [x] (2026-08-13 10:41Z) Passed six focused resolver unit tests, two existing C++ navigation controls, analysis all-target clippy, format, workspace dependency validation, and diff checks.
-- [ ] Commit and push the follow-up, replay pinned MuJoCo, publish evidence, and close #2095.
+- [x] (2026-08-13 10:46Z) Committed and pushed the local-inference follow-up as `eff59cd0`.
+- [x] (2026-08-13 11:02Z) Replayed pinned clean MuJoCo at `eff59cd0`: all 314 forward files completed in 44.3 seconds and the full run completed in 69.6 seconds with no dirty state, file errors, or inverse-precision findings.
+- [ ] Publish the replay evidence and close #2095.
 
 ## Surprises & Discoveries
 
@@ -34,6 +36,9 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 
 - Observation: initializer inference discards the local-binding engine it is currently building.
   Evidence: `cpp_seed_binding` owns the already-seeded `LocalInferenceEngine<CppType>`, but `cpp_infer_type_from_value` resolves a field-call receiver through `cpp_field_receiver_type_units`, whose identifier path calls `cpp_bindings_before` from the root. A chain of inferred local initializers therefore rebuilds every prior binding recursively and can grow exponentially.
+
+- Observation: reusing the active binding engine removes the production tail rather than merely improving a synthetic cost counter.
+  Evidence: at `eff59cd0`, the same pinned clean MuJoCo corpus completed every forward file in 44.3 seconds and the full forward/inverse run in 69.6 seconds. The old `578ce51f` run took 755.7 seconds, including a 680.7-second final-file tail. The replacement report is completed and clean with zero file errors.
 
 ## Decision Log
 
@@ -55,7 +60,7 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 
 ## Outcomes & Retrospective
 
-The external-header closure implementation and its replay-discovered local-inference follow-up are complete locally. External member and boundary lookups share one typed closure outcome per reference file and analyzer generation. Initializer return-type inference now reuses the exact source-ordered binding engine already being constructed, so a chain of inferred receivers performs one binding build instead of recursively rebuilding each prefix. The old pushed binary completed MuJoCo file 314 at 733.0 seconds, a 680.7-second tail, which proves the cache alone did not meet acceptance. Commit, push, and a replacement replay remain.
+The external-header closure implementation and its replay-discovered local-inference follow-up are implemented, validated, committed, pushed, and accepted against the pinned production corpus. External member and boundary lookups share one typed closure outcome per reference file and analyzer generation. Initializer return-type inference reuses the exact source-ordered binding engine already being constructed, so a chain of inferred receivers performs one binding build instead of recursively rebuilding each prefix. The old pushed binary completed MuJoCo file 314 at 733.0 seconds, a 680.7-second tail. At `eff59cd0`, all 314 forward files completed in 44.3 seconds and the full run completed in 69.6 seconds, an 89.5% reduction in total wall time. The report is completed, clean, and contains zero file errors or inverse-precision findings. Publication and issue closure remain as the final administrative step.
 
 ## Context and Orientation
 
@@ -115,6 +120,22 @@ Pre-fix MuJoCo evidence at Bifrost `3691bb01`:
     file 314 plugin/usd_decoder/usd_decoder.cc: completed at 713.3 seconds
     single-file tail: 668.3 seconds
 
+Post-fix MuJoCo evidence at Bifrost `eff59cd0d2a2e6b5a786a90f2ac46c8a0e200adc`:
+
+    report: /mnt/optane/tmp/bifrost-fird/final-eff59cd0/cpp-mujoco-eff59cd0.jsonl
+    SHA-256: 53a414cc47a91793d8fe4adc5cb32fe2c006fd5f32a1f464c41bb8986e6ceda8
+    forward files 314/314: 44.3 seconds
+    inverse targets 1000/1000: 59.4 seconds cumulative
+    full repository: 69.568551822 seconds
+    status: completed
+    bifrost_dirty: false
+    repo_dirty: false
+    file_errors: 0
+    inverse_precision_unbacked_hits: 0
+    actionable missing findings: 199
+
 Plan revision note (2026-08-13): Created from issue #2095 and the durable rank-31+ C++ replay after #2097 was fixed. The plan records the structured cache key, completion/cancellation contract, prepared-syntax seam, required parity controls, and exact MuJoCo acceptance replay.
 
 Plan revision note (2026-08-13): Recorded the pushed cache implementation and the exact replay's independent recursive local-inference tail. The plan now includes the structured reuse fix and its behavior/cost acceptance rather than incorrectly treating cache publication as issue completion.
+
+Plan revision note (2026-08-13): Recorded the successful `eff59cd0` replacement replay. The production witness improved from a 680.7-second final-file tail and 755.7-second full run to 44.3 seconds for all forward files and 69.6 seconds overall, with a clean, error-free report.
