@@ -12022,7 +12022,7 @@ function render() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.js.classes.enabled",
+        result["definitions"][0]["fqn"], "classes.enabled",
         "{value}"
     );
     assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
@@ -12110,7 +12110,7 @@ bench.start();
     );
     assert_eq!(bench["results"][0]["status"], "resolved", "{bench}");
     assert_eq!(
-        bench["results"][0]["definitions"][0]["fqn"], "app.js.bench",
+        bench["results"][0]["definitions"][0]["fqn"], "bench",
         "{bench}"
     );
 }
@@ -12591,7 +12591,7 @@ function callLocal() {
         "{local_value}"
     );
     assert_eq!(
-        local_value["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.LOCALE",
+        local_value["results"][0]["definitions"][0]["fqn"], "googLocal.LOCALE",
         "{local_value}"
     );
 
@@ -12611,7 +12611,7 @@ function callLocal() {
         "{local_call}"
     );
     assert_eq!(
-        local_call["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.getMsg",
+        local_call["results"][0]["definitions"][0]["fqn"], "googLocal.getMsg",
         "{local_call}"
     );
 }
@@ -14021,7 +14021,7 @@ function accepts(value) {
     let result = &receiver_value["results"][0];
     assert_eq!(result["status"], "resolved", "{receiver_value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.js.re_aggrWithExpression",
+        result["definitions"][0]["fqn"], "re_aggrWithExpression",
         "{receiver_value}"
     );
     assert_eq!(

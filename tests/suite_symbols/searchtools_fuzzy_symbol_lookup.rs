@@ -359,7 +359,7 @@ fn javascript_object_literal_method_is_searchable_as_function_symbol() {
         library
             .functions
             .iter()
-            .any(|hit| hit.symbol == "library.js.helpers.formatTask" && hit.line == 2),
+            .any(|hit| hit.symbol == "helpers.formatTask" && hit.line == 2),
         "expected object-literal method in functions bucket: {search:#?}"
     );
 }
