@@ -13,7 +13,8 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 - [x] (2026-08-13 14:08Z) Routed forward navigation, targeted macro scans, and bulk inverted edges through the shared verdict while preserving the existing function-like call path.
 - [x] (2026-08-13 14:18Z) Added InlineTestProject coverage for every advertised expression surface and fail-closed control, plus a bulk-edge unit pin.
 - [x] (2026-08-13 14:31Z) Passed focused #2093, #1812, #1819, #1960, resolver, bulk-edge, affected-crate clippy, and dependency validation.
-- [ ] Commit, rebuild the release runner, replay representative corpus witnesses, push, publish evidence, and close #2093 without waiting for the full rank-31+ rerun.
+- [x] (2026-08-13 14:44Z) Committed `8af20c88`, rebuilt the release runner, and replayed three clean unconditional corpus witnesses with exact inverse parity.
+- [ ] Push, publish evidence, and close #2093 without waiting for the full rank-31+ rerun.
 
 ## Surprises & Discoveries
 
@@ -32,6 +33,9 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 - Observation: the public workspace graph intentionally excludes Macro CodeUnits from its node catalog.
   Evidence: `WorkspaceUsageCatalog::build_with_cancellation` retains classes, callables, and Java module scopes only. Bulk parity is therefore pinned at the internal `build_cpp_edges` seam with an explicit macro node set rather than by widening the public graph contract.
 
+- Observation: the ranked `SAVE` exemplar is not an unconditional ordinary-macro witness.
+  Evidence: `rui314/8cc` defines `SAVE` to a multi-statement replacement under `#ifdef __GNUC__` and to an empty replacement under `#else`. The exact environment cannot choose one compile branch, so the shared verdict correctly returns ambiguity. This is the fail-closed conditional control required by #2093, not a regression in the unconditional macro path.
+
 ## Decision Log
 
 - Decision: centralize macro occurrence admission and exact target selection in `crates/bifrost-cpp/src/graph/resolver.rs`.
@@ -48,7 +52,7 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 
 ## Outcomes & Retrospective
 
-The shared resolver verdict and all three consumers are implemented. Focused behavior now covers array bounds, initializers, binary and argument expressions, casts, returns, and selected member spellings. Before-definition, after-`#undef`, contradictory conditional definitions, labels, macro definition/formal names, and the existing function-like call surface remain fail-closed or on their established paths. Focused tests, clippy, and dependency validation are green; production corpus replay and publication remain.
+The shared resolver verdict and all three consumers are implemented. Focused behavior covers array bounds, initializers, binary and argument expressions, casts, returns, and selected member spellings. Before-definition, after-`#undef`, contradictory conditional definitions, labels, macro definition/formal names, and the existing function-like call surface remain fail-closed or on their established paths. Focused tests, clippy, dependency validation, and three clean exact corpus replays are green. Publication remains; the full 843-key campaign rerun is deliberately deferred under the user's push-without-full-CI instruction.
 
 ## Context and Orientation
 
@@ -116,7 +120,17 @@ The complete C ledger is:
 
 The issue reports 843 unique census gaps: 842 ordinary argument/binary/assignment/array/cast/initializer/return positions and one macro-expanded member selector. Representative macro families include `SAVE`, `BLOCK_SIZE`, and `BYTES`.
 
+Exact clean replay evidence at `8af20c888af37ac2f36de16c38ada3afad04cce6`:
+
+    strongSwan BLOCK_SIZE array bound: c675619cbfd4964bb83b5a64bd952e85cc7d526b2601bc2af12a70250acc00d5
+    PyCryptodome BLOCK_SIZE assignment: 93a60ac698031c14dd5fa74eebbc0c3a674cca7715b64406644e7f8e6d2dc9ae
+    PyCryptodome BYTES array bound: b97c085489a4af881ee091fae206e3c80e7e6c61a90265faafd7db8b6533b815
+
+Each artifact records a clean Bifrost tree and clean pinned repository, one resolved/consistent site, an exact inverse reference range, zero actionable findings, zero file errors, and zero inverse-precision findings.
+
 Plan revision note (2026-08-13): Created after closing #2092 and auditing #2093's three resolver surfaces. The audit established that extraction and targeted matching already exist; the missing root is a shared ordinary-occurrence activation verdict.
+
+Plan revision note (2026-08-13): Implementation completed at `8af20c88`. A first exact `SAVE` replay exposed conditional redefinition rather than an unconditional macro miss; acceptance evidence therefore uses three unconditional ranked witnesses and retains `SAVE` as the intended ambiguity control.
 
 ## Interfaces and Dependencies
 
