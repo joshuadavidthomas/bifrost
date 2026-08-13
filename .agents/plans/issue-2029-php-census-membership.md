@@ -15,7 +15,7 @@ The reference differential should stop presenting PHP namespace declaration segm
 - [x] (2026-08-13) Added an end-to-end `InlineTestProject` reference-differential regression with positive and near-miss assertions.
 - [x] (2026-08-13) Passed focused featureless tests, dependency check, fmt, and clippy for touched crates.
 - [x] (2026-08-13) Replayed the two exact Respect Validation witnesses and namespace/constant declaration controls.
-- [ ] Commit, synchronize with `origin/master`, push, comment with evidence, and close #2029.
+- [x] (2026-08-13) Committed, merged current `origin/master`, passed post-merge focused tests, pushed as `a3aeae37`, commented with evidence, and closed #2029.
 
 ## Surprises & Discoveries
 
@@ -64,4 +64,4 @@ All edits and tests are repeatable. Exact corpus replays use ephemeral cache mod
 
 ## Outcomes & Retrospective
 
-The implementation now preserves the maximal raw census while excluding PHP namespace and constant binders before sampling. PHP membership descends ERROR subtrees only for exact nullsafe member-name fields and static-call scope envelopes. The Respect `Id` replay (`9db9054da565924ae3001efbafcda2c810a8ed72bc1152d96bbcd845c804dad7`) and `withInput` replay (`48993ff03957b4dbe8654ca3368e0995546cfa51e9b189949ab9ebf85e9a5ec5`) each report zero actionable and zero inverse-precision findings. Exact namespace and constant declaration replays now stop with `exact site did not match a structured non-declaration reference`, as intended. Commit/push and issue closure remain.
+The implementation now preserves the maximal raw census while excluding PHP namespace and constant binders before sampling. PHP membership descends ERROR subtrees only for exact nullsafe member-name fields and static-call scope envelopes. The Respect `Id` replay (`9db9054da565924ae3001efbafcda2c810a8ed72bc1152d96bbcd845c804dad7`) and `withInput` replay (`48993ff03957b4dbe8654ca3368e0995546cfa51e9b189949ab9ebf85e9a5ec5`) each report zero actionable and zero inverse-precision findings. Exact namespace and constant declaration replays now stop with `exact site did not match a structured non-declaration reference`, as intended. The fix was pushed as `a3aeae37`; the evidence comment is https://github.com/BrokkAi/bifrost/issues/2029#issuecomment-5284237791 and the issue is closed.
