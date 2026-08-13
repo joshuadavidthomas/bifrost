@@ -13,7 +13,10 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 - [x] (2026-08-13 09:41Z) Reused prepared workspace syntax and added cancellation-safe complete/unavailable closure construction.
 - [x] (2026-08-13 09:47Z) Added behavior, update, cancellation, missing/conflicting-context, and deterministic work-count coverage.
 - [x] (2026-08-13 09:52Z) Passed focused unit, integration, compile, clippy, format, dependency, and diff validation.
-- [ ] Commit and push, replay pinned MuJoCo, attach evidence, and close #2095.
+- [x] (2026-08-13 10:08Z) Committed and pushed the closure cache as `db1bebb6`, merged at `578ce51f`.
+- [x] (2026-08-13 10:37Z) Removed recursive local-binding reconstruction from initializer inference and added a 16-link behavior/cost regression.
+- [x] (2026-08-13 10:41Z) Passed six focused resolver unit tests, two existing C++ navigation controls, analysis all-target clippy, format, workspace dependency validation, and diff checks.
+- [ ] Commit and push the follow-up, replay pinned MuJoCo, publish evidence, and close #2095.
 
 ## Surprises & Discoveries
 
@@ -25,6 +28,12 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 
 - Observation: A keyed pool-safe cell is necessary even though the build itself is serial.
   Evidence: forward files are processed by rayon workers. Same-file member queries can race on a cold closure. `PoolSafeMemo::get_or_try_build_pool_independent_while` collapses that race without a worker convoy and declines to publish an interrupted build.
+
+- Observation: The exact replay falsified the assumption that repeated external-header closure construction was the only MuJoCo tail.
+  Evidence: at pushed commit `578ce51f`, files 1-313 completed in 52.3 seconds, but file 314 was still running after eleven minutes. A live GDB stack showed one active worker repeatedly cycling through `cpp_seed_active_path`, `cpp_seed_variable_declaration`, `cpp_infer_type_from_value`, and `cpp_field_receiver_type_units`; the seven peer workers were parked. The external-header closure builder was absent from the stack.
+
+- Observation: initializer inference discards the local-binding engine it is currently building.
+  Evidence: `cpp_seed_binding` owns the already-seeded `LocalInferenceEngine<CppType>`, but `cpp_infer_type_from_value` resolves a field-call receiver through `cpp_field_receiver_type_units`, whose identifier path calls `cpp_bindings_before` from the root. A chain of inferred local initializers therefore rebuilds every prior binding recursively and can grow exponentially.
 
 ## Decision Log
 
@@ -40,9 +49,13 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
   Rationale: the language crate owns the AST interpretation. This avoids reparsing prepared workspace source without moving grammar-dependent code into analysis or introducing text scanning.
   Date/Author: 2026-08-13 / Codex
 
+- Decision: Thread the already-seeded local-binding engine through initializer call-return inference instead of adding a depth cutoff.
+  Rationale: the current engine is the exact structured state visible before the declaration being seeded. Rebuilding it is both redundant and the source of the tail; an arbitrary recursion limit would merely turn a provable receiver into an unknown result. Callers without an active seeding pass retain the ordinary root-based lookup.
+  Date/Author: 2026-08-13 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation and focused gate are complete. External member and boundary lookups now share one typed closure outcome per reference file and analyzer generation. Prepared syntax supplies the workspace seed includes, stable unavailable outcomes are cached without claiming a header, and interrupted work is not published. Seven analyzer tests cover direct/transitive reuse, cancellation and retry, missing and conflicting compile contexts, and analyzer update invalidation. Replay and publication remain.
+The external-header closure implementation and its replay-discovered local-inference follow-up are complete locally. External member and boundary lookups share one typed closure outcome per reference file and analyzer generation. Initializer return-type inference now reuses the exact source-ordered binding engine already being constructed, so a chain of inferred receivers performs one binding build instead of recursively rebuilding each prefix. The old pushed binary completed MuJoCo file 314 at 733.0 seconds, a 680.7-second tail, which proves the cache alone did not meet acceptance. Commit, push, and a replacement replay remain.
 
 ## Context and Orientation
 
@@ -62,6 +75,8 @@ In the language crate, factor AST walking into `external_angle_include_paths_fro
 
 Extend the existing external semantic-pack tests with a small source and fake include tree. Repeated boundary/member calls must report identical results while counters show one closure build and one parse per external header, not one per queried member. Add direct/transitive, conditional, missing/conflicting compile context, and limit/containment controls where existing fixtures already expose them. Add a custom-`keep_going` test that stops a cold build after it starts, then retries and proves a second complete build occurs; the interrupted value must not be published. Update the project source or analyzer and prove a new analyzer rebuilds the closure.
 
+For the replay-discovered follow-up in `crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs`, allow call-return inference invoked from `cpp_seed_binding` to borrow the `LocalInferenceEngine<CppType>` that has already been seeded in source order. When a field-call receiver is an identifier, resolve it from that engine and preserve its shadow verdict; only callers outside an active binding pass build bindings from the root. Add a behavior regression with a long chain of `auto next = previous.member()` declarations. It must resolve the final member while a test-only inference counter proves work grows linearly rather than recursively rebuilding prefixes. Preserve field/member, parenthesized receiver, shadowing, and unknown-receiver controls.
+
 ## Concrete Steps
 
 Work from `/mnt/optane/bifrost-fird`. Edit only with `apply_patch`, then run:
@@ -69,6 +84,7 @@ Work from `/mnt/optane/bifrost-fird`. Edit only with `apply_patch`, then run:
     cargo fmt --all
     cargo test -p brokk-bifrost-cpp external_angle_include_paths --lib
     cargo test -p brokk-bifrost-analysis analyzer::cpp::external::tests --lib
+    cargo test -p brokk-bifrost-analysis analyzer::usages::get_definition::cpp::bounded_tests::initializer_inference_reuses_seeded_bindings --lib
     cargo check -p brokk-bifrost-cpp --all-targets
     cargo check -p brokk-bifrost-analysis --all-targets
     cargo clippy -p brokk-bifrost-core -p brokk-bifrost-cpp -p brokk-bifrost-analysis --all-targets -- -D warnings
@@ -82,6 +98,8 @@ After the focused gate, commit and push on the current branch. Rebuild `bifrost_
 Behavior must remain exact for direct and transitive external headers, conditional include exclusion, missing/conflicting compile context, dependency/package identity, semantic-overlay filtering, and the existing header/byte bounds. A project/analyzer update must discard old closure state. An interrupted build must leave the cell empty and a later uncancelled query must construct the full answer.
 
 The deterministic cost test must issue many member or boundary queries for one source and observe exactly one closure build. The prepared workspace source must be walked without a new parser. External headers must be parsed at most once in the closure build.
+
+The initializer-inference regression must navigate through a chain of typed call-return bindings and prove that each declaration prefix is seeded once for the queried site. A local shadow or an unknown receiver must continue to fail closed; the optimization must not bypass source-order visibility.
 
 The corpus acceptance is pinned MuJoCo steady forward completion through `plugin/usd_decoder/usd_decoder.cc` (file 314/314). Compare its post-fix time with the pre-fix 668.3-second single-file tail, require `status=completed`, `bifrost_dirty=false`, `repo_dirty=false`, and zero file errors.
 
@@ -98,3 +116,5 @@ Pre-fix MuJoCo evidence at Bifrost `3691bb01`:
     single-file tail: 668.3 seconds
 
 Plan revision note (2026-08-13): Created from issue #2095 and the durable rank-31+ C++ replay after #2097 was fixed. The plan records the structured cache key, completion/cancellation contract, prepared-syntax seam, required parity controls, and exact MuJoCo acceptance replay.
+
+Plan revision note (2026-08-13): Recorded the pushed cache implementation and the exact replay's independent recursive local-inference tail. The plan now includes the structured reuse fix and its behavior/cost acceptance rather than incorrectly treating cache publication as issue completion.

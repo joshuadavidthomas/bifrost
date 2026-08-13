@@ -3975,7 +3975,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
         .exact();
     if let Some(operator) = cpp_explicit_operator_name(call) {
         let member = cpp_node_text(operator, ctx.source);
-        let owners = cpp_receiver_type_units(ctx, function, false);
+        let owners = cpp_receiver_type_units(ctx, function, false, None);
         let candidates = cpp_member_candidates_lazy(ctx, owners, member, call_arity, || {
             cpp_call_argument_types(
                 ctx.analyzer,
@@ -6343,6 +6343,7 @@ fn cpp_expression_type(
             source,
             Some(root),
             node,
+            None,
         ),
         "parenthesized_expression" => node
             .child_by_field_name("argument")
@@ -6425,37 +6426,28 @@ fn cpp_receiver_type_units(
     ctx: CppLookupCtx<'_, '_>,
     receiver: Node<'_>,
     unwrap_template_alias: bool,
+    seeded_bindings: Option<&LocalInferenceEngine<CppType>>,
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
             let name = cpp_node_text(receiver, ctx.source);
-            let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
-            if let Some(cpp_type) = first_precise(&bindings, name) {
-                return cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
-                    .into_iter()
-                    .collect();
+            if let Some(bindings) = seeded_bindings {
+                return cpp_identifier_receiver_type_units(
+                    ctx,
+                    receiver,
+                    name,
+                    bindings,
+                    unwrap_template_alias,
+                );
             }
-            if bindings.is_shadowed(name) {
-                Vec::new()
-            } else if let Some(cpp_type) = cpp_enclosing_member_field_type(
-                ctx.analyzer,
-                ctx.support,
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-                ctx.root,
+            let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
+            cpp_identifier_receiver_type_units(
+                ctx,
                 receiver,
                 name,
-            ) {
-                cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
-                    .into_iter()
-                    .collect()
-            } else {
-                ctx.visibility
-                    .resolve_type(ctx.file, name)
-                    .into_iter()
-                    .collect()
-            }
+                &bindings,
+                unwrap_template_alias,
+            )
         }
         "this" => cpp_enclosing_class(
             ctx.analyzer,
@@ -6497,9 +6489,46 @@ fn cpp_receiver_type_units(
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
-            .map(|inner| cpp_receiver_type_units(ctx, inner, unwrap_template_alias))
+            .map(|inner| {
+                cpp_receiver_type_units(ctx, inner, unwrap_template_alias, seeded_bindings)
+            })
             .unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+fn cpp_identifier_receiver_type_units(
+    ctx: CppLookupCtx<'_, '_>,
+    receiver: Node<'_>,
+    name: &str,
+    bindings: &LocalInferenceEngine<CppType>,
+    unwrap_template_alias: bool,
+) -> Vec<CodeUnit> {
+    if let Some(cpp_type) = first_precise(bindings, name) {
+        return cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
+            .into_iter()
+            .collect();
+    }
+    if bindings.is_shadowed(name) {
+        Vec::new()
+    } else if let Some(cpp_type) = cpp_enclosing_member_field_type(
+        ctx.analyzer,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        receiver,
+        name,
+    ) {
+        cpp_receiver_unit_for_access(ctx, cpp_type, unwrap_template_alias)
+            .into_iter()
+            .collect()
+    } else {
+        ctx.visibility
+            .resolve_type(ctx.file, name)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -6514,6 +6543,23 @@ fn cpp_field_receiver_type_units(
     field: Node<'_>,
     receiver: Node<'_>,
 ) -> Vec<CodeUnit> {
+    cpp_field_receiver_type_units_with_bindings(
+        analyzer, support, visibility, file, source, root, field, receiver, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_field_receiver_type_units_with_bindings(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    field: Node<'_>,
+    receiver: Node<'_>,
+    seeded_bindings: Option<&LocalInferenceEngine<CppType>>,
+) -> Vec<CodeUnit> {
     let ctx = CppLookupCtx {
         analyzer,
         support,
@@ -6527,6 +6573,7 @@ fn cpp_field_receiver_type_units(
         ctx,
         receiver,
         cpp_field_expression_uses_arrow(field, source),
+        seeded_bindings,
     )
 }
 
@@ -6986,9 +7033,16 @@ fn cpp_bindings_before(
     root: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CppType> {
+    #[cfg(test)]
+    CPP_BINDINGS_BUILD_COUNT.with(|count| count.set(count.get() + 1));
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     cpp_seed_active_path(ctx, root, cutoff_start, &mut bindings);
     bindings
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CPP_BINDINGS_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn cpp_local_bindings_before(
@@ -7745,7 +7799,21 @@ fn cpp_seed_binding(
         })
         .or_else(|| {
             value.and_then(|value| {
-                cpp_infer_type_from_value(analyzer, support, visibility, file, source, root, value)
+                // This declaration is being seeded in source order, so the
+                // engine already contains exactly the bindings visible to its
+                // initializer. Rebuilding from the function root here makes
+                // chained `auto next = previous.member()` declarations
+                // recursively rebuild every earlier prefix (#2095).
+                cpp_infer_type_from_value(
+                    analyzer,
+                    support,
+                    visibility,
+                    file,
+                    source,
+                    root,
+                    value,
+                    Some(bindings),
+                )
             })
         });
     match resolved {
@@ -8034,6 +8102,7 @@ fn cpp_alias_target_texts<'a>(
         .filter_map(|declaration| cpp_alias_declaration_target_text(&declaration))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cpp_infer_type_from_value(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -8042,6 +8111,7 @@ fn cpp_infer_type_from_value(
     source: &str,
     root: Option<Node<'_>>,
     node: Node<'_>,
+    seeded_bindings: Option<&LocalInferenceEngine<CppType>>,
 ) -> Option<CppType> {
     match node.kind() {
         "new_expression" => {
@@ -8051,7 +8121,14 @@ fn cpp_infer_type_from_value(
             Some(CppType::from_text(analyzer, visibility, file, type_text, 1))
         }
         "call_expression" => cpp_call_return_type(
-            analyzer, support, visibility, file, source, root, node,
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            root,
+            node,
+            seeded_bindings,
         )
         .or_else(|| {
             node.child_by_field_name("function")
@@ -8062,6 +8139,7 @@ fn cpp_infer_type_from_value(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cpp_call_return_type(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -8070,6 +8148,7 @@ fn cpp_call_return_type(
     source: &str,
     root: Option<Node<'_>>,
     call: Node<'_>,
+    seeded_bindings: Option<&LocalInferenceEngine<CppType>>,
 ) -> Option<CppType> {
     let function = call.child_by_field_name("function")?;
     let CallArityEvidence::Exact(arity) = visibility.call_arity_evidence(file, call, source) else {
@@ -8118,8 +8197,16 @@ fn cpp_call_return_type(
             let receiver = function
                 .child_by_field_name("argument")
                 .or_else(|| function.named_child(0))?;
-            let owners = cpp_field_receiver_type_units(
-                analyzer, support, visibility, file, source, root, function, receiver,
+            let owners = cpp_field_receiver_type_units_with_bindings(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                function,
+                receiver,
+                seeded_bindings,
             );
             cpp_member_candidates(
                 CppLookupCtx {
@@ -8376,5 +8463,56 @@ struct holder {
         );
 
         assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+
+    #[test]
+    fn initializer_inference_reuses_seeded_bindings() {
+        let declarations = (1..=16)
+            .map(|index| format!("    auto& value{index} = value{}.next();\n", index - 1))
+            .collect::<String>();
+        let source = format!(
+            "class Node {{\npublic:\n    static Node& GetInstance();\n    Node& next();\n    int value();\n}};\n\n\
+             int read(Node& value0) {{\n{declarations}    return value16.value();\n}}\n"
+        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("chain.cpp", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "chain.cpp");
+        let tree = parse_cpp_tree(&source).expect("C++ tree");
+        let start_byte = source.rfind("value()").expect("final member");
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "value".to_string(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "value".len(),
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "value".len(),
+        };
+
+        CPP_BINDINGS_BUILD_COUNT.with(|count| count.set(0));
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, false);
+        context.bounded_support.set_language(Language::Cpp);
+        let outcome = resolve_cpp(analyzer, &mut context, &file, &source, Some(&tree), &site);
+        let builds = CPP_BINDINGS_BUILD_COUNT.with(std::cell::Cell::get);
+
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "unexpected lookup outcome: {outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1);
+        assert_eq!(outcome.definitions[0].fq_name(), "Node.value");
+        assert_eq!(
+            builds, 1,
+            "initializer inference must reuse the source-ordered binding engine"
+        );
     }
 }
