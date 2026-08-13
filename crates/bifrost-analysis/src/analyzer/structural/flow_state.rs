@@ -1350,6 +1350,43 @@ function beforeEstablishment() {
         );
     }
 
+    /// #2014: a read in return position anchors on the identifier occurrence,
+    /// not on the enclosing `return` statement, so an RQLP capture of that
+    /// identifier joins the event by `ast_id` instead of silently joining
+    /// nothing.
+    #[test]
+    fn a_return_position_read_anchors_on_the_identifier_occurrence() {
+        let fixture = Fixture::new(
+            Language::JavaScript,
+            &[("src/main.js", JS_READ_BEFORE_ESTABLISHMENT)],
+        );
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
+        });
+        let read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read
+                    && matches!(event.subject, FlowSubject::Binding { .. })
+                    && spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
+            })
+            .expect("the returned binding is read");
+        let identifier_start = JS_READ_BEFORE_ESTABLISHMENT
+            .rfind("early")
+            .expect("the fixture returns the binding");
+        assert_eq!(
+            (read.site.range.start_byte, read.site.range.end_byte),
+            (identifier_start, identifier_start + "early".len()),
+            "the read must anchor on the returned identifier, not the statement"
+        );
+        assert!(
+            read.site.ast_id.is_some(),
+            "the identifier anchor must land on a facts-arena node so the RQLP join works"
+        );
+    }
+
     const TS_CONDITIONAL_ESTABLISHMENT: &str = r#"
 function conditionalEstablishment(flag: boolean): number {
   const ns: { value?: number } = {};
@@ -1453,11 +1490,11 @@ function shadowRebind(flag) {
         let reaching = relation_spellings(JS_SHADOW_REBIND, derivation, FlowRelation::Reaching);
         let serving_the_final_read = reaching
             .iter()
-            .filter(|(_, target, _)| *target == "return value;")
+            .filter(|(_, target, _)| *target == "value")
             .collect::<Vec<_>>();
         assert_eq!(
             serving_the_final_read,
-            vec![&("value = 3", "return value;", FlowCertainty::Exact)],
+            vec![&("value = 3", "value", FlowCertainty::Exact)],
             "only the rebind may serve the final read; got {reaching:?}"
         );
     }

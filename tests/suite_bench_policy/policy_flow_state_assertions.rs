@@ -72,8 +72,43 @@ function conditionalEstablishment(flag) {
 }
 "#;
 
+/// #2014: the premature read sits in *return* position. Before the anchoring
+/// fix its state event anchored on the whole `return` statement, no
+/// `value_reference` occurrence carried the event's `ast_id`, and the assert
+/// silently joined nothing -- indistinguishable from a pass. The second return
+/// reads the same binding after its establishment, so one run holds both the
+/// finding and the clean conclusion.
+const JS_RETURN_BEFORE_ESTABLISHMENT: &str = r#"
+function returnBeforeEstablishment(flag) {
+  let early;
+  if (flag) {
+    return early;
+  }
+  early = 1;
+  return early;
+}
+"#;
+
+/// #2014's near miss: the establishment is one-armed, so the return-position
+/// read is reached but not dominated. The `dominated` finding proves the
+/// capture joins the read event; the `reached` pass on the same capture is
+/// therefore a real conclusion, not an assert with nothing to say.
+const JS_RETURN_CONDITIONAL_ESTABLISHMENT: &str = r#"
+function returnConditionalEstablishment(flag) {
+  let early;
+  if (flag) {
+    early = 1;
+  }
+  return early;
+}
+"#;
+
 /// `x = wrap(x)`: the read feeds the very value the write assigns, so the
-/// write cannot serve it (mined commit `9e60fddcb`'s ordering rule).
+/// write cannot serve it (mined commit `9e60fddcb`'s ordering rule). The
+/// procedure deliberately ends at the binder: the `wrap` call uncovers the
+/// same-evaluation axis for every *other* read of `x`, so a trailing
+/// `return x` would make the whole assert honestly inconclusive (#2014 made
+/// that read join; before, it silently did not).
 const JS_SAME_ASSIGNMENT: &str = r#"
 function wrap(value) {
   return value;
@@ -81,7 +116,6 @@ function wrap(value) {
 
 function sameAssignment(x) {
   x = wrap(x);
-  return x;
 }
 "#;
 
@@ -360,6 +394,98 @@ fn a_one_armed_conditional_is_reached_but_not_dominated() {
         observed.contains("is not dominated by any establishment")
             && observed.contains("reaches the read but does not dominate it"),
         "the finding must distinguish reaching from dominance: {observed}"
+    );
+}
+
+/// #2014: a premature read in return position is a finding, not a silent
+/// non-application. The same run's second return reads the binding after its
+/// establishment and stays clean, so the single finding proves the assert
+/// evaluated both joined reads.
+#[test]
+fn a_return_position_read_before_establishment_is_a_finding() {
+    let (_project, workspace) = javascript(JS_RETURN_BEFORE_ESTABLISHMENT);
+    let run = evaluate(
+        &policy(
+            "test.flow.return-before",
+            r#"(identifier :text/regex "^early$" :capture "site")"#,
+            r#"(assert-flow-establishment :id premature-read :at "site" :role value_reference
+                  :require reached)"#,
+        ),
+        &workspace,
+    );
+    assert_eq!(
+        run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{:?}",
+        run.diagnostics()
+    );
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    assert_eq!(assert_kind(&run, 0), "flow_establishment");
+    let observed = assertion_observed(&run, 0);
+    assert!(
+        observed.contains("is not reached by any establishment"),
+        "the finding must state the unmet requirement: {observed}"
+    );
+    assert!(
+        observed.contains("considered: binding at src/main.js:7 (does not reach the read)"),
+        "the finding must name the establishment behind the early return: {observed}"
+    );
+}
+
+/// #2014's near miss: on a return-position read the `reached` requirement
+/// concludes clean *because it joins*, which the `dominated` requirement on
+/// the very same capture proves by producing its finding.
+#[test]
+fn a_return_position_read_after_establishment_concludes_clean_because_it_joins() {
+    let (_project, workspace) = javascript(JS_RETURN_CONDITIONAL_ESTABLISHMENT);
+    let subject = r#"(identifier :text/regex "^early$" :capture "site")"#;
+
+    let reached = evaluate(
+        &policy(
+            "test.flow.return-after.reached",
+            subject,
+            r#"(assert-flow-establishment :id established :at "site" :role value_reference
+                  :require reached)"#,
+        ),
+        &workspace,
+    );
+    assert_eq!(
+        reached.completion(),
+        &PolicyRunCompletion::Complete,
+        "{:?}",
+        reached.diagnostics()
+    );
+    assert!(
+        reached.findings().is_empty(),
+        "the establishment reaches the returned read: {:?}",
+        reached.findings()
+    );
+
+    let dominated = evaluate(
+        &policy(
+            "test.flow.return-after.dominated",
+            subject,
+            r#"(assert-flow-establishment :id established :at "site" :role value_reference
+                  :require dominated)"#,
+        ),
+        &workspace,
+    );
+    assert_eq!(
+        dominated.completion(),
+        &PolicyRunCompletion::Complete,
+        "{:?}",
+        dominated.diagnostics()
+    );
+    assert_eq!(
+        dominated.findings().len(),
+        1,
+        "the dominance finding proves the capture joins the return-position read: {:?}",
+        dominated.findings()
+    );
+    let observed = assertion_observed(&dominated, 0);
+    assert!(
+        observed.contains("is not dominated by any establishment"),
+        "the finding must state the unmet requirement: {observed}"
     );
 }
 

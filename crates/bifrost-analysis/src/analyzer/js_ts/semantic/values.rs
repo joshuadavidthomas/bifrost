@@ -201,9 +201,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some((source, kind)) = source
             && source != target
         {
-            self.append_effect(
+            // The read is spelled by the identifier occurrence itself. `point`
+            // is whatever entry the enclosing evaluation scheduled this
+            // expression at -- for a `return` argument that is the statement
+            // point -- so the event carries its own identifier-anchored
+            // mapping instead of inheriting the point's (#2014).
+            let metadata = self.session.add_node_mapping(builder, node)?;
+            self.session.append_effect_with_metadata(
                 builder,
                 point,
+                metadata,
                 SemanticEffect::ValueFlow {
                     kind,
                     source,

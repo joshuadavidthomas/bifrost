@@ -1108,6 +1108,21 @@ impl<'a> ProcedureLoweringSession<'a> {
         effect: SemanticEffect,
     ) -> Result<(), ProcedureLoweringError> {
         let metadata = self.metadata(point)?;
+        self.append_effect_with_metadata(builder, point, metadata, effect)
+    }
+
+    /// Append an effect whose event anchors on its own source mapping rather
+    /// than inheriting the point's. An effect that models one token of a wider
+    /// evaluation -- a binding read inside a `return`, for example -- is
+    /// spelled by that token, not by whichever statement-level point the
+    /// evaluation happened to be scheduled at.
+    pub(crate) fn append_effect_with_metadata(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        metadata: PointMetadata,
+        effect: SemanticEffect,
+    ) -> Result<(), ProcedureLoweringError> {
         builder.append_event(
             point,
             SemanticEvent::new(effect, metadata.source, metadata.evidence),
