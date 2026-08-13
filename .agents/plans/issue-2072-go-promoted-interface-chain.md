@@ -13,7 +13,7 @@ After this change, finding usages of a Go interface method will include calls ma
 - [x] (2026-08-14 05:31Z) Separated scan candidates from resolution inputs so a query builds compact Go type/import facts from the whole analyzed workspace but retains and scans only candidate/target trees.
 - [x] (2026-08-14 05:56Z) Passed both issue tests, all 57 Go usage-graph tests, Go crate tests, formatting, dependency checks, and focused all-target clippy.
 - [x] (2026-08-14 06:02Z) Rebuilt the release runner and replayed all eight #2072 occurrence keys; each completed with `actionable=0`.
-- [ ] Commit, push, comment on #2072 with evidence, and close it.
+- [x] (2026-08-14 06:10Z) Committed the implementation and validation record, merged the concurrent upstream master, revalidated the focused issue tests, and pushed master at `348e109b4`; issue comment/closure follows this final plan checkpoint.
 
 ## Surprises & Discoveries
 
@@ -33,7 +33,7 @@ After this change, finding usages of a Go interface method will include calls ma
 
 ## Outcomes & Retrospective
 
-The root fix and behavior tests are complete. Narrow authoritative scans now recover methods promoted across package boundaries without reporting hits outside the candidate scope. All focused tests and eight exact corpus replays pass. Commit/push and issue-tracker closure are the only remaining administrative steps.
+The root fix and behavior tests are complete and pushed. Narrow authoritative scans now recover methods promoted across package boundaries without reporting hits outside the candidate scope. All focused tests and eight exact corpus replays pass. The implementation landed through commits `aeebb032a`, `992734dbd`, and merge commit `348e109b4`; only the external issue close remains after this plan checkpoint.
 
 ## Context and Orientation
 
@@ -87,4 +87,4 @@ The representative production chains are Hugo `pageState -> *pageCommon -> page.
 
 Retain `GoEdgeIndex::embedded_field_type_fqns`, `GoEdgeIndex::direct_member_fqns`, and `go_unique_indexed_member_candidate_at_nearest_depth` as the shared structured facts and precedence operator unless investigation proves one of their contracts is wrong. Do not add dependencies or a new crate. Keep `brokk-bifrost-core` free of language-specific code.
 
-Plan revision note: Updated on 2026-08-14 after validation. The final design records a transitive import closure rather than parsing unrelated workspace packages, and the exact eight-site corpus result is now part of the acceptance evidence.
+Plan revision note: Finalized on 2026-08-14 after validation and push. The final design records a transitive import closure rather than parsing unrelated workspace packages, and the exact eight-site corpus result is part of the acceptance evidence.
