@@ -8,7 +8,7 @@ use super::return_type::{
     method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name};
-use crate::java::hierarchy::java_is_interface;
+use crate::java::hierarchy::java_preferred_declaring_owners;
 use brokk_bifrost_core::analyzer::model::{CallableArity, CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -588,15 +588,7 @@ fn nearest_declaring_ancestor_matches_target(
             next_level.extend(provider.get_direct_ancestors(&ancestor));
         }
         if !declaring_owners.is_empty() {
-            let class_owners = declaring_owners
-                .iter()
-                .filter(|owner| !java_is_interface(ctx.java, owner))
-                .collect::<Vec<_>>();
-            let preferred = if class_owners.is_empty() {
-                declaring_owners.iter().collect::<Vec<_>>()
-            } else {
-                class_owners
-            };
+            let preferred = java_preferred_declaring_owners(ctx.java, &declaring_owners);
             return preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name();
         }
         level = next_level;

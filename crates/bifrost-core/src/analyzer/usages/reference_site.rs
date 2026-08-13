@@ -68,7 +68,7 @@ pub fn resolve_reference_site_with_line_starts(
                 ));
             }
             if let Some(root) = root {
-                parsed_leaf_bounds(root, start, end).ok_or_else(|| {
+                parsed_leaf_bounds(root, start, end, language).ok_or_else(|| {
                     "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
                         .to_string()
                 })?
@@ -174,9 +174,18 @@ pub fn resolve_reference_site_with_line_starts(
 /// authoritative token boundary for Unicode identifiers and language-specific
 /// symbolic names. Requiring one real leaf also keeps a range that crosses two
 /// adjacent tokens fail-closed.
-fn parsed_leaf_bounds(root: Node<'_>, start: usize, end: usize) -> Option<(usize, usize)> {
+fn parsed_leaf_bounds(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+    language: Language,
+) -> Option<(usize, usize)> {
     let node = root.descendant_for_byte_range(start, end)?;
-    (node.child_count() == 0
+    let exact_cpp_destructor = language == Language::Cpp
+        && node.kind() == "destructor_name"
+        && node.start_byte() == start
+        && node.end_byte() == end;
+    ((node.child_count() == 0 || exact_cpp_destructor)
         && !node.is_error()
         && !node.is_missing()
         && !node.is_extra()

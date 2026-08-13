@@ -387,6 +387,7 @@ fn indexed_scope_entry<'entry, 'facts>(
     scope_range_index: &'entry [ScopeRangeEntry],
     scope_facts: &'facts HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     node: Node<'_>,
+    mut skip_innermost: usize,
 ) -> Option<(&'entry CodeUnit, &'facts LocalBindingsSnapshot<String>)> {
     let mut cursor =
         scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
@@ -397,6 +398,10 @@ fn indexed_scope_entry<'entry, 'facts>(
             return None;
         }
         if entry.range.end_byte >= node.end_byte() {
+            if skip_innermost > 0 {
+                skip_innermost -= 1;
+                continue;
+            }
             return scope_facts
                 .get(&entry.scope)
                 .map(|facts| (&entry.scope, facts));
@@ -429,7 +434,12 @@ impl ScanCtx<'_> {
         &self,
         node: Node<'_>,
     ) -> Option<(&CodeUnit, &LocalBindingsSnapshot<String>)> {
-        indexed_scope_entry(self.scope_range_index, self.scope_facts, node)
+        indexed_scope_entry(
+            self.scope_range_index,
+            self.scope_facts,
+            node,
+            usize::from(function_declaration_expression_is_outer_scoped(node)),
+        )
     }
 
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
@@ -513,7 +523,7 @@ impl ScanCtx<'_> {
         if enclosing.is_function() {
             return target_owner_code_unit(self.graph.index, &enclosing).as_ref()
                 == Some(target_owner)
-                && function_declaration_expression_is_class_scoped(node);
+                && function_declaration_expression_is_outer_scoped(node);
         }
         target_owner_code_unit(self.graph.index, &enclosing).as_ref() == Some(target_owner)
     }
@@ -679,15 +689,47 @@ impl ScanCtx<'_> {
     }
 }
 
-fn function_declaration_expression_is_class_scoped(node: Node<'_>) -> bool {
+pub(crate) fn function_declaration_expression_is_outer_scoped(node: Node<'_>) -> bool {
     let site_start = node.start_byte();
     let site_end = node.end_byte();
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "function_definition" {
-            return parent.child_by_field_name("body").is_none_or(|body| {
-                !(body.start_byte() <= site_start && site_end <= body.end_byte())
-            });
+            if parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+            {
+                return false;
+            }
+            if parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+            {
+                return false;
+            }
+            if let Some(parameters) = parent.child_by_field_name("parameters")
+                && parameters.start_byte() <= site_start
+                && site_end <= parameters.end_byte()
+            {
+                let mut parameter = node;
+                while parameter.parent() != Some(parameters) {
+                    let Some(next) = parameter.parent() else {
+                        return false;
+                    };
+                    parameter = next;
+                }
+                let binder = if parameter.kind() == "identifier" {
+                    Some(parameter)
+                } else {
+                    parameter.child_by_field_name("name").or_else(|| {
+                        parameter
+                            .named_child(0)
+                            .filter(|child| child.kind() == "identifier")
+                    })
+                };
+                return binder.is_none_or(|binder| binder.id() != node.id());
+            }
+            return true;
         }
         if parent.kind() == "decorated_definition" {
             return current.kind() == "decorator";
@@ -1548,32 +1590,26 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    let parent_kind = parent.kind();
-    if matches!(
-        parent_kind,
-        "class_definition" | "function_definition" | "parameters"
-    ) && parent
-        .child_by_field_name("name")
-        .map(|name| name.id() == node.id())
-        .unwrap_or(false)
-    {
-        return true;
+    let contains = |container: Node<'_>| {
+        container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+    };
+    match parent.kind() {
+        "class_definition" | "function_definition" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "parameters" | "lambda_parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            true
+        }
+        "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+            parent.child_by_field_name("name").is_some_and(contains)
+        }
+        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+            parent.child_by_field_name("left").is_some_and(contains)
+        }
+        "named_expression" => parent.child_by_field_name("name").is_some_and(contains),
+        "aliased_import" | "import_from_statement" | "import_statement" => true,
+        _ => false,
     }
-
-    if matches!(
-        parent_kind,
-        "aliased_import" | "import_from_statement" | "import_statement"
-    ) {
-        return true;
-    }
-
-    parent_kind == "assignment"
-        && parent
-            .child_by_field_name("left")
-            .map(|left| {
-                left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
-            })
-            .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

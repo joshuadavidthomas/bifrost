@@ -798,6 +798,7 @@ fn go_differential(
             max_targets: 1_000,
             max_usage_files: 20,
             max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
             ..ReferenceDifferentialConfig::default()
         },
     )

@@ -77,7 +77,15 @@ where
             ParseSpec::whole(&language),
             |input| {
                 let (alias_packages, dot_packages) = index.namespace_packages(file);
-                scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
+                let import_binding_names = index.import_binding_names(file);
+                scan_go_file(
+                    index,
+                    file_pkg,
+                    alias_packages,
+                    dot_packages,
+                    import_binding_names,
+                    input,
+                )
             },
         )
     })

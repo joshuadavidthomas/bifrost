@@ -1196,6 +1196,9 @@ fn resolve_one<'a>(
         Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
             js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
         }
+        Some(tree) if language == Language::Python => {
+            python::python_site_for_focus(site, tree, &source, request.start_byte, request.end_byte)
+        }
         _ => site,
     };
 

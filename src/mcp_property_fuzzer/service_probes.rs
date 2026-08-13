@@ -288,6 +288,16 @@ pub struct ProbeSummary {
     pub calls_skipped_time_budget: usize,
     /// Distinct symbol fqs that tripped the time budget at least once.
     pub symbols_time_budgeted: usize,
+    /// Eligible (post-filter, in-shard) symbols carrying each anomaly signal;
+    /// a symbol can carry several. See [`super::AnomalySignals`].
+    pub symbols_flagged_duplicate_fq: usize,
+    pub symbols_flagged_generated_file: usize,
+    pub symbols_flagged_exotic_name: usize,
+    pub symbols_flagged_parse_error_file: usize,
+    /// Service-sample slots filled from the anomaly-flagged pool under
+    /// `--anomaly-percent`; 0 either when the percent is 0 or when no
+    /// eligible symbol was flagged.
+    pub symbols_anomaly_selected: usize,
     pub render_mode_comparisons: usize,
     /// Render-mode comparisons whose payloads differed but where at least one
     /// side reported wall-clock partiality (`summary.partial`): the two modes
@@ -755,6 +765,7 @@ fn generate_probes(
     summary: &mut ProbeSummary,
 ) -> Vec<ProbeRecord> {
     let mut service_symbols: Vec<usize> = Vec::new();
+    let mut eligible: Vec<usize> = Vec::new();
     for (index, symbol) in input.symbols.iter().enumerate() {
         if invalid.contains(&index) {
             summary.symbols_excluded_range_invalid += 1;
@@ -787,10 +798,54 @@ fn generate_probes(
         {
             continue;
         }
-        service_symbols.push(index);
-        if service_symbols.len() >= config.max_service_symbols {
-            break;
+        eligible.push(index);
+    }
+    for &index in &eligible {
+        let signals = &input.symbols[index].anomaly_signals;
+        if signals.duplicate_fq {
+            summary.symbols_flagged_duplicate_fq += 1;
         }
+        if signals.generated_file {
+            summary.symbols_flagged_generated_file += 1;
+        }
+        if signals.exotic_name {
+            summary.symbols_flagged_exotic_name += 1;
+        }
+        if signals.parse_error_file {
+            summary.symbols_flagged_parse_error_file += 1;
+        }
+    }
+    if config.anomaly_percent == 0 {
+        // Historical behavior: the first N eligible symbols in census order.
+        service_symbols = eligible
+            .into_iter()
+            .take(config.max_service_symbols)
+            .collect();
+    } else {
+        // Anomaly-directed composition: flagged symbols (campaign-proven
+        // suspicion strata) fill up to anomaly_percent of the cap, the
+        // uniform census-order draw fills the rest, and leftovers from either
+        // pool flow to the other so small or anomaly-poor repos still reach
+        // the cap. Both pools preserve census order, so runs reproduce.
+        let cap = config.max_service_symbols;
+        let quota = cap * config.anomaly_percent as usize / 100;
+        let mut flagged: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&index| input.symbols[index].anomaly_signals.any())
+            .collect();
+        let mut unflagged: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&index| !input.symbols[index].anomaly_signals.any())
+            .collect();
+        let take_flagged = flagged.len().min(quota);
+        service_symbols.extend(flagged.drain(..take_flagged));
+        summary.symbols_anomaly_selected = take_flagged;
+        let take_uniform = unflagged.len().min(cap - service_symbols.len());
+        service_symbols.extend(unflagged.drain(..take_uniform));
+        let backfill = flagged.len().min(cap - service_symbols.len());
+        service_symbols.extend(flagged.drain(..backfill));
     }
     summary.symbols_sampled = service_symbols.len();
 
@@ -2841,5 +2896,160 @@ mod tests {
         let text = capped["blocks"][0]["text"].as_str().unwrap();
         assert!(text.contains("[truncated,"));
         assert!(text.len() < DUMP_PAYLOAD_EXCERPT_BYTES * 2);
+    }
+
+    // --- anomaly-directed service-sample composition ---
+
+    fn probe_symbol(
+        fq_name: &str,
+        signals: crate::mcp_property_fuzzer::AnomalySignals,
+    ) -> SymbolFacts {
+        SymbolFacts {
+            fq_name: fq_name.to_string(),
+            identifier: fq_name.to_string(),
+            display_fq: fq_name.to_string(),
+            kind: CodeUnitType::Function,
+            language: crate::analyzer::Language::Scala,
+            file_index: 0,
+            ranges: vec![crate::analyzer::Range {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+            }],
+            child_indexes: Vec::new(),
+            parent_index: None,
+            aux_constructor: false,
+            anomaly_signals: signals,
+        }
+    }
+
+    fn probe_input(symbols: Vec<SymbolFacts>) -> I1Input {
+        I1Input {
+            files: vec![crate::mcp_property_fuzzer::I1File {
+                path: "src/Fixture.scala".to_string(),
+                text: None,
+                parse_errors: None,
+            }],
+            symbols,
+        }
+    }
+
+    fn probe_config(max_service_symbols: usize, anomaly_percent: u8) -> FuzzerConfig {
+        FuzzerConfig {
+            corpus_language: "scala".to_string(),
+            invariants: vec![InvariantKind::I2],
+            max_symbols: 5_000,
+            max_service_symbols,
+            max_scan_probes: 0,
+            symbol_time_budget_ms: 0,
+            anomaly_percent,
+            symbol_filter: None,
+            path_filter: None,
+            shard: None,
+            seed: 0,
+        }
+    }
+
+    /// The service sample's symbol fqs in selection order, read off the
+    /// `get_symbol_sources#0` probe ids (one per selected symbol).
+    fn selected_fqs(input: &I1Input, config: &FuzzerConfig) -> Vec<String> {
+        let mut summary = ProbeSummary::default();
+        let probes = generate_probes(input, &HashSet::new(), config, &mut summary);
+        let mut fqs: Vec<String> = probes
+            .iter()
+            .filter(|probe| probe.id.starts_with("i2:get_symbol_sources#0:"))
+            .map(|probe| probe.symbol_fq.clone())
+            .collect();
+        fqs.dedup();
+        fqs
+    }
+
+    #[test]
+    fn anomaly_selection_prioritizes_flagged_symbols_within_quota() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            duplicate_fq: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", Default::default()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", Default::default()),
+            probe_symbol("d", Default::default()),
+            probe_symbol("e", flagged()),
+            probe_symbol("f", Default::default()),
+        ]);
+        // cap 4, percent 50: quota 2 flagged (b, e in census order), uniform
+        // fill takes a, c.
+        assert_eq!(
+            selected_fqs(&input, &probe_config(4, 50)),
+            vec!["b", "e", "a", "c"]
+        );
+        // percent 100: quota covers every flagged symbol, no uniform fill.
+        assert_eq!(selected_fqs(&input, &probe_config(2, 100)), vec!["b", "e"]);
+    }
+
+    #[test]
+    fn anomaly_selection_zero_percent_matches_historical_census_order() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            generated_file: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", Default::default()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", Default::default()),
+            probe_symbol("d", flagged()),
+        ]);
+        assert_eq!(
+            selected_fqs(&input, &probe_config(3, 0)),
+            vec!["a", "b", "c"],
+            "percent 0 must reproduce the pre-strata first-N sample exactly"
+        );
+    }
+
+    #[test]
+    fn anomaly_selection_backfills_from_flagged_pool_when_uniform_runs_dry() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            exotic_name: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", flagged()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", flagged()),
+            probe_symbol("d", flagged()),
+            probe_symbol("e", flagged()),
+            probe_symbol("f", Default::default()),
+        ]);
+        // cap 4, percent 50: quota 2 flagged (a, b), uniform pool has only f,
+        // so the last slot backfills from the flagged pool (c).
+        assert_eq!(
+            selected_fqs(&input, &probe_config(4, 50)),
+            vec!["a", "b", "f", "c"]
+        );
+    }
+
+    #[test]
+    fn anomaly_selection_is_deterministic_and_reports_the_mix() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            duplicate_fq: true,
+            parse_error_file: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", flagged()),
+            probe_symbol("b", Default::default()),
+            probe_symbol("c", flagged()),
+        ]);
+        let config = probe_config(3, 50);
+        assert_eq!(selected_fqs(&input, &config), selected_fqs(&input, &config));
+
+        let mut summary = ProbeSummary::default();
+        generate_probes(&input, &HashSet::new(), &config, &mut summary);
+        assert_eq!(summary.symbols_flagged_duplicate_fq, 2);
+        assert_eq!(summary.symbols_flagged_parse_error_file, 2);
+        assert_eq!(summary.symbols_anomaly_selected, 1);
+        assert_eq!(summary.symbols_sampled, 3);
     }
 }

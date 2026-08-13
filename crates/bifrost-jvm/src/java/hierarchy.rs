@@ -48,6 +48,25 @@ pub fn java_is_interface(source: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bo
         })
 }
 
+/// Prefer class owners over interface owners at one Java hierarchy
+/// level. When no class declares the applicable member, every interface owner
+/// remains a peer so callers can preserve honest ambiguity.
+pub fn java_preferred_declaring_owners(
+    source: &dyn CodeUnitIndex,
+    owners: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let class_owners = owners
+        .iter()
+        .filter(|owner| !java_is_interface(source, owner))
+        .cloned()
+        .collect::<Vec<_>>();
+    if class_owners.is_empty() {
+        owners.to_vec()
+    } else {
+        class_owners
+    }
+}
+
 /// The uncached half of the analyzer's `get_direct_ancestors`.
 pub fn java_direct_ancestors(source: &dyn JavaSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
     source

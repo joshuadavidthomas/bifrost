@@ -20,7 +20,7 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::{
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::graph::ast::{
@@ -40,6 +40,7 @@ pub fn scan_go_file(
     file_pkg: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
     let mut ctx = FileScan {
@@ -47,6 +48,7 @@ pub fn scan_go_file(
         file_pkg,
         alias_packages,
         dot_packages,
+        import_binding_names,
         index,
         member_callee_cache: HashMap::default(),
         input,
@@ -62,6 +64,7 @@ struct FileScan<'a> {
     file_pkg: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
     index: &'a GoEdgeIndex,
     member_callee_cache: HashMap<(String, String), Vec<String>>,
     input: &'a FileEdgeScanInput<'a>,
@@ -214,7 +217,7 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
             seed_local_bindings(node, ctx, locals);
         }
         "selector_expression" | "qualified_type" => scan_selector(node, ctx, locals),
-        "identifier" | "type_identifier" => scan_direct(node, ctx, locals),
+        "identifier" | "type_identifier" | "package_identifier" => scan_direct(node, ctx, locals),
         _ => {}
     }
     scan_children(node, ctx, locals);
@@ -417,6 +420,9 @@ fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEn
         return;
     }
     let text = node_text(node, ctx.source).to_string();
+    if ctx.import_binding_names.contains(&text) {
+        return;
+    }
     if locals.is_shadowed(&text) {
         return;
     }

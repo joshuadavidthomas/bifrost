@@ -4,6 +4,7 @@ use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_stat
 use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
+use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +138,39 @@ pub fn census_membership_identifier_ranges(
         &|| false,
     )
     .expect("non-cancellable collection cannot be cancelled")
+}
+
+/// Collect structured identifier occurrences inside Python deferred
+/// annotations for inverse membership. Arbitrary strings and `Literal[...]`
+/// values remain absent, and the ordinary census probe frontier is unchanged.
+pub fn python_deferred_annotation_membership_ranges(
+    root: Node<'_>,
+    source: &str,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "string"
+            && let Some(deferred) = python_deferred_annotation_identifier_ranges(node, source, None)
+        {
+            for range in deferred {
+                if ranges.len() == limit {
+                    ranges.sort_unstable();
+                    ranges.dedup();
+                    return ReferenceCandidateRanges::LimitExceeded { limit, ranges };
+                }
+                ranges.push(range);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ReferenceCandidateRanges::Complete(ranges)
 }
 
 /// Per-file answer to "could a BARE occurrence of this name, at this byte, bind
@@ -335,8 +369,13 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
         (matches!(
             parent.kind(),
             "field_declaration"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_elem"
                 | "type_alias"
                 | "type_spec"
+                | "var_spec"
+                | "const_spec"
                 | "import_spec"
                 | "package_clause"
                 | "parameter_declaration"
@@ -649,6 +688,50 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(added, vec![shorthand], "{language:?}");
         }
+    }
+
+    #[test]
+    fn python_deferred_annotation_membership_excludes_ordinary_and_literal_strings() {
+        let source = concat!(
+            "from typing import Literal\n",
+            "def deferred(value: \"pkg.Widget | list[Gadget]\") -> \"Result\": ...\n",
+            "def ordinary(): return \"Widget\"\n",
+            "def literal(value: Literal[\"Widget\"]): ...\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "models.py");
+        let tree = parse_tree_for_language(&file, Language::Python, source)
+            .expect("failed to parse Python");
+        let ReferenceCandidateRanges::Complete(ranges) =
+            python_deferred_annotation_membership_ranges(tree.root_node(), source, 100)
+        else {
+            panic!("deferred annotation membership budget exceeded");
+        };
+        let offsets = ranges
+            .iter()
+            .map(|range| range.start_byte)
+            .collect::<Vec<_>>();
+        for expected in ["pkg", "Widget |", "list[", "Gadget]", "Result\""] {
+            let offset = source.find(expected).expect("expected deferred token");
+            assert!(
+                offsets.contains(&offset),
+                "deferred token at {offset} is absent: {offsets:?}"
+            );
+        }
+        for excluded in [
+            source.find("return \"Widget\"").expect("ordinary string") + "return \"".len(),
+            source.find("Literal[\"Widget\"]").expect("Literal string") + "Literal[\"".len(),
+        ] {
+            assert!(
+                !offsets.contains(&excluded),
+                "non-type string at {excluded} entered membership: {offsets:?}"
+            );
+        }
+        assert!(matches!(
+            python_deferred_annotation_membership_ranges(tree.root_node(), source, 4),
+            ReferenceCandidateRanges::LimitExceeded { limit: 4, .. }
+        ));
     }
 
     /// Tree-sitter error recovery destroys enclosing declaration nodes: a
@@ -1030,6 +1113,53 @@ func run() {
             assert!(
                 offsets.contains(&reference),
                 "Go reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reference_frontier_excludes_interface_methods_and_value_declarations() {
+        let source = r#"package sample
+
+type Reader interface {
+    Read([]byte) (int, error)
+    Close() error
+}
+
+const Ready, Waiting = 1, 2
+
+func use(reader Reader) int {
+    _, _ = reader.Read(nil)
+    return Ready
+}
+"#;
+        let references = reference_candidate_offsets(Language::Go, "sample.go", source);
+        let census = census_offsets(Language::Go, "sample.go", source);
+        let declaration_offsets = [
+            source.find("Read([]byte)").expect("Read declaration"),
+            source.find("Close() error").expect("Close declaration"),
+            source.find("Ready, Waiting").expect("Ready declaration"),
+            source.find("Waiting =").expect("Waiting declaration"),
+        ];
+        for declaration in declaration_offsets {
+            assert!(
+                census.contains(&declaration),
+                "raw census must retain the declaration at {declaration}: {census:?}"
+            );
+            assert!(
+                !references.contains(&declaration),
+                "declaration at {declaration} entered the reference frontier: {references:?}"
+            );
+        }
+
+        for reference in [
+            source.rfind("Reader").expect("parameter type reference"),
+            source.rfind("Read").expect("method reference"),
+            source.rfind("Ready").expect("constant reference"),
+        ] {
+            assert!(
+                references.contains(&reference),
+                "reference at {reference} left the frontier: {references:?}"
             );
         }
     }

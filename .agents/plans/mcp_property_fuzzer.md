@@ -76,6 +76,15 @@ excluded); I1(c) and I2–I5 run in the service phase through
   no checker, and are counted as `calls_skipped_time_budget` in `probe_summary`;
   0 = unlimited, and the flag is what makes macro-family whales completable),
   `--repo-jobs` (cross-repo parallelism; memory is the binding constraint).
+- Sampling knobs (post-tier-7): `--max-symbols` sizes the cheap I1 census (default
+  50,000; 0 = full census — CPU-free but `I1Input` holds every covered file's source
+  text, so uncapped whales are a memory decision). `--anomaly-percent` (default 50)
+  reserves that share of the service-probe cap for symbols carrying an AnomalySignal
+  (duplicate-fq cluster, generated file, exotic name, parse-error file — the strata
+  seven tiers of signatures actually came from); the uniform hash draw fills the rest,
+  leftovers flow across pools, and 0 reproduces the historical first-N sample exactly
+  (as do pre-field ledger records under `--rerun`). `probe_summary` reports the flag
+  counts and `symbols_anomaly_selected` per run.
 - Merge/survey/audit tooling is small campaign scripts rebuilt per tier (not committed);
   the semantics that must hold: repository records merge append-only, dedupe on
   `(repo_slug, run_fingerprint, report.config.shard.index)`; a run is complete when its
@@ -145,7 +154,9 @@ exemplar note, no new issue: **#1775** (I1 source-text-differs: `#`-directive co
 overrun; interior/mid-line mismatch in class blocks), **#1927** (phalcon-class per-call
 latency: per-request TU re-parse in `CppIdentityRenderCache` + row-by-row
 `hydrate_file_state_with_source`; minutes-to-hours per call on macro-heavy generated
-C), **#1928** (chromium `SegmentInterner` resolve/intern + park/unpark churn).
+C), **#1928** (chromium `SegmentInterner` resolve/intern + park/unpark churn),
+**#2111** (bundle/dist symbols whose display fq embeds path segments — unaddressable
+selector spellings, cross-spelling drift, empty I5 refusals; ts bundles).
 
 ## Checker conventions (expected behavior; do not re-file)
 

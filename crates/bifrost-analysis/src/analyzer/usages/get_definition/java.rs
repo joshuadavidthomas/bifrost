@@ -8,6 +8,7 @@ use crate::analyzer::usages::receiver_analysis::{
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_jvm::java::graph_support::JavaSource;
+use brokk_bifrost_jvm::java::hierarchy::java_preferred_declaring_owners;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
@@ -3123,6 +3124,7 @@ fn java_member_candidates(
         while !level.is_empty() {
             depth += 1;
             let mut level_candidates = Vec::new();
+            let mut declaring_owner_by_candidate = HashMap::default();
             let mut next_level = Vec::new();
             for ancestor in level {
                 if !session.observe_cancellation() {
@@ -3141,6 +3143,9 @@ fn java_member_candidates(
                 if let Some(state) = member_trace.as_mut() {
                     state.record_found(&found, &ancestor, depth);
                 }
+                for candidate in &found {
+                    declaring_owner_by_candidate.insert(candidate.clone(), ancestor.clone());
+                }
                 level_candidates.extend(found);
                 let expanded = session.direct_ancestors(provider, &ancestor);
                 if let Some(state) = member_trace.as_mut() {
@@ -3158,21 +3163,29 @@ fn java_member_candidates(
             let level_applicability =
                 java_candidate_applicability(analyzer, session, &level_candidates, arity);
             if arity.is_some() && !level_applicability.winners.is_empty() {
+                let winners = java_prefer_class_method_candidates(
+                    analyzer,
+                    kind,
+                    level_applicability.winners.clone(),
+                    &declaring_owner_by_candidate,
+                );
                 if let Some(state) = member_trace.as_ref() {
-                    state.stage_selection(
-                        owner,
-                        &level_applicability,
-                        &level_applicability.winners,
-                    );
+                    state.stage_selection(owner, &level_applicability, &winners);
                 }
-                return candidates_outcome(level_applicability.winners);
+                return candidates_outcome(winners);
             }
             if !level_candidates.is_empty() {
                 if arity.is_none() {
+                    let candidates = java_prefer_class_method_candidates(
+                        analyzer,
+                        kind,
+                        level_candidates,
+                        &declaring_owner_by_candidate,
+                    );
                     if let Some(state) = member_trace.as_ref() {
-                        state.stage_selection(owner, &level_applicability, &level_candidates);
+                        state.stage_selection(owner, &level_applicability, &candidates);
                     }
-                    return candidates_outcome(level_candidates);
+                    return candidates_outcome(candidates);
                 }
                 // JLS 15.12.2 applicability (#1755): a level set with no
                 // accepting overload is discarded, never bound. Record the
@@ -3204,6 +3217,39 @@ fn java_member_candidates(
         "no_accepting_overload",
         format!("no indexed `{owner_fqn}.{member}` overload accepts {expected} arguments"),
     )
+}
+
+fn java_prefer_class_method_candidates(
+    analyzer: &dyn IAnalyzer,
+    kind: JavaMemberLookupKind,
+    candidates: Vec<CodeUnit>,
+    declaring_owner_by_candidate: &HashMap<CodeUnit, CodeUnit>,
+) -> Vec<CodeUnit> {
+    if kind != JavaMemberLookupKind::Method || candidates.len() < 2 {
+        return candidates;
+    }
+    let mut owners = candidates
+        .iter()
+        .map(|candidate| {
+            declaring_owner_by_candidate
+                .get(candidate)
+                .expect("hierarchy candidate has its declaring owner")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut owners);
+    owners.dedup();
+    let preferred = java_preferred_declaring_owners(analyzer, &owners);
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            preferred.contains(
+                declaring_owner_by_candidate
+                    .get(candidate)
+                    .expect("hierarchy candidate has its declaring owner"),
+            )
+        })
+        .collect()
 }
 
 /// Whether `owner`'s supertype closure names a type this workspace does not
