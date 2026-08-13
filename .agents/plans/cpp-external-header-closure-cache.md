@@ -18,7 +18,7 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 - [x] (2026-08-13 10:41Z) Passed six focused resolver unit tests, two existing C++ navigation controls, analysis all-target clippy, format, workspace dependency validation, and diff checks.
 - [x] (2026-08-13 10:46Z) Committed and pushed the local-inference follow-up as `eff59cd0`.
 - [x] (2026-08-13 11:02Z) Replayed pinned clean MuJoCo at `eff59cd0`: all 314 forward files completed in 44.3 seconds and the full run completed in 69.6 seconds with no dirty state, file errors, or inverse-precision findings.
-- [ ] Publish the replay evidence and close #2095.
+- [x] (2026-08-13 11:08Z) Published the replay evidence and closed #2095.
 
 ## Surprises & Discoveries
 
@@ -60,7 +60,7 @@ Forward lookup in a C++ source that mentions many unresolved external-looking me
 
 ## Outcomes & Retrospective
 
-The external-header closure implementation and its replay-discovered local-inference follow-up are implemented, validated, committed, pushed, and accepted against the pinned production corpus. External member and boundary lookups share one typed closure outcome per reference file and analyzer generation. Initializer return-type inference reuses the exact source-ordered binding engine already being constructed, so a chain of inferred receivers performs one binding build instead of recursively rebuilding each prefix. The old pushed binary completed MuJoCo file 314 at 733.0 seconds, a 680.7-second tail. At `eff59cd0`, all 314 forward files completed in 44.3 seconds and the full run completed in 69.6 seconds, an 89.5% reduction in total wall time. The report is completed, clean, and contains zero file errors or inverse-precision findings. Publication and issue closure remain as the final administrative step.
+The external-header closure implementation and its replay-discovered local-inference follow-up are implemented, validated, committed, pushed, and accepted against the pinned production corpus. External member and boundary lookups share one typed closure outcome per reference file and analyzer generation. Initializer return-type inference reuses the exact source-ordered binding engine already being constructed, so a chain of inferred receivers performs one binding build instead of recursively rebuilding each prefix. The old pushed binary completed MuJoCo file 314 at 733.0 seconds, a 680.7-second tail. At `eff59cd0`, all 314 forward files completed in 44.3 seconds and the full run completed in 69.6 seconds, an 89.5% reduction in total wall time. The report is completed, clean, and contains zero file errors or inverse-precision findings. The evidence was published on #2095 and the issue is closed.
 
 ## Context and Orientation
 
