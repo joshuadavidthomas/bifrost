@@ -19,7 +19,7 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 - [x] (2026-08-13 12:48Z) Replayed the production pgBackRest macro witness, preserved known macro definitions across unrelated unavailable includes, and pinned identical guarded re-includes, conflicting conditional definitions, and `#undef` controls.
 - [x] (2026-08-13 12:53Z) Re-ran resolver unit tests, the four #2092 integration tests, affected-crate all-target clippy, dependency validation, formatting, and diff checks after the visibility correction.
 - [x] (2026-08-13 13:01Z) Amended checkpoint `e283a796`, rebuilt the release runner, and replayed all three exact witnesses from clean pinned repositories: two resolved with exact inverse hits and the macro-local value was canonically adjudicated, with zero actionable findings, precision findings, or file errors.
-- [ ] Push, publish evidence, and close #2092.
+- [x] (2026-08-13 13:07Z) Pushed `259fed16` to `origin/master`, published focused and exact-replay evidence, and closed #2092 without waiting for the full corpus report, as requested.
 
 ## Surprises & Discoveries
 
@@ -57,7 +57,7 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 
 ## Outcomes & Retrospective
 
-The ordinary typed-binding implementation is pushed, and the macro-produced local completion is committed at `e283a796`. All focused validation and all three clean pinned exact replays pass: strongSwan `usercert` resolves to `private_nm_creds_t.usercert`, pgBackRest `varList` resolves to `VarStore.varList`, both have exact inverse hits, and pgBackRest's direct macro-local `this` is an adjudicated `local_variable_reference`. Publication and issue closure remain.
+Issue #2092 is complete and closed. The ordinary typed-binding implementation and macro-produced local completion are pushed at `259fed16`. All focused validation and all three clean pinned exact replays pass: strongSwan `usercert` resolves to `private_nm_creds_t.usercert`, pgBackRest `varList` resolves to `VarStore.varList`, both have exact inverse hits, and pgBackRest's direct macro-local `this` is an adjudicated `local_variable_reference`. Per the user's instruction, publication did not wait for a full CI or full 813-site corpus report.
 
 ## Context and Orientation
 
