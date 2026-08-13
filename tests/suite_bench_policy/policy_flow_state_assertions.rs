@@ -119,17 +119,43 @@ function sameAssignment(x) {
 }
 "#;
 
-/// A file whose property axis is genuinely partial -- the JavaScript lowering
-/// publishes a field-memory capability gap for `ns.value` -- while the asserted
-/// read is a binding read the derivation states completely. The assert must
-/// still conclude: it consults the axes it names and no others.
+/// A file whose property axis is genuinely partial -- `ns` escapes into the
+/// returned array, so the JavaScript lowering keeps its field-memory
+/// capability gap for `ns.value` (a fully plain namespace no longer carries
+/// one since #2015) -- while the asserted read is a binding read the
+/// derivation states completely. The assert must still conclude: it consults
+/// the axes it names and no others.
 const JS_PARTIAL_BUT_IRRELEVANT: &str = r#"
 function partialButIrrelevant() {
   const ns = {};
   ns.value = 1;
   let total = 0;
   const observed = total;
+  return [observed, ns];
+}
+"#;
+
+/// The #2015 upgrade of the Milestone-5 property shape: a plain object local
+/// used only as a member-access base is lowered without capability gaps, so
+/// the temporal asserts conclude on property reads exactly as on bindings.
+const JS_PROPERTY_AFTER_ESTABLISHMENT: &str = r#"
+function propertyAfterEstablishment() {
+  const ns = {};
+  ns.value = 1;
+  const observed = ns.value;
   return observed;
+}
+"#;
+
+/// The mined `9e60fddcb` property shape end to end: the only establishment of
+/// `ns.value` is one line below its read, so the absence of a reaching row is
+/// a conclusion over covered axes, not an unknown.
+const JS_PROPERTY_BEFORE_ESTABLISHMENT: &str = r#"
+function propertyBeforeEstablishment() {
+  const ns = {};
+  const captured = ns.value;
+  ns.value = 1;
+  return captured;
 }
 "#;
 
@@ -517,6 +543,72 @@ fn a_same_evaluation_binder_is_forbidden_and_names_both_ends() {
         observed.contains("establishment of binding at src/main.js:7")
             && observed.contains("the read of binding at src/main.js:7"),
         "the finding must name both ends of the relation: {observed}"
+    );
+}
+
+/// The property-subject satisfied case (#2015): the store to `ns.value`
+/// dominates its read, and every axis the assert consults is covered, so all
+/// three requirement spellings conclude clean rather than inconclusive.
+#[test]
+fn a_property_read_after_its_establishment_satisfies_both_requirements() {
+    let (_project, workspace) = javascript(JS_PROPERTY_AFTER_ESTABLISHMENT);
+    for require in ["", ":require reached", ":require dominated"] {
+        let run = evaluate(
+            &policy(
+                "test.flow.property.after",
+                r#"(field_access :field (name "value") :capture "site")"#,
+                &format!(
+                    r#"(assert-flow-establishment :id established :at "site"
+                          :role value_reference {require})"#
+                ),
+            ),
+            &workspace,
+        );
+        assert_eq!(
+            run.completion(),
+            &PolicyRunCompletion::Complete,
+            "{require}: the property axes must be covered on the plain-object shape: {:?}",
+            run.diagnostics()
+        );
+        assert!(
+            run.findings().is_empty(),
+            "{require}: the establishment dominates the read: {:?}",
+            run.findings()
+        );
+    }
+}
+
+/// The property-subject mined shape (#2015): the establishment is one line
+/// below the read. With the axes covered, the absence of a reaching row is a
+/// finding that names the considered establishment -- not an unreliable run.
+#[test]
+fn a_property_read_before_its_establishment_is_a_finding_with_the_considered_witness() {
+    let (_project, workspace) = javascript(JS_PROPERTY_BEFORE_ESTABLISHMENT);
+    let run = evaluate(
+        &policy(
+            "test.flow.property.before",
+            r#"(field_access :field (name "value") :capture "site")"#,
+            r#"(assert-flow-establishment :id established :at "site" :role value_reference)"#,
+        ),
+        &workspace,
+    );
+    assert_eq!(
+        run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{:?}",
+        run.diagnostics()
+    );
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    assert_eq!(assert_kind(&run, 0), "flow_establishment");
+    let observed = assertion_observed(&run, 0);
+    assert!(
+        observed.contains("is not reached by any establishment"),
+        "the finding must state the unmet requirement: {observed}"
+    );
+    assert!(
+        observed
+            .contains("considered: property `.value` at src/main.js:5 (does not reach the read)"),
+        "the finding must list the establishment it considered and why it fails: {observed}"
     );
 }
 

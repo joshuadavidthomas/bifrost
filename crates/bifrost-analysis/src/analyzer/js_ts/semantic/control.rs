@@ -42,10 +42,12 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         procedure_targets,
         abruptness: HashMap::default(),
         cleanups: Vec::new(),
+        plain_object_locals: HashMap::default(),
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
+    context.collect_plain_object_locals(&mut builder, spec.body)?;
     if spec.properties.is_generator {
         context.add_gap(
             &mut builder,
@@ -282,7 +284,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     member: self.memory_member_locator(property)?,
                 },
             )?;
-            self.add_field_identity_gap(builder, terminal, location)?;
+            // A field store on an established plain object local creates or
+            // rewrites a data property of the local literal; its identity
+            // needs no further resolution.
+            if !self.established_plain_object_base(left, object) {
+                self.add_field_identity_gap(builder, terminal, location)?;
+            }
             self.append_effect(
                 builder,
                 terminal,
@@ -1156,11 +1163,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
+            "object" => {
+                // The literal's creation completes after its members
+                // evaluate, so the allocation sits on a terminal point the
+                // member expressions flow into.
+                let terminal = self.point(builder, node, Vec::new())?;
+                self.session
+                    .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+                self.edge(builder, terminal, next)?;
+                let children = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() != "comment")
+                    .collect::<Vec<_>>();
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
             "augmented_assignment_expression"
             | "update_expression"
             | "sequence_expression"
             | "array"
-            | "object"
             | "pair"
             | "spread_element"
             | "template_string"
@@ -1258,7 +1285,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), TsLoweringError> {
         let object = required_field(node, "object")?;
         let access = self.point(builder, node, Vec::new())?;
-        self.implicit_exception_gap(builder, access, node)?;
+        // A field read on an established plain object local resolves to a
+        // data property of the local literal: no accessor, proxy trap, or
+        // unresolved field identity remains, so neither gap applies.
+        let established_plain_base =
+            node.kind() == "member_expression" && self.established_plain_object_base(node, object);
+        if !established_plain_base {
+            self.implicit_exception_gap(builder, access, node)?;
+        }
         if node.kind() == "subscript_expression" {
             let index = required_field(node, "index")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
@@ -1294,7 +1328,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     member: self.memory_member_locator(property)?,
                 },
             )?;
-            self.add_field_identity_gap(builder, access, location)?;
+            if !established_plain_base {
+                self.add_field_identity_gap(builder, access, location)?;
+            }
             self.append_effect(
                 builder,
                 access,
