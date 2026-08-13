@@ -43,6 +43,7 @@ mod go_semantic_diagnostics;
 mod icfg_contract;
 mod issue_2057_python_deferred_annotation_membership;
 mod issue_2074_go_declaration_probe_eligibility;
+mod issue_2086_java_error_membership;
 mod java_semantic_diagnostics;
 mod js_ts_dependency_semantic_pack;
 mod js_ts_semantic_diagnostics;
