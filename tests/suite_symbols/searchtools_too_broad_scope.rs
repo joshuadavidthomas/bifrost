@@ -222,3 +222,78 @@ fn get_symbol_sources_too_broad_render_names_target_counts_and_narrowing() {
     assert!(rendered.contains("wide/Wide00.java"), "{rendered}");
     assert!(rendered.contains("list_symbols"), "{rendered}");
 }
+
+/// #2111: a too-broad target is the one failure payload that carried no
+/// corrective text of its own. The declarations flavour has no sample by
+/// construction, so a structured consumer saw `sources: []`, `not_found: []`,
+/// `ambiguous: []` and a bare count -- a refusal with no next step in it. Both
+/// flavours now state their remedy structurally, and the rendered text prints
+/// that same sentence rather than a second copy of it.
+#[test]
+fn too_broad_scopes_state_their_remedy_in_the_structured_payload() {
+    let project = fixture();
+    let service = service(&project);
+
+    let value = symbol_sources_json(&service, r#"{"symbols":["wide/**"]}"#);
+    let too_broad = array(&value, "too_broad");
+    assert_eq!(1, too_broad.len(), "{value}");
+    let note = too_broad[0]["note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!note.trim().is_empty(), "{value}");
+
+    let payload = service
+        .call_tool_payload_json(
+            "get_symbol_sources",
+            r#"{"symbols":["wide/**"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let rendered_value: Value = serde_json::from_str(&payload).unwrap();
+    let rendered = rendered_value["rendered_text"]
+        .as_str()
+        .expect("rendered text");
+    assert!(
+        rendered.contains(&note),
+        "the rendered text must state the same remedy: {rendered}"
+    );
+}
+
+/// The resolution-fan-out flavour, which reaches `too_broad` through a plain
+/// symbol selector rather than a glob. This is the reply shape the #2111
+/// fuzzer run scored as an empty refusal: no sources, no not_found, no
+/// ambiguous, and (before the fix) a bare count.
+#[test]
+fn over_cap_symbol_resolution_reports_too_broad_with_a_remedy() {
+    let project = wide_member_fixture();
+    let service = service(&project);
+
+    let value = symbol_sources_json(&service, r#"{"symbols":["value"]}"#);
+    let too_broad = array(&value, "too_broad");
+    assert_eq!(1, too_broad.len(), "{value}");
+    let scope = &too_broad[0];
+    assert_eq!("value", scope["target"], "{value}");
+    assert_eq!("declarations", scope["matched_kind"], "{value}");
+    assert!(
+        !scope["note"].as_str().unwrap_or_default().trim().is_empty(),
+        "{value}"
+    );
+    assert!(array(&value, "sources").is_empty(), "{value}");
+}
+
+/// More declarations of one member name than the resolution cap admits, so a
+/// bare selector for that name trips the fan-out guard.
+fn wide_member_fixture() -> BuiltInlineTestProject {
+    const CLASSES: usize = 260;
+    let mut project = InlineTestProject::new();
+    for index in 0..CLASSES {
+        project = project.file(
+            format!("members/Member{index:03}.java"),
+            format!(
+                "public class Member{index:03} {{ public int value() {{ return {index}; }} }}\n"
+            ),
+        );
+    }
+    project.build()
+}

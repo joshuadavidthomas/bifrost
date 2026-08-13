@@ -267,6 +267,13 @@ pub struct ProbeSummary {
     /// Go blank identifiers (`_`) skipped at generation: unaddressable, and
     /// every blank in a package shares one fq.
     pub symbols_excluded_blank_identifier: usize,
+    /// Symbols skipped at generation because their recorded terminal segment
+    /// is not identifier-shaped, so the bare-terminal spelling every
+    /// selector invariant starts from does not exist for them: JS/TS
+    /// object-literal keys such as `"data/web-interface.csv"`, C++
+    /// `operator<<`, JVM `<init>`. Counted rather than dropped silently, so a
+    /// corpus that is mostly such names is visible in the summary (#2111).
+    pub symbols_excluded_non_ident_identifier: usize,
     pub selector_probes: usize,
     pub definition_probes: usize,
     pub definition_batch_probes: usize,
@@ -771,7 +778,21 @@ fn generate_probes(
             summary.symbols_excluded_range_invalid += 1;
             continue;
         }
-        if symbol.ranges.is_empty() || !is_ident_like(&symbol.identifier) {
+        if symbol.ranges.is_empty() {
+            continue;
+        }
+        // A module unit is named after its file (`utils.ts`), which is not
+        // identifier-shaped; I2 excludes it by kind further down, with its own
+        // counter, and the other invariants still probe it. So the
+        // identifier-shape gate applies to every other kind only.
+        //
+        // Until #2111 this exemption was unnecessary by accident: the fuzzer
+        // read a symbol's terminal through a helper that split the rendered
+        // name on `.`, so a module unit arrived here spelled `ts` and a
+        // slash-bearing object-literal key arrived spelled `csv`. Both passed
+        // the gate, and both produced selector spellings that named nothing.
+        if symbol.kind != CodeUnitType::Module && !is_ident_like(&symbol.identifier) {
+            summary.symbols_excluded_non_ident_identifier += 1;
             continue;
         }
         // Go blank identifiers (`var _ Iface = ...`): unaddressable by any
@@ -2678,11 +2699,11 @@ pub fn check_i4(
 }
 
 /// I5: every failure-status response must carry actionable next-step content.
-/// What counts as actionable per tool: a `note` on not-found entries, a
-/// non-empty matches/candidates list on ambiguous entries, diagnostics with
-/// messages on definition lookups, a message on scan failures, or a note on
-/// empty searches. A response with no content and no failure payload at all
-/// is an empty refusal.
+/// What counts as actionable per tool: a `note` on not-found and too-broad
+/// entries, a non-empty matches/candidates list on ambiguous entries,
+/// diagnostics with messages on definition lookups, a message on scan
+/// failures, or a note on empty searches. A response with no content and no
+/// failure payload at all is an empty refusal.
 pub fn check_i5(
     records: &[&ProbeRecord],
     language: &str,
@@ -2722,6 +2743,24 @@ pub fn check_i5(
                             "kind": "ambiguous",
                             "target": entry.get("target"),
                             "problem": "no candidate list",
+                        }));
+                    }
+                }
+                // A skipped target is a failure payload too. The
+                // declarations flavour carries no sample by construction (the
+                // candidate list is the work the cap skipped), so its `note`
+                // is the whole of its guidance; without examining this field
+                // at all, every over-cap selector read as an empty refusal
+                // (#2111).
+                for entry in array_field(structured, "too_broad") {
+                    any_failure_payload = true;
+                    examined += 1;
+                    let note = entry.get("note").and_then(Value::as_str).unwrap_or("");
+                    if note.trim().is_empty() {
+                        failures.push(json!({
+                            "kind": "too_broad",
+                            "target": entry.get("target"),
+                            "problem": "missing corrective note",
                         }));
                     }
                 }

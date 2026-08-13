@@ -2560,6 +2560,25 @@ impl CodeUnit {
         self.0.fq.prefix(self.0.package_segment_count)
     }
 
+    /// This declaration's qualified name as its recorded segment texts, root to
+    /// leaf.
+    ///
+    /// These are the boundaries the language extractor recorded, which the
+    /// rendered `fq_name()` cannot always be split back into: a segment may
+    /// itself contain `.`, `/` or `::` (a JS/TS object-literal key such as
+    /// `"data/web-interface.csv"`, a Go import-path head such as `github.com`).
+    /// Any consumer that needs the segments must read them here rather than
+    /// re-split the rendered string (#2111).
+    pub fn fq_segment_texts(&self) -> Vec<String> {
+        let interner = segment_interner();
+        self.0
+            .fq
+            .segments()
+            .iter()
+            .map(|&id| interner.resolve(id).0.to_string())
+            .collect()
+    }
+
     /// Debug/test-only view of the structured `fq` as ordered `(kind_name,
     /// text)` pairs. Public so integration tests in `tests/` (compiled against
     /// the lib in debug builds, where `debug_assertions` is on) can assert that
