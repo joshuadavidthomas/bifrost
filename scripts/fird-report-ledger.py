@@ -39,10 +39,11 @@ def main() -> int:
     parser.add_argument("--exact-output-root", type=Path, required=True)
     args = parser.parse_args()
 
+    decoder = json.JSONDecoder()
+    records = map(decoder.decode, args.input.read_text().splitlines())
     rows = []
     seen = set()
-    for line in args.input.read_text().splitlines():
-        record = json.loads(line)
+    for record in records:
         if record.get("status") != "completed":
             continue
         report = record["report"]
@@ -112,10 +113,10 @@ def main() -> int:
                 "disposition": None,
             })
 
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+    output = "\n".join(map(encoder.encode, rows))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w") as stream:
-        for row in rows:
-            stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+    args.output.write_text(output + ("\n" if output else ""))
     return 0
 
 
