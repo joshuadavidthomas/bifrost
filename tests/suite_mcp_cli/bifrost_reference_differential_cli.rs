@@ -58,6 +58,45 @@ fn corpus_exact_repo_and_language_filters_override_size_ranking() {
 }
 
 #[test]
+fn corpus_task_ranking_uses_tasks_selector_and_stable_task_count_order() {
+    let fixture = CorpusFixture::new();
+    fixture.add_repo("java", "large_loc__few_tasks", 500, true);
+    fixture.add_repo("java", "small_loc__many_tasks", 100, true);
+    fixture.add_repo("java", "tie_first", 200, true);
+    fixture.add_repo("java", "tie_second", 300, true);
+    let brokkbench = fixture.fake_brokkbench(&[
+        ("large_loc__few_tasks", 1),
+        ("tie_second", 2),
+        ("tie_first", 2),
+        ("small_loc__many_tasks", 3),
+    ]);
+    let brokkbench_arg = brokkbench.to_string_lossy().into_owned();
+
+    let output = fixture.run(&[
+        "run-corpus",
+        "--language",
+        "java",
+        "--repos-per-language",
+        "3",
+        "--task-ranked",
+        "--brokkbench-root",
+        &brokkbench_arg,
+        "--dry-run",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let slugs = stdout
+        .lines()
+        .map(|line| line.split('\t').nth(1).expect("slug"))
+        .collect::<Vec<_>>();
+    assert_eq!(slugs, ["small_loc__many_tasks", "tie_second", "tie_first"]);
+}
+
+#[test]
 fn corpus_runs_distinct_repositories_concurrently_and_resumes_safely() {
     let fixture = CorpusFixture::new();
     for (slug, code_loc) in [
@@ -372,6 +411,51 @@ fn run_repo_completion_identity_includes_cache_mode() {
 }
 
 #[test]
+fn run_repo_shards_partition_the_unsharded_sample_and_resume_separately() {
+    let fixture = TinyRepoFixture::new("tiny__rust_shards");
+    for shard in ["1/2", "2/2"] {
+        let output = fixture.run(&["--cache-mode", "ephemeral", "--shard", shard]);
+        assert!(
+            output.status.success(),
+            "shard {shard} stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let unsharded = fixture.run(&["--cache-mode", "ephemeral"]);
+    assert!(
+        unsharded.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&unsharded.stderr)
+    );
+
+    let records = fs::read_to_string(&fixture.output)
+        .expect("read shard report")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse record"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3, "{records:#?}");
+    assert_eq!(records[0]["report"]["config"]["shard"]["index"], 1);
+    assert_eq!(records[1]["report"]["config"]["shard"]["index"], 2);
+    assert!(records[2]["report"]["config"]["shard"].is_null());
+    assert_eq!(
+        records[0]["report"]["summary"]["audited_files"]
+            .as_u64()
+            .unwrap()
+            + records[1]["report"]["summary"]["audited_files"]
+                .as_u64()
+                .unwrap(),
+        records[2]["report"]["summary"]["audited_files"]
+            .as_u64()
+            .unwrap()
+    );
+    let fingerprints = records
+        .iter()
+        .map(|record| record["run_fingerprint"].as_str().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(fingerprints.len(), 3);
+}
+
+#[test]
 fn run_repo_cpp_reports_inverse_visibility_progress() {
     let fixture = TinyCppRepoFixture::new("tiny__cpp");
     let output = fixture.run(&["--cache-mode", "ephemeral"]);
@@ -618,6 +702,24 @@ impl CorpusFixture {
 
     fn path(&self, name: &str) -> std::path::PathBuf {
         self._temp.path().join(name)
+    }
+
+    fn fake_brokkbench(&self, rows: &[(&str, usize)]) -> std::path::PathBuf {
+        let root = self._temp.path().join("brokkbench");
+        fs::create_dir_all(&root).expect("brokkbench root");
+        let rows = rows
+            .iter()
+            .map(|(slug, count)| format!("    RepoRef('java', {slug:?}, {count}),"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            root.join("tasks.py"),
+            format!(
+                "from dataclasses import dataclass\nfrom types import SimpleNamespace\n\n@dataclass\nclass RepoRef:\n    lang: str\n    repo_slug: str\n    task_count: int\n\nSFT_PREDICATES = SimpleNamespace(not_overlarge=True)\nROWS = [\n{rows}\n]\n\ndef task_repos(predicates, *, commits_dir, langs):\n    assert predicates.not_overlarge\n    return [row for row in ROWS if row.lang in langs]\n"
+            ),
+        )
+        .expect("fake tasks.py");
+        root
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {

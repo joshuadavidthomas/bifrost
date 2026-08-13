@@ -56,6 +56,48 @@ pub struct ReferenceDifferentialConfig {
     /// be reported under. Only consulted for `probe_seed == Census`.
     #[serde(default)]
     pub tiers: TierSelection,
+    /// Optional hash partition of the globally sampled file set. Shards are
+    /// disjoint and their union is the same set selected by an unsharded run.
+    #[serde(default)]
+    pub shard: Option<ReferenceShardSpec>,
+}
+
+/// A one-based hash partition used by `--shard K/N` corpus runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceShardSpec {
+    pub index: usize,
+    pub count: usize,
+}
+
+impl ReferenceShardSpec {
+    pub fn new(index: usize, count: usize) -> Result<Self, String> {
+        if count == 0 {
+            return Err("--shard count must be at least 1".to_string());
+        }
+        if index == 0 || index > count {
+            return Err(format!("--shard index {index} is out of range 1..={count}"));
+        }
+        Ok(Self { index, count })
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (index, count) = value
+            .split_once('/')
+            .ok_or_else(|| format!("--shard expects K/N, got `{value}`"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| format!("--shard index `{index}` is not a positive integer"))?;
+        let count = count
+            .parse::<usize>()
+            .map_err(|_| format!("--shard count `{count}` is not a positive integer"))?;
+        Self::new(index, count)
+    }
+
+    fn contains(self, seed: u64, path: &str) -> bool {
+        let digest = stable_hash(seed, path.as_bytes());
+        let bucket = u64::from_le_bytes(digest[..8].try_into().expect("eight digest bytes"));
+        self.count == 1 || bucket % self.count as u64 == (self.index - 1) as u64
+    }
 }
 
 /// The probe frontier that proposes reference sites to the differential.
@@ -127,6 +169,7 @@ impl Default for ReferenceDifferentialConfig {
             exact_site: None,
             probe_seed: ProbeSeed::Index,
             tiers: TierSelection::default(),
+            shard: None,
         }
     }
 }
@@ -144,12 +187,17 @@ pub struct ReferenceDifferentialReport {
     pub config: ReferenceDifferentialConfig,
     pub summary: ReferenceDifferentialSummary,
     pub sites: Vec<ReferenceDifferentialSite>,
+    #[serde(default)]
+    pub inverse_precision_findings: Vec<InversePrecisionFinding>,
     pub file_errors: Vec<ReferenceDifferentialFileError>,
 }
 
 impl ReferenceDifferentialReport {
     pub fn actionable_count(&self) -> usize {
-        self.summary.classifications.missing
+        self.summary
+            .classifications
+            .missing
+            .saturating_add(self.summary.inverse_precision_unbacked_hits)
     }
 
     pub fn has_actionable_findings(&self) -> bool {
@@ -173,6 +221,8 @@ pub struct ReferenceDifferentialSummary {
     pub skipped_targets: usize,
     pub target_truncated_sites: usize,
     pub classifications: ReferenceClassificationCounts,
+    #[serde(default)]
+    pub inverse_precision_unbacked_hits: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -219,6 +269,9 @@ pub struct ReferenceDifferentialSite {
     pub note: Option<String>,
     pub inverse_hit: Option<InverseHitEvidence>,
     pub diagnostics: Vec<ReferenceDiagnostic>,
+    /// Tree-sitter node context for ledger signature grouping.
+    #[serde(default)]
+    pub syntactic_shape: String,
     /// The probe frontier that proposed this site: `"index"` or `"census"`.
     #[serde(default = "default_seed_tag")]
     pub seed: String,
@@ -250,6 +303,21 @@ pub struct InverseHitEvidence {
     pub kind: String,
     pub exact_range: bool,
     pub snippet: String,
+}
+
+/// An inverse result whose range contains no census occurrence of the target's
+/// literal terminal name. Alias-aware precision is intentionally future work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InversePrecisionFinding {
+    pub signature: String,
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub line: usize,
+    pub kind: String,
+    pub snippet: String,
+    pub expected_names: Vec<String>,
+    pub targets: Vec<StableDeclarationIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +378,7 @@ struct SampledSite {
     range: Range,
     csharp_nameof_argument: bool,
     point_lookup: bool,
+    syntactic_shape: String,
 }
 
 impl Ord for SampledSite {
@@ -341,6 +410,8 @@ struct PreparedInverseGroup {
     group: ResolvedGroup,
     candidate_files: HashSet<ProjectFile>,
 }
+
+type CensusMembership = HashMap<String, Option<HashSet<(usize, usize, String)>>>;
 
 struct ForwardFileResult {
     records: Vec<ReferenceDifferentialSite>,
@@ -399,6 +470,16 @@ pub fn run_reference_differential_with_progress(
         &mut summary,
         &mut file_errors,
     )?;
+    let census_membership = if config.probe_seed == ProbeSeed::Census {
+        collect_census_membership(
+            analyzer,
+            &audited,
+            requested_language,
+            config.max_candidates_per_file,
+        )
+    } else {
+        HashMap::default()
+    };
     summary.sampled_sites = sampled.len();
     progress(ReferenceDifferentialProgress::Sampling {
         sampled_sites: summary.sampled_sites,
@@ -421,9 +502,10 @@ pub fn run_reference_differential_with_progress(
         resolved_sites: groups.iter().map(|group| group.site_indexes.len()).sum(),
         distinct_targets: summary.distinct_targets,
     });
-    compare_inverse(
+    let inverse_precision_findings = compare_inverse(
         analyzer,
         &audited,
+        &census_membership,
         groups,
         config,
         &mut records,
@@ -438,14 +520,51 @@ pub fn run_reference_differential_with_progress(
         classify_census_gaps(analyzer, config, &mut records);
     }
     recompute_classifications(&records, &mut summary.classifications);
+    summary.inverse_precision_unbacked_hits = inverse_precision_findings.len();
 
     Ok(ReferenceDifferentialReport {
         root: analyzer.project().root().display().to_string(),
         config: config.clone(),
         summary,
         sites: records,
+        inverse_precision_findings,
         file_errors,
     })
+}
+
+fn collect_census_membership(
+    analyzer: &dyn IAnalyzer,
+    audited: &[ProjectFile],
+    language: Language,
+    max_candidates_per_file: usize,
+) -> CensusMembership {
+    let mut membership = HashMap::default();
+    for file in audited {
+        let Some(source) = analyzer.indexed_source(file) else {
+            continue;
+        };
+        let context = DeclarationNameRangeContext::new(file, source.clone());
+        let Some(root) = context.root_node() else {
+            continue;
+        };
+        let ranges = match census_identifier_ranges(root, language, max_candidates_per_file) {
+            ReferenceCandidateRanges::Complete(ranges) => ranges,
+            ReferenceCandidateRanges::LimitExceeded { .. } => {
+                membership.insert(rel_path_string(file), None);
+                continue;
+            }
+        };
+        let entries = ranges
+            .into_iter()
+            .filter_map(|range| {
+                source
+                    .get(range.start_byte..range.end_byte)
+                    .map(|text| (range.start_byte, range.end_byte, text.to_string()))
+            })
+            .collect();
+        membership.insert(rel_path_string(file), Some(entries));
+    }
+    membership
 }
 
 fn eligible_files_with_inventory(
@@ -592,6 +711,9 @@ fn select_audited_files(
     }
     eligible.sort_by_cached_key(|file| stable_hash(config.seed, rel_path_string(file).as_bytes()));
     eligible.truncate(config.max_files);
+    if let Some(shard) = config.shard {
+        eligible.retain(|file| shard.contains(config.seed, &rel_path_string(file)));
+    }
     eligible.sort();
     eligible
 }
@@ -760,6 +882,13 @@ fn collect_sampled_sites(
                         )
                     });
             let point_lookup = reference_candidate_requires_point_lookup(root, language, &range);
+            let syntactic_shape = root
+                .descendant_for_byte_range(range.start_byte, range.end_byte)
+                .map(|node| match node.parent() {
+                    Some(parent) => format!("{}>{}", parent.kind(), node.kind()),
+                    None => node.kind().to_string(),
+                })
+                .unwrap_or_else(|| "unknown".to_string());
             let priority = site_priority(config.seed, &path, &range);
             push_bounded(
                 &mut heap,
@@ -769,6 +898,7 @@ fn collect_sampled_sites(
                     range,
                     csharp_nameof_argument,
                     point_lookup,
+                    syntactic_shape,
                 },
                 config.max_sites,
             );
@@ -930,6 +1060,7 @@ fn forward_resolve_file(
             },
             inverse_hit: None,
             diagnostics,
+            syntactic_shape: site.syntactic_shape,
             seed: default_seed_tag(),
             tier: None,
         });
@@ -1029,13 +1160,14 @@ fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
 fn compare_inverse(
     analyzer: &dyn IAnalyzer,
     audited_files: &[ProjectFile],
+    census_membership: &CensusMembership,
     mut groups: Vec<ResolvedGroup>,
     config: &ReferenceDifferentialConfig,
     records: &mut [ReferenceDifferentialSite],
     summary: &mut ReferenceDifferentialSummary,
     progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
     worker_pool: &rayon::ThreadPool,
-) -> Result<(), String> {
+) -> Result<Vec<InversePrecisionFinding>, String> {
     let files_by_path: HashMap<String, ProjectFile> = audited_files
         .iter()
         .cloned()
@@ -1091,12 +1223,13 @@ fn compare_inverse(
 
     summary.queried_targets += prepared.len();
     if prepared.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let total = prepared.len();
     let records = Mutex::new(records);
     let completed = Mutex::new(0usize);
+    let precision_findings = Mutex::new(Vec::new());
     // Nested UsageFinder queries share this outer request context, allowing
     // immutable per-file syntax to be prepared once across target groups.
     let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
@@ -1181,12 +1314,25 @@ fn compare_inverse(
                 // The short lock expresses that invariant safely without retaining every
                 // potentially large query result until the slowest target finishes.
                 let mut records = records.lock().expect("inverse record lock poisoned");
-                classify_group_result(
+                let proven = classify_group_result(
                     &mut records,
                     &prepared.group,
                     result,
                     &prepared.candidate_files,
                 );
+                drop(records);
+                let findings = inverse_precision_findings(
+                    analyzer,
+                    &prepared.group.targets,
+                    &proven,
+                    census_membership,
+                );
+                if !findings.is_empty() {
+                    precision_findings
+                        .lock()
+                        .expect("inverse precision lock poisoned")
+                        .extend(findings);
+                }
             }
             let mut completed = completed.lock().expect("inverse progress lock poisoned");
             *completed += 1;
@@ -1197,7 +1343,24 @@ fn compare_inverse(
             });
         });
     });
-    finish_inverse_query(&query_scope)
+    finish_inverse_query(&query_scope)?;
+    let mut findings = precision_findings
+        .into_inner()
+        .expect("inverse precision lock poisoned");
+    findings.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_byte.cmp(&right.start_byte))
+            .then_with(|| left.end_byte.cmp(&right.end_byte))
+            .then_with(|| left.expected_names.cmp(&right.expected_names))
+    });
+    findings.dedup_by(|left, right| {
+        left.path == right.path
+            && left.start_byte == right.start_byte
+            && left.end_byte == right.end_byte
+            && left.expected_names == right.expected_names
+    });
+    Ok(findings)
 }
 
 fn finish_inverse_query(
@@ -1223,7 +1386,7 @@ fn classify_group_result(
     group: &ResolvedGroup,
     result: FuzzyResult,
     candidate_files: &HashSet<ProjectFile>,
-) {
+) -> Vec<UsageHit> {
     match result {
         FuzzyResult::Success {
             hits_by_overload,
@@ -1248,6 +1411,7 @@ fn classify_group_result(
                 &unproven,
                 unproven_truncated,
             );
+            proven
         }
         FuzzyResult::Ambiguous {
             hits_by_overload, ..
@@ -1267,24 +1431,80 @@ fn classify_group_result(
                     record.note = Some("inverse usage result was ambiguous".to_string());
                 }
             }
+            proven
         }
         FuzzyResult::Failure {
             fq_name, reason, ..
-        } => set_group_inconclusive(
-            records,
-            &group.site_indexes,
-            &format!("inverse failure for {fq_name}: {reason}"),
-        ),
+        } => {
+            set_group_inconclusive(
+                records,
+                &group.site_indexes,
+                &format!("inverse failure for {fq_name}: {reason}"),
+            );
+            Vec::new()
+        }
         FuzzyResult::TooManyCallsites {
             total_callsites,
             limit,
             ..
-        } => set_group_inconclusive(
-            records,
-            &group.site_indexes,
-            &format!("inverse call-site limit exceeded: {total_callsites} > {limit}"),
-        ),
+        } => {
+            set_group_inconclusive(
+                records,
+                &group.site_indexes,
+                &format!("inverse call-site limit exceeded: {total_callsites} > {limit}"),
+            );
+            Vec::new()
+        }
     }
+}
+
+fn inverse_precision_findings(
+    analyzer: &dyn IAnalyzer,
+    targets: &[CodeUnit],
+    hits: &[UsageHit],
+    census_membership: &CensusMembership,
+) -> Vec<InversePrecisionFinding> {
+    let mut expected_names = targets
+        .iter()
+        .map(|target| target.terminal_name().to_string())
+        .collect::<Vec<_>>();
+    expected_names.sort();
+    expected_names.dedup();
+    let stable_targets = targets
+        .iter()
+        .map(stable_declaration_identity)
+        .collect::<Vec<_>>();
+    hits.iter()
+        .filter_map(|hit| {
+            let path = rel_path_string(&hit.file);
+            let source = analyzer.indexed_source(&hit.file)?;
+            let literal = source.get(hit.start_offset..hit.end_offset)?;
+            if !expected_names.iter().any(|name| name == literal) {
+                return None;
+            }
+            let entries = census_membership.get(&path)?.as_ref()?;
+            let backed = entries.contains(&(hit.start_offset, hit.end_offset, literal.to_string()));
+            if backed {
+                return None;
+            }
+            let signature = format!(
+                "inverse_precision:{}:{}",
+                hit.kind.wire_label(),
+                expected_names.join("|")
+            );
+            Some(InversePrecisionFinding {
+                signature,
+                path,
+                start_byte: hit.start_offset,
+                end_byte: hit.end_offset,
+                line: hit.line + 1,
+                kind: hit.kind.wire_label().to_string(),
+                snippet: hit.snippet.clone(),
+                expected_names: expected_names.clone(),
+                targets: stable_targets.clone(),
+            })
+        })
+        .collect()
 }
 
 fn classify_complete_sites(
@@ -1788,6 +2008,89 @@ mod tests {
     };
     use std::cell::Cell;
     use std::fs;
+
+    #[test]
+    fn reference_shards_partition_paths_exactly_once() {
+        let paths = ["src/lib.rs", "src/main.rs", "tests/a.rs", "tests/b.rs"];
+        for count in 1..=4 {
+            let shards = (1..=count)
+                .map(|index| ReferenceShardSpec::new(index, count).expect("valid shard"))
+                .collect::<Vec<_>>();
+            for path in paths {
+                assert_eq!(
+                    shards
+                        .iter()
+                        .filter(|shard| shard.contains(7, path))
+                        .count(),
+                    1,
+                    "path {path} must occur in exactly one of {count} shards"
+                );
+            }
+        }
+        assert!(ReferenceShardSpec::parse("0/2").is_err());
+        assert!(ReferenceShardSpec::parse("3/2").is_err());
+        assert!(ReferenceShardSpec::parse("1").is_err());
+    }
+
+    #[test]
+    fn inverse_precision_reports_only_literal_hits_without_census_membership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = "fn target() {}\nfn caller() { target(); }\n";
+        fs::write(root.join("lib.rs"), source).expect("source");
+        let project = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = ProjectFile::new(&root, "lib.rs");
+        let target = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.terminal_name() == "target")
+            .expect("target declaration");
+        let start = source.rfind("target").expect("target call");
+        let enclosing = analyzer
+            .enclosing_code_unit(
+                &file,
+                &Range {
+                    start_byte: start,
+                    end_byte: start + "target".len(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            )
+            .expect("caller owner");
+        let hit = UsageHit::new(
+            file.clone(),
+            1,
+            start,
+            start + "target".len(),
+            enclosing,
+            1.0,
+            "fn caller() { target(); }",
+        );
+
+        let mut empty_membership = HashMap::default();
+        empty_membership.insert("lib.rs".to_string(), Some(HashSet::default()));
+        let unbacked = inverse_precision_findings(
+            analyzer,
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&hit),
+            &empty_membership,
+        );
+        assert_eq!(unbacked.len(), 1, "{unbacked:#?}");
+        assert_eq!(unbacked[0].expected_names, ["target"]);
+
+        let mut membership = HashMap::default();
+        membership.insert(
+            "lib.rs".to_string(),
+            Some(
+                [(start, start + "target".len(), "target".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(inverse_precision_findings(analyzer, &[target], &[hit], &membership).is_empty());
+    }
 
     #[test]
     fn inverse_query_scope_propagates_store_errors_after_the_batch() {

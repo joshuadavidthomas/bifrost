@@ -49,8 +49,8 @@ Canonical clone root:
 Corpus membership, pinned commits, and LOC metadata:
   /home/jonathan/Projects/brokkbench/sft-tools-commits
 
-Durable raw run output and logs:
-  /mnt/optane/tmp/reference-differential
+Durable raw run output and logs for the census campaign:
+  /mnt/optane/tmp/bifrost-fird
 ```
 
 The clone directory name is the canonical repository slug, for example
@@ -62,9 +62,13 @@ Corpus membership comes from:
 <commits-root>/<language>/<slug>.jsonl
 ```
 
-Repository ranking uses `repos.csv::code_loc` under the commits root. Sidecar files such as
-`.testsome.jsonl` are not corpus members. A missing clone, invalid pinned commit, missing LOC value,
-or dirty tracked checkout must be reported rather than silently treated as a smaller repository.
+The default repository ranking uses `repos.csv::code_loc`. A task-ranked campaign must pass
+`--task-ranked`. That option imports `tasks.py`, calls
+`tasks.task_repos(tasks.SFT_PREDICATES, langs=[language])`, and applies a stable descending
+task-count sort. Stable sorting keeps `tasks.py` order for ties. `SFT_PREDICATES.not_overlarge`
+excludes `large-repos.csv`. Sidecar files such as `.testsome.jsonl` are not corpus members. A
+missing clone, invalid pinned commit, missing LOC value, or dirty tracked checkout must be reported
+rather than silently treated as a smaller repository.
 
 ## Preconditions
 
@@ -126,6 +130,7 @@ target/release/bifrost_reference_differential run-corpus \
   --clones-root /home/jonathan/Projects/brokkbench/clones \
   --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
   --language cpp \
+  --task-ranked \
   --repos-per-language 5 \
   --repo-jobs 1 \
   --jobs 8 \
@@ -135,6 +140,11 @@ target/release/bifrost_reference_differential run-corpus \
 `--language` and `--repo` are repeatable. Use explicit `--repo SLUG` filters when the requested set
 has exclusions, such as selecting the five largest non-Chromium C++ repositories. Record the dry-run
 selection and pinned clone heads in the campaign ExecPlan before starting the expensive run.
+
+For task-ranked selection, `--repos-per-language N` means up to N eligible task repositories. A
+language can have fewer than N repositories after `SFT_PREDICATES` applies every gate. Record the
+eligible count and audit all eligible repositories. Do not replace excluded repositories with rows
+that failed the selector.
 
 ## Run a resumable corpus audit
 
@@ -160,6 +170,7 @@ set -o pipefail
   --clones-root /home/jonathan/Projects/brokkbench/clones \
   --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
   --language cpp \
+  --task-ranked \
   --repo REPOSITORY_SLUG \
   --repo-jobs 1 \
   --jobs 8 \
@@ -173,13 +184,20 @@ set -o pipefail
   --max-usage-files 1000 \
   --max-usages 100000 \
   --seed 0 \
-  --output /mnt/optane/tmp/reference-differential/LANGUAGE-CAMPAIGN-BIFROST_HEAD.jsonl \
-  2>&1 | tee -a /mnt/optane/tmp/reference-differential/LANGUAGE-CAMPAIGN-BIFROST_HEAD.log
+  --probe-seed census \
+  --tiers 1,2,3 \
+  --output /mnt/optane/tmp/bifrost-fird/LANGUAGE-CAMPAIGN-BIFROST_HEAD.jsonl \
+  2>&1 | tee -a /mnt/optane/tmp/bifrost-fird/LANGUAGE-CAMPAIGN-BIFROST_HEAD.log
 ```
 
 For a complete top-N run, omit explicit `--repo` filters and use `--repos-per-language N`, or repeat
 `--repo` for an exact selected set. `run-corpus` appends one JSON object per completed repository.
 Records are written in completion order; JSONL line order is not semantically meaningful.
+
+Use `--shard K/N` to partition the globally sampled file set. K is one-based. Shards are disjoint,
+and their union contains the same sampled files as the unsharded run. Each shard has a distinct run
+fingerprint and resume key. Use a separate output file for each shard, then audit their ledgers as
+one campaign leg.
 
 ### Parallelism
 
@@ -287,6 +305,11 @@ Important site classifications:
   not form a valid complete comparison.
 - `missing`: a forward-resolved site is absent from the complete inverse result and requires triage.
 
+The report also contains `inverse_precision_findings`. Each row is a proven inverse hit whose exact
+range contains a literal target terminal name but has no matching raw census occurrence. Alias
+spellings are skipped until the analyzer emits alias sets. The summary counter
+`inverse_precision_unbacked_hits` contributes to strict-mode actionable findings.
+
 Also inspect each site's `forward_status`, `targets`, `note`, `diagnostics`, and `inverse_hit`
 (including its nested `exact_range`). At report level, inspect `summary.target_truncated_sites`,
 `summary.skipped_targets`, candidate-limit counters, configured usage limits, and `file_errors`. A
@@ -307,6 +330,22 @@ For every `missing` site:
 6. Search the existing issue ledger and prior campaign families.
 7. Group genuine witnesses by root cause, not by repository or syntax spelling.
 8. Record every row in a checksummed ledger, including non-actionable dispositions and evidence.
+
+Create the initial exact-site ledger with:
+
+```bash
+python3 scripts/fird-report-ledger.py \
+  --input RUN.jsonl \
+  --output RUN-missing-ledger.jsonl \
+  --binary target/release/bifrost_reference_differential \
+  --clones-root /home/jonathan/Projects/brokkbench/clones \
+  --exact-output-root /mnt/optane/tmp/bifrost-fird/exact
+sha256sum RUN-missing-ledger.jsonl > RUN-missing-ledger.sha256
+```
+
+The script records one row per raw finding. It adds a failure signature, an occurrence key, minimal
+source evidence, and a single-line exact rerun command. Fill the `disposition` field only after the
+exact audit. Preserve the raw ledger and its checksum.
 
 Do not infer that a large cluster is one bug merely because source text looks similar. Conversely, do
 not file one issue per symptom when structured tracing proves a shared resolver invariant.
@@ -357,7 +396,7 @@ After integrating a fix stack, run at least:
 
 ```bash
 cargo fmt --all -- --check
-scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 UV_CACHE_DIR=/tmp/bifrost-uv-cache \
   BIFROST_SEMANTIC_INDEX=off \
   scripts/with-isolated-cargo-target.sh cargo test --features nlp,python

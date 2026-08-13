@@ -13,7 +13,7 @@ After this change a contributor can run:
     target/release/bifrost_reference_differential run-repo --root <clone> --language rust \
       --probe-seed census --tiers 1,2,3 --output <out.jsonl> ...
 
-and receive a report whose probe sites came from a **raw tree-sitter identifier census** (every identifier-class leaf token, ignorant of the analyzer index), so it surfaces usage-loss at sites the index never proposed. Forward-resolved census sites flow through the existing inverse comparison (a miss is a finding with no external referee). Forward-unresolvable census sites are graded into deterministic evidence tiers. The end state is a per-language campaign over the top-30 task-weighted repos of all 11 corpus languages, producing triaged issues assigned to `jbellis`, fixed and closed depth-first per language, merged to `origin/master` as we go.
+and receive a report whose probe sites came from a **raw tree-sitter identifier census** (every identifier-class leaf token, ignorant of the analyzer index), so it surfaces usage-loss at sites the index never proposed. Forward-resolved census sites flow through the existing inverse comparison (a miss is a finding with no external referee). Forward-unresolvable census sites are graded into deterministic evidence tiers. The end state is a per-language campaign over the top-50 task-weighted repos of all 11 corpus languages, or every eligible repository when a language has fewer than 50. The campaign produces triaged issues assigned to `jbellis`, fixes and closes them depth-first per language, and merges each completed fix to `origin/master`.
 
 Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP comes along for the ride but is not a focus. M4 (external referee) is intentionally **not** built; tier-3 residue is adjudicated by the agent during triage.
 
@@ -21,8 +21,12 @@ Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP 
 
 - [x] (2026-08-07) Recon: confirmed census seeding is unimplemented (no `census.rs`, no `--probe-seed`); mapped FIRD engine seam (`collect_sampled_sites` at `src/reference_differential/mod.rs:555`), report schema, CLI parsers, and the candidate walk (`collect_candidate_ranges`); confirmed tasks.py selector (`task_repos(SFT_PREDICATES, langs=[lang])` ranked by exact `(-task_count, repo_slug)`) and the 11 languages. `SFT_PREDICATES.not_overlarge` excludes `large-repos.csv`.
 - [x] (2026-08-07) M1: census walk (`CandidateFrontier::Census` + `census_identifier_ranges`), `ProbeSeed`/`TierSelection` in engine config + CLI (`--probe-seed`, `--tiers`), `collect_sampled_sites` seed branch, `classify_census_gaps` (tier 1/2/3 via `census_site_role` + same-file decl), report rows tagged `seed`/`tier`. Tests: frontier superset unit test, two engine integration tests (census proposes macro-body occurrence + stays silent without same-file decl), all green. End-to-end tokio census pass succeeded (seed-tagged sites, tier-2 gaps, 5 forward-adjudicated misses).
-- [ ] M2: `--probe-seed` pluggability in `collect_sampled_sites`, forward adjudication of census sites tagged `seed: census`, tier-2/3 classification, ledger/shrink/single-line rerun.
-- [ ] M3: inverse-precision check (name-literal), sharded corpus runner (`--shard K/N`), per-language ranking; two-language corpus pass.
+- [x] (2026-08-12) M2: `--probe-seed` pluggability, forward adjudication, tier-2/3 classification, and a checked-in exact-site ledger generator. `scripts/fird-report-ledger.py` emits signatures, occurrence keys, source evidence, and single-line rerun commands. A retained JavaScript report produced a one-row deterministic smoke ledger.
+- [x] (2026-08-12) M3 implementation: name-literal inverse-precision findings, `--shard K/N` file partitioning, and direct `tasks.py` ranking through `--task-ranked`. Unit and CLI tests prove backed/unbacked precision behavior, exact shard partitioning, distinct resume fingerprints, and stable task-count selection. The two-language corpus acceptance remains part of the final campaign launch.
+- [x] (2026-08-12) TOP-50 selector audit: `tasks.task_repos(tasks.SFT_PREDICATES, langs=[lang])`, followed by a stable descending task-count sort, selects 526 repositories. C, C++, C#, Go, JavaScript, PHP, and Python select 50. Java selects all 46, Rust all 44, Scala all 47, and TypeScript all 39. `SFT_PREDICATES.not_overlarge=true`. Aggregate selector SHA-256 is `89efcfee4d210d3a4c35996cdc8ffc98627debaf5d13bedafa90af5b68f554c8`.
+- [ ] TOP-50 preflight: repair or replace two dirty clones, reconcile 15 clone-head mismatches to their corpus pins, and resolve the unpinned JavaScript `CodesWhat__drydock` row without silently changing selection.
+- [ ] TOP-50 final campaign: run fresh tier-1/2/3 census reports for all 526 selected repositories on one clean pushed Bifrost head; audit every ordinary missing and inverse-precision row; fix or assign every valid family.
+- [ ] TOP-50 closure: preserve checksummed ledgers and compact manifests, run all required gates, clean temporary outputs, and prove local and remote master agree.
 - [x] (2026-08-10) CSHARP ranks 21-30 complete.
   - The final 10-repository tier-1 census is `/mnt/optane/tmp/bifrost-fird/csharp-ranks21-30-current-tier1.jsonl`.
   - Seven repositories report zero `missing` rows. The 14 raw rows in Marten, Elsa, and dotnet-bumper are invalid forward targets, external members, a declaration name, generic identity collisions, or local-function bindings. Three exact dotnet-bumper probes return `actionable=0`.
@@ -116,6 +120,12 @@ Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP 
 
 ## Surprises & Discoveries
 
+- Observation: The live top-50 selector has only 526 eligible repositories. Java has 46, Rust 44, Scala 47, and TypeScript 39 after all SFT gates and the large-repository exclusion.
+  Evidence: selector aggregate SHA-256 `89efcfee4d210d3a4c35996cdc8ffc98627debaf5d13bedafa90af5b68f554c8`; tasks.py SHA-256 `3aae9889b13266592ecd022a00ac022cbf17eec70131454d0fa2bdb88f2642f3`.
+- Observation: Historical top-30 notes do not meet the runbook's final-proof standard. Raw rank-21-through-30 reports survive for five languages, and the complete top-20 raw envelopes were removed.
+  Evidence: `/mnt/optane/tmp/bifrost-fird/` contains accepted C, C++, C#, JavaScript, and old TypeScript envelopes only; the plan records deletion of other language outputs.
+- Observation: Rank-31 onward preflight found two dirty clones, 15 clone heads that differ from corpus pins, and one selected JavaScript repository without a corpus `head_sha`.
+  Evidence: selector audit on 2026-08-12; exact rows are recorded in the top-50 preflight artifact created before launch.
 - Observation: Census seeding was entirely unbuilt despite being a detailed design doc; all its milestones were unchecked.
   Evidence: `grep -rn "probe.seed\|census" src/reference_differential/ src/bin/` finds nothing; `find . -name census.rs` empty.
 - Observation: The FIRD engine lives in the facade crate at `src/reference_differential/mod.rs`, not `crates/bifrost-analysis/...` as the design doc's path suggested.
@@ -129,6 +139,15 @@ Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP 
 
 ## Decision Log
 
+- Decision: Rerun the full current 526-repository selection for closure instead of treating the historical top-30 campaign as an accepted prefix.
+  Rationale: The runbook requires one fresh complete corpus on the final clean integrated head. Historical raw evidence is missing for several languages and predates inverse-precision support.
+  Date/Author: 2026-08-12, Codex.
+- Decision: Interpret "top 50" as the first 50 eligible rows, or all eligible rows when fewer than 50 exist.
+  Rationale: The selector itself produces fewer than 50 rows in four languages. Adding rejected repositories would violate `SFT_PREDICATES` and the required `large-repos.csv` exclusion.
+  Date/Author: 2026-08-12, Codex.
+- Decision: Preserve tasks.py order for equal task counts by using a stable descending task-count sort.
+  Rationale: `tasks.task_repos` already supplies deterministic selector order. Adding a new repository-slug tie-break would alter the tasks.py selection contract.
+  Date/Author: 2026-08-12, Codex.
 - Decision: Build M1-M3, skip M4 (external referee); the agent adjudicates tier-3 during triage.
   Rationale: Forward-adjudicated misses plus tiers 1-2 need no referee and carry the designed yield; M4 is marked optional/cuttable and only pre-ranks the tier-3 long tail. User confirmed 2026-08-07.
   Date/Author: 2026-08-07, Claude (Opus) with Jonathan.
@@ -178,13 +197,13 @@ M2 — Forward adjudication + tiers + ledger. Route census sites through the unc
 
 M3 — Inverse-precision + sharded runner. After inverse comparison, check every inverse hit's range corresponds to a census occurrence of the name (name-literal); unbacked hits become their own signature class. Add `--shard K/N` (hash-partition files) to `run-corpus`. Wire per-language ranking from tasks.py.
 
-Campaign — Per language A..K (depth-first): select top-30 repos via tasks.py; build the release runner from clean HEAD; run census FIRD (tier-1 first, then 2-3); triage every finding per the runbook; file issues assigned to `jbellis` (skip issues already assigned to others; escalate non-generalizable/hacky ones to `DavidBakerEffendi` with a comment); fix with structured (non-regex) solutions + regressions; `cargo test` green; commit; merge to `origin/master`; summarize the language before moving on.
+Campaign — Per language A..K (depth-first): select up to 50 repos via tasks.py, using every eligible repository when fewer exist; build the release runner from a clean pushed HEAD; run census FIRD with tiers 1,2,3 and inverse precision; triage every finding per the runbook; file issues assigned to `jbellis` (skip issues already assigned to others; escalate non-generalizable/hacky ones to `DavidBakerEffendi` with a comment); fix with structured (non-regex) solutions and regressions; keep tests green; commit; push to `origin/master`; summarize each language before moving on.
 
 ## Concrete Steps
 
 Build: `cd /mnt/optane/bifrost-fird && scripts/with-isolated-cargo-target.sh cargo build --release --bin bifrost_reference_differential` (final campaign builds must be non-isolated and durable per the runbook; use isolated target only for iteration).
 
-Select repos (per language): import `tasks.py` directly and print the top-30 `SFT_PREDICATES` repos by exact `(-task_count, repo_slug)` order. Store the resulting manifest under `/mnt/optane/tmp/bifrost-fird/`.
+Select repos (per language): import `tasks.py` directly, call `tasks.task_repos(tasks.SFT_PREDICATES, langs=[lang])`, and apply a stable descending `task_count` sort. The stable sort preserves tasks.py order for ties. Take up to 50 and store the resulting manifest under `/mnt/optane/tmp/bifrost-fird/`.
 
 Run: `run-repo`/`run-corpus` with `--probe-seed census --tiers 1,2,3` and the standard semantic budget from the runbook. Outputs and ledgers under `/mnt/optane/tmp/bifrost-fird/`.
 
@@ -219,3 +238,5 @@ CLI (`src/bin/bifrost_reference_differential.rs`): `--probe-seed index|census` (
 (Transcripts and evidence appended per milestone.)
 
 Plan revision, 2026-08-08: The completed campaign covered 20 repositories per language. The user requested 30. This revision adds the rank-21-through-30 extension. It also names `SFT_PREDICATES` as the selector used by the campaign. This selector applies the required `large-repos.csv` exclusion.
+
+Plan revision, 2026-08-12: The user expanded the objective to the top 50 repositories per language. The live selector has 526 eligible rows, so this revision defines closure as all 526. It also replaces incomplete historical top-30 evidence with one fresh full final-head run, records the preflight clone defects, and completes the missing M2/M3 runner interfaces.
