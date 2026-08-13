@@ -3,7 +3,8 @@ use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
     census_membership_identifier_ranges, go_is_declaration_or_import_name,
-    reference_candidate_ranges, reference_candidate_requires_point_lookup,
+    python_deferred_annotation_membership_ranges, reference_candidate_ranges,
+    reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -560,7 +561,7 @@ fn collect_census_membership(
                     continue;
                 }
             };
-        let entries = ranges
+        let mut entries: HashSet<(usize, usize, String)> = ranges
             .into_iter()
             .filter_map(|range| {
                 source
@@ -568,9 +569,39 @@ fn collect_census_membership(
                     .map(|text| (range.start_byte, range.end_byte, text.to_string()))
             })
             .collect();
+        if language == Language::Python
+            && !augment_python_deferred_annotation_membership(
+                root,
+                &source,
+                &mut entries,
+                max_candidates_per_file,
+            )
+        {
+            membership.insert(rel_path_string(file), None);
+            continue;
+        }
         membership.insert(rel_path_string(file), Some(entries));
     }
     membership
+}
+
+fn augment_python_deferred_annotation_membership(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    entries: &mut HashSet<(usize, usize, String)>,
+    limit: usize,
+) -> bool {
+    let ranges = match python_deferred_annotation_membership_ranges(root, source, limit) {
+        ReferenceCandidateRanges::Complete(ranges) => ranges,
+        ReferenceCandidateRanges::LimitExceeded { .. } => return false,
+    };
+    ranges.into_iter().all(|range| {
+        let Some(text) = source.get(range.start_byte..range.end_byte) else {
+            return true;
+        };
+        entries.insert((range.start_byte, range.end_byte, text.to_string()));
+        entries.len() <= limit
+    })
 }
 
 fn augment_c_recovery_membership(
