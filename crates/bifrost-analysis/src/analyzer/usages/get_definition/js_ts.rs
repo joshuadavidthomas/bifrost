@@ -624,7 +624,12 @@ pub(super) fn resolve_js_ts(
         .collect();
     let binding_ranges =
         lexical_bindings.binding_identifier_ranges_at(reference, site.focus_start_byte);
-    if !binding_ranges.is_empty() {
+    // TypeScript keeps value and type declarations in separate namespaces. A
+    // visible `const Widget` must narrow a value-position `Widget`, but it must
+    // not hide an `interface Widget` or `type Widget` at an annotation site.
+    // The lexical binding index records value binders, so apply its declaration
+    // range filter only in the value namespace (#2114).
+    if value_position && !binding_ranges.is_empty() {
         same_file.retain(|candidate| {
             analyzer.ranges(candidate).iter().any(|declaration_range| {
                 binding_ranges.iter().any(|binding_range| {
