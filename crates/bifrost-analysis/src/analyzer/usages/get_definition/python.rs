@@ -1507,6 +1507,13 @@ pub(super) fn resolve_python(
                     format!("`{text}` is a local Python value"),
                 );
             }
+            if let Some(local) = ctx.same_file.get(text) {
+                let class_candidates =
+                    python_visible_class_binding_candidates(analyzer, file, identifier, local);
+                if !class_candidates.is_empty() {
+                    return candidates_outcome(class_candidates);
+                }
+            }
             if let Some(candidates) = python_visible_module_binding_candidates(
                 analyzer,
                 py,
@@ -1839,6 +1846,29 @@ fn python_visible_same_file_candidates(
     node: Node<'_>,
     candidates: &[CodeUnit],
 ) -> Vec<CodeUnit> {
+    let class_candidates =
+        python_visible_class_binding_candidates(analyzer, file, node, candidates);
+    if !class_candidates.is_empty() {
+        return class_candidates;
+    }
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.is_module()
+                && analyzer
+                    .parent_of(candidate)
+                    .is_some_and(|parent| parent.is_module())
+        })
+        .cloned()
+        .collect()
+}
+
+fn python_visible_class_binding_candidates(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -1862,20 +1892,33 @@ fn python_visible_same_file_candidates(
                 scope = analyzer.parent_of(&scope)?;
             }
         });
+    let Some(enclosing_class) = enclosing_class else {
+        return Vec::new();
+    };
+    let latest_end = candidates
+        .iter()
+        .filter(|candidate| {
+            analyzer
+                .parent_of(candidate)
+                .is_some_and(|parent| parent == enclosing_class)
+        })
+        .flat_map(|candidate| analyzer.ranges(candidate))
+        .filter(|range| range.end_byte <= node.start_byte())
+        .map(|range| range.end_byte)
+        .max();
+    let Some(latest_end) = latest_end else {
+        return Vec::new();
+    };
     candidates
         .iter()
         .filter(|candidate| {
-            !candidate.is_module()
-                && analyzer.parent_of(candidate).is_some_and(|parent| {
-                    parent.is_module()
-                        || enclosing_class
-                            .as_ref()
-                            .is_some_and(|scope| scope == &parent)
-                            && analyzer
-                                .ranges(candidate)
-                                .iter()
-                                .any(|range| range.end_byte <= node.start_byte())
-                })
+            analyzer
+                .parent_of(candidate)
+                .is_some_and(|parent| parent == enclosing_class)
+                && analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.end_byte == latest_end)
         })
         .cloned()
         .collect()
