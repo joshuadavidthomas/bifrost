@@ -5,6 +5,8 @@
   "version": "0.9.3",
   "bifrost": {
     "binaryVersion": "0.9.3",
+    "minimumBinaryVersion": "0.9.0",
+    "allowPrerelease": false,
     "archiveSha256": {
       "aarch64-pc-windows-msvc": "68452707689d1ed05150232c761946c715252b1166735dfae54e376fc8e12c64",
       "aarch64-unknown-linux-gnu": "9303ddbf42d278d93ce78219149a4010b55688f444d463a55704e0cd48bee91a",

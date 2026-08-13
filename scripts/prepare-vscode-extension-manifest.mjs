@@ -9,6 +9,15 @@ const options = parseArgs(process.argv.slice(2));
 const version = required(options.version, "version");
 const distDir = path.resolve(required(options.dist, "dist"));
 const archiveSha256 = readArchiveHashes(distDir, version);
+const rangeSource = options.pluginRelease
+  ? JSON.parse(fs.readFileSync(path.resolve(options.pluginRelease), "utf8"))
+  : options.manifest
+    ? JSON.parse(fs.readFileSync(path.resolve(options.manifest), "utf8")).bifrost
+    : null;
+const minimumBinaryVersion = sameMinorSeries(rangeSource?.binaryVersion, version)
+  ? (rangeSource?.minimumBinaryVersion ?? version)
+  : version;
+const allowPrerelease = rangeSource?.allowPrerelease ?? false;
 
 if (options.manifest) {
   const manifestPath = path.resolve(options.manifest);
@@ -17,6 +26,8 @@ if (options.manifest) {
   manifest.bifrost = {
     ...manifest.bifrost,
     binaryVersion: version,
+    minimumBinaryVersion,
+    allowPrerelease,
     archiveSha256
   };
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -26,6 +37,8 @@ if (options.pluginRelease) {
   const pluginReleasePath = path.resolve(options.pluginRelease);
   const pluginRelease = JSON.parse(fs.readFileSync(pluginReleasePath, "utf8"));
   pluginRelease.binaryVersion = version;
+  pluginRelease.minimumBinaryVersion = minimumBinaryVersion;
+  pluginRelease.allowPrerelease = allowPrerelease;
   pluginRelease.archiveSha256 = archiveSha256;
   fs.writeFileSync(pluginReleasePath, `${JSON.stringify(pluginRelease, null, 2)}\n`);
 }
@@ -92,4 +105,13 @@ function required(value, name) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sameMinorSeries(left, right) {
+  const leftParts = String(left ?? "").split(".");
+  const rightParts = String(right ?? "").split(".");
+  return leftParts.length >= 2
+    && rightParts.length >= 2
+    && leftParts[0] === rightParts[0]
+    && leftParts[1] === rightParts[1];
 }

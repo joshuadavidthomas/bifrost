@@ -49,21 +49,24 @@ procedure, see the [Cursor integration guide](https://bifrost.brokk.ai/cursor/).
 Launch mode behavior:
 
 - `auto`: use `bifrost.serverPath` when explicitly configured, then the
-  extension-managed binary if present or accepted for installation, then a
+  exact preferred extension-managed binary, then the newest compatible cached
+  patch, then a preferred binary accepted for installation, then a
   local development build under `target/`, then
   `bifrost` on `PATH`.
-- `bundled`: require the extension-managed binary for this platform and prompt
-  to install it when missing.
+- `bundled`: require a compatible extension-managed binary for this platform
+  and prompt to install the preferred binary only when none is cached.
 - `path`: use `bifrost.serverPath`, falling back to `bifrost` on `PATH`.
 
-The managed binary is pinned by the extension package metadata field
-`bifrost.binaryVersion`, with expected archive hashes in
-`bifrost.archiveSha256`. The extension downloads the existing GitHub Release
+The managed binary range uses the same extension package metadata as the agent
+launcher: `bifrost.binaryVersion`, `bifrost.minimumBinaryVersion`, and
+`bifrost.allowPrerelease`, with expected archive hashes in
+`bifrost.archiveSha256`. A compatible cached patch is reused without a network
+or install prompt. The extension downloads only the exact preferred GitHub Release
 archives (`.tar.gz` on macOS/Linux and `.zip` on Windows), verifies each
 archive against the package-pinned SHA-256 and the release `.sha256` sidecar,
 extracts the `bifrost` executable into VS Code global storage at
-`binaries/<version>/<platform>-<arch>/`, and removes older managed versions
-after a successful install. Managed binaries are checked with
+`binaries/<version>/<platform>-<arch>/`, and removes only versions outside the
+declared compatible range after a successful install. Managed binaries are checked with
 `bifrost --version` before the language server starts.
 
 ## Commands
@@ -200,8 +203,9 @@ npm run compile
 npx vsce package
 ```
 
-The tag-driven release workflow publishes this same validated VSIX to the
-GitHub Release, the Visual Studio Marketplace, and Open VSX. Open VSX
+The tag-driven release workflow publishes this same validated VSIX, including
+the binary compatibility range above, to the GitHub Release, the Visual Studio
+Marketplace, and Open VSX. Open VSX
 publication uses the pinned `ovsx` dependency and requires:
 
 - the verified `brokk` Open VSX namespace;
@@ -223,6 +227,8 @@ Before publishing the VSIX, ensure:
 
 - `package.json` has `bifrost.binaryVersion` set to the Bifrost release version
   without the leading `v`.
+- `package.json` has `bifrost.minimumBinaryVersion` and
+  `bifrost.allowPrerelease` equal to the agent plugin release metadata.
 - `package.json` has `bifrost.archiveSha256` entries for every supported
   extension target. These hashes are the VSIX trust anchor for downloaded
   archives.

@@ -19,6 +19,7 @@ export const EXTRACTION_TIMEOUT_MS = 60_000;
 export const VERSION_PROBE_TIMEOUT_MS = 10_000;
 export const STARTUP_MARGIN_MS = 30_000;
 const CHILD_SIGNAL_GRACE_MS = 4_000;
+export const STALE_INSTALL_ARTIFACT_AGE_MS = 24 * 60 * 60 * 1_000;
 export const MINIMUM_MCP_STARTUP_TIMEOUT_MS =
   DOWNLOAD_TIMEOUT_MS + EXTRACTION_TIMEOUT_MS + VERSION_PROBE_TIMEOUT_MS + STARTUP_MARGIN_MS;
 export const SUPPORTED_TARGETS = [
@@ -46,7 +47,7 @@ export class LauncherError extends Error {
 
 export function parseLauncherArgs(args) {
   const command = args[0];
-  if (command === "doctor" || command === "prepare") {
+  if (command === "doctor" || command === "prepare" || command === "prepare-preferred") {
     let json = false;
     for (const arg of args.slice(1)) {
       if (arg === "--json") {
@@ -238,12 +239,76 @@ export async function readReleaseMetadata(filePath = metadataPath, fsImpl = fs) 
   } catch (error) {
     throw new LauncherError("metadata_error", `Could not read Bifrost release metadata: ${filePath}`, error);
   }
-  const version = String(parsed.binaryVersion ?? "").trim().replace(/^v/, "");
-  if (!version) {
+  return normalizeReleaseMetadata(parsed);
+}
+
+function normalizeReleaseMetadata(metadata) {
+  const binaryVersion = normalizeVersion(metadata?.binaryVersion);
+  if (!binaryVersion) {
     throw new LauncherError("metadata_error", "Bifrost release metadata is missing binaryVersion.");
   }
-  const archiveSha256 = parsed.archiveSha256 ?? {};
-  return { binaryVersion: version, archiveSha256 };
+  const preferred = parseSemver(binaryVersion, "binaryVersion");
+  const minimumBinaryVersion = normalizeVersion(metadata?.minimumBinaryVersion ?? binaryVersion);
+  const minimum = parseSemver(minimumBinaryVersion, "minimumBinaryVersion");
+  const allowPrerelease = metadata?.allowPrerelease ?? false;
+  if (typeof allowPrerelease !== "boolean") {
+    throw new LauncherError("metadata_error", "Bifrost release metadata allowPrerelease must be a boolean.");
+  }
+  if (preferred.major !== minimum.major || preferred.minor !== minimum.minor) {
+    throw new LauncherError(
+      "metadata_error",
+      `Bifrost minimumBinaryVersion ${minimumBinaryVersion} must use the preferred ${preferred.major}.${preferred.minor} minor series.`
+    );
+  }
+  if (compareSemver(minimum, preferred) > 0) {
+    throw new LauncherError(
+      "metadata_error",
+      `Bifrost minimumBinaryVersion ${minimumBinaryVersion} cannot exceed binaryVersion ${binaryVersion}.`
+    );
+  }
+  return {
+    binaryVersion,
+    minimumBinaryVersion,
+    allowPrerelease,
+    archiveSha256: metadata?.archiveSha256 ?? {}
+  };
+}
+
+function normalizeVersion(version) {
+  return String(version ?? "").trim().replace(/^v/, "");
+}
+
+function parseSemver(version, label = "version") {
+  const normalized = normalizeVersion(version);
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(normalized);
+  if (!match) {
+    throw new LauncherError("metadata_error", `Invalid Bifrost ${label}: ${version}.`);
+  }
+  return {
+    raw: normalized,
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ?? null
+  };
+}
+
+function compareSemver(left, right) {
+  for (const key of ["major", "minor", "patch"]) {
+    if (left[key] !== right[key]) {
+      return left[key] - right[key];
+    }
+  }
+  if (left.prerelease === right.prerelease) {
+    return 0;
+  }
+  if (left.prerelease === null) {
+    return 1;
+  }
+  if (right.prerelease === null) {
+    return -1;
+  }
+  return left.prerelease.localeCompare(right.prerelease, "en", { numeric: true });
 }
 
 export function cacheRootFor(env = process.env, platform = process.platform, homedir = os.homedir()) {
@@ -270,14 +335,14 @@ export async function resolveBifrostBinary(options = {}) {
 
 async function resolveAssessedBinary(assessment, options) {
   if (assessment.status === "ready") {
-    return { path: assessment.binaryPath, source: assessment.source };
+    return binarySelection(assessment.binaryPath, assessment.source, assessment.selectedVersion, assessment);
   }
   if (assessment.status === "error" || assessment.source === "explicit" || !assessment.autoInstall) {
     throw assessment.error ?? new LauncherError("binary_not_found", assessment.message);
   }
 
   options.onInstallStart?.({
-    version: assessment.requiredVersion,
+    version: assessment.preferredVersion,
     cachePath: assessment.cachePath
   });
   const installed = await installManagedBinary({
@@ -289,10 +354,20 @@ async function resolveAssessedBinary(assessment, options) {
     fsImpl: assessment.fsImpl
   });
   options.onInstallComplete?.({
-    version: assessment.requiredVersion,
+    version: assessment.preferredVersion,
     cachePath: installed
   });
-  return { path: installed, source: "installed" };
+  return binarySelection(installed, "installed", assessment.preferredVersion, assessment);
+}
+
+function binarySelection(binaryPath, source, selectedVersion, context) {
+  return {
+    path: binaryPath,
+    source,
+    preferredVersion: context.preferredVersion,
+    selectedVersion,
+    compatibilityMode: selectedVersion === context.preferredVersion ? "exact" : "compatible"
+  };
 }
 
 export async function inspectBifrostInstallation(options = {}) {
@@ -303,7 +378,9 @@ export async function inspectBifrostInstallation(options = {}) {
   } catch (error) {
     return launcherStatus({
       status: launcherStatusForError(error),
-      requiredVersion: null,
+      preferredVersion: null,
+      selectedVersion: null,
+      compatibilityMode: null,
       source: null,
       binaryPath: null,
       cachePath: null,
@@ -325,28 +402,96 @@ export async function prepareBifrostInstallation(options = {}) {
     const binary = await resolveAssessedBinary(assessment, options);
     return launcherStatus({
       status: "ready",
-      requiredVersion: assessment.requiredVersion,
+      preferredVersion: assessment.preferredVersion,
+      selectedVersion: binary.selectedVersion,
+      compatibilityMode: binary.compatibilityMode,
       source: binary.source,
       binaryPath: binary.path,
       cachePath: assessment.cachePath,
       autoInstall,
-      message: `Bifrost ${assessment.requiredVersion} is ready.`
+      message: readyMessage(assessment.preferredVersion, binary.selectedVersion, binary.source)
     });
   } catch (error) {
-    const requiredVersion = assessment?.requiredVersion ?? options.metadata?.binaryVersion ?? null;
-    const cachePath = assessment?.cachePath ?? (requiredVersion
-      ? managedBinaryPath(options.cacheRoot ?? cacheRootFor(env, platform), requiredVersion, platform, arch)
+    const preferredVersion = assessment?.preferredVersion ?? options.metadata?.binaryVersion ?? null;
+    const cachePath = assessment?.cachePath ?? (preferredVersion
+      ? managedBinaryPath(options.cacheRoot ?? cacheRootFor(env, platform), preferredVersion, platform, arch)
       : null);
     return launcherStatus({
       status: launcherStatusForError(error),
-      requiredVersion,
+      preferredVersion,
+      selectedVersion: assessment?.selectedVersion ?? null,
+      compatibilityMode: assessment?.compatibilityMode ?? null,
       source: assessment?.source ?? null,
       binaryPath: assessment?.binaryPath ?? null,
       cachePath,
       autoInstall,
-      message: `${formatCause(error)} ${formatRecoveryMessage(requiredVersion, cachePath)}`
+      message: `${formatCause(error)} ${formatRecoveryMessage(preferredVersion, cachePath)}`
     });
   }
+}
+
+export async function preparePreferredBifrostInstallation(options = {}) {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const fsImpl = options.fsImpl ?? fs;
+  const metadata = options.metadata
+    ? normalizeReleaseMetadata(options.metadata)
+    : await readReleaseMetadata(options.metadataPath ?? metadataPath, fsImpl);
+  const cacheRoot = options.cacheRoot ?? cacheRootFor(env, platform);
+  const cachePath = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
+
+  if (env.BIFROST_LAUNCHER_AUTO_INSTALL === "0") {
+    return launcherStatus({
+      status: "missing",
+      preferredVersion: metadata.binaryVersion,
+      selectedVersion: null,
+      source: null,
+      compatibilityMode: null,
+      binaryPath: null,
+      cachePath,
+      autoInstall: false,
+      message: `Preferred Bifrost ${metadata.binaryVersion} preparation is disabled.`
+    });
+  }
+
+  if (await pathExists(cachePath, fsImpl)) {
+    const exact = await inspectCandidate("managed", cachePath, {
+      preferredVersion: metadata.binaryVersion,
+      selectedVersion: null,
+      compatibilityMode: null,
+      cachePath,
+      autoInstall: true,
+      metadata,
+      cacheRoot,
+      platform,
+      arch,
+      fsImpl
+    }, options);
+    if (exact.status === "ready" && exact.compatibilityMode === "exact") {
+      return launcherStatus(exact);
+    }
+  }
+
+  const installed = await installManagedBinary({
+    ...options,
+    metadata,
+    cacheRoot,
+    platform,
+    arch,
+    fsImpl
+  });
+  return launcherStatus({
+    status: "ready",
+    preferredVersion: metadata.binaryVersion,
+    selectedVersion: metadata.binaryVersion,
+    source: "installed",
+    compatibilityMode: "exact",
+    binaryPath: installed,
+    cachePath,
+    autoInstall: true,
+    message: readyMessage(metadata.binaryVersion, metadata.binaryVersion, "installed")
+  });
 }
 
 async function assessBifrostCandidates(options = {}) {
@@ -354,12 +499,16 @@ async function assessBifrostCandidates(options = {}) {
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
   const fsImpl = options.fsImpl ?? fs;
-  const metadata = options.metadata ?? await readReleaseMetadata(options.metadataPath ?? metadataPath, fsImpl);
+  const metadata = options.metadata
+    ? normalizeReleaseMetadata(options.metadata)
+    : await readReleaseMetadata(options.metadataPath ?? metadataPath, fsImpl);
   releaseTargetFor(platform, arch);
   const cacheRoot = options.cacheRoot ?? cacheRootFor(env, platform);
   const cachePath = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
   const context = {
-    requiredVersion: metadata.binaryVersion,
+    preferredVersion: metadata.binaryVersion,
+    selectedVersion: null,
+    compatibilityMode: null,
     cachePath,
     autoInstall: env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0",
     metadata,
@@ -378,6 +527,14 @@ async function assessBifrostCandidates(options = {}) {
     let fallback = null;
     if (await pathExists(cachePath, fsImpl)) {
       const managed = await inspectCandidate("managed", cachePath, context, options);
+      if (managed.status === "ready") {
+        return managed;
+      }
+      fallback = managed;
+    }
+
+    for (const cached of await compatibleManagedCandidates(context)) {
+      const managed = await inspectCandidate("managed", cached.path, context, options);
       if (managed.status === "ready") {
         return managed;
       }
@@ -409,9 +566,9 @@ async function assessBifrostCandidates(options = {}) {
       binaryPath: null,
       error: new LauncherError(
         "binary_not_found",
-        `No compatible Bifrost ${context.requiredVersion} binary was found. Set BIFROST_BINARY_PATH, set BIFROST_LAUNCHER_ALLOW_PATH=1 to use PATH, or allow the launcher to install the pinned release.`
+        `No compatible Bifrost binary was found for preferred ${context.preferredVersion}. Set BIFROST_BINARY_PATH, set BIFROST_LAUNCHER_ALLOW_PATH=1 to use PATH, or allow the launcher to install the pinned release.`
       ),
-      message: `No compatible Bifrost ${context.requiredVersion} binary is available.`
+      message: `No compatible Bifrost binary is available for preferred ${context.preferredVersion}.`
     };
   } catch (error) {
     return {
@@ -430,14 +587,17 @@ async function assessBifrostCandidates(options = {}) {
 async function inspectCandidate(source, binaryPath, context, options) {
   try {
     await validateExecutable(binaryPath, context.fsImpl, context.platform, `${source} Bifrost binary`);
-    await validateVersion(binaryPath, context.requiredVersion, options);
+    const selectedVersion = await validateVersion(binaryPath, context.metadata, options);
+    const compatibilityMode = selectedVersion === context.preferredVersion ? "exact" : "compatible";
     return {
       ...context,
       status: "ready",
       source,
       binaryPath,
+      selectedVersion,
+      compatibilityMode,
       error: null,
-      message: `Bifrost ${context.requiredVersion} is ready from ${source}.`
+      message: readyMessage(context.preferredVersion, selectedVersion, source)
     };
   } catch (error) {
     return {
@@ -451,11 +611,46 @@ async function inspectCandidate(source, binaryPath, context, options) {
   }
 }
 
+async function compatibleManagedCandidates(context) {
+  const binariesRoot = path.join(context.cacheRoot, "binaries");
+  let entries;
+  try {
+    entries = await context.fsImpl.readdir(binariesRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return [];
+    }
+    throw error;
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && entry.name !== context.preferredVersion)
+    .flatMap((entry) => {
+      try {
+        const parsed = parseSemver(entry.name);
+        return isVersionCompatible(entry.name, context.metadata)
+          ? [{ version: parsed, path: managedBinaryPath(context.cacheRoot, entry.name, context.platform, context.arch) }]
+          : [];
+      } catch {
+        return [];
+      }
+    })
+    .sort((left, right) => compareSemver(right.version, left.version));
+}
+
+function readyMessage(preferredVersion, selectedVersion, source) {
+  if (preferredVersion === selectedVersion) {
+    return `Bifrost ${selectedVersion} is ready from ${source} in exact mode.`;
+  }
+  return `Bifrost ${selectedVersion} is ready from ${source} in compatibility mode; preferred ${preferredVersion}.`;
+}
+
 function launcherStatus(status) {
   return {
     status: status.status,
-    requiredVersion: status.requiredVersion,
+    preferredVersion: status.preferredVersion,
+    selectedVersion: status.selectedVersion,
     source: status.source,
+    compatibilityMode: status.compatibilityMode,
     binaryPath: status.binaryPath,
     cachePath: status.cachePath,
     autoInstall: status.autoInstall,
@@ -487,6 +682,50 @@ async function pathExists(candidate, fsImpl) {
   }
 }
 
+export async function cleanupStaleInstallArtifacts(options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const tempRoot = options.tempRoot ?? os.tmpdir();
+  const destinationDir = options.destinationDir;
+  const now = options.now ?? Date.now();
+  const staleBefore = now - (options.maxAgeMs ?? STALE_INSTALL_ARTIFACT_AGE_MS);
+  const locations = [
+    {
+      directory: tempRoot,
+      matches: (name) => /^bifrost-agent-[A-Za-z0-9]{6}$/.test(name),
+      recursive: true
+    },
+    ...(destinationDir ? [{
+      directory: destinationDir,
+      matches: (name) => /^bifrost(?:\.exe)?\.\d+\.\d+\.[0-9a-f-]+\.download$/i.test(name),
+      recursive: false
+    }] : [])
+  ];
+
+  for (const location of locations) {
+    let entries;
+    try {
+      entries = await fsImpl.readdir(location.directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!location.matches(entry.name) || (location.recursive && !entry.isDirectory())) {
+        continue;
+      }
+      const artifactPath = path.join(location.directory, entry.name);
+      try {
+        const stat = await fsImpl.stat(artifactPath);
+        if (stat.mtimeMs < staleBefore) {
+          await fsImpl.rm(artifactPath, { recursive: location.recursive, force: true });
+        }
+      } catch {
+        // Cleanup must never prevent a launch or a fresh installation.
+      }
+    }
+  }
+}
+
 export async function installManagedBinary(options) {
   const metadata = options.metadata;
   const platform = options.platform ?? process.platform;
@@ -499,7 +738,9 @@ export async function installManagedBinary(options) {
   const expectedSha256 = normalizeSha256(metadata.archiveSha256?.[asset.target], asset.archiveName);
   const destination = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
   const destinationDir = path.dirname(destination);
-  const tempDir = await fsImpl.mkdtemp(path.join(os.tmpdir(), "bifrost-agent-"));
+  const tempRoot = options.tempRoot ?? os.tmpdir();
+  await cleanupStaleInstallArtifacts({ fsImpl, tempRoot, destinationDir });
+  const tempDir = await fsImpl.mkdtemp(path.join(tempRoot, "bifrost-agent-"));
   const archivePath = path.join(tempDir, asset.archiveName);
   const extractDir = path.join(tempDir, "extract");
   const tmpDestination = path.join(
@@ -537,18 +778,24 @@ export async function installManagedBinary(options) {
     if (platform !== "win32") {
       await fsImpl.chmod(tmpDestination, 0o755);
     }
-    if (await isExecutable(destination, fsImpl, platform) && await isVersionCompatibleBinary(destination, metadata.binaryVersion, options)) {
+    if (await isExecutable(destination, fsImpl, platform) && await isExactVersionBinary(destination, metadata.binaryVersion, options)) {
       return destination;
     }
     try {
       await fsImpl.rename(tmpDestination, destination);
     } catch (error) {
-      if (await isExecutable(destination, fsImpl, platform) && await isVersionCompatibleBinary(destination, metadata.binaryVersion, options)) {
+      if (await isExecutable(destination, fsImpl, platform) && await isExactVersionBinary(destination, metadata.binaryVersion, options)) {
         return destination;
       }
       throw error;
     }
-    await validateVersion(destination, metadata.binaryVersion, options);
+    const installedVersion = await validateVersion(destination, metadata, options);
+    if (installedVersion !== metadata.binaryVersion) {
+      throw new LauncherError(
+        "version_mismatch",
+        `Downloaded Bifrost binary at ${destination} is ${installedVersion}; expected exact pinned version ${metadata.binaryVersion}.`
+      );
+    }
     return destination;
   } catch (error) {
     if (error instanceof LauncherError) {
@@ -583,22 +830,25 @@ async function extractArchive(archivePath, destination, platform) {
   }
 }
 
-export async function validateVersion(binaryPath, requiredVersion, options = {}) {
+export async function validateVersion(binaryPath, compatibility, options = {}) {
   const probe = await probeBifrostVersion(binaryPath, options);
-  if (isVersionCompatible(probe.version, requiredVersion)) {
-    return;
+  if (isVersionCompatible(probe.version, compatibility)) {
+    return probe.version;
   }
   const found = probe.version ?? probe.rawOutput ?? "unknown";
+  const metadata = typeof compatibility === "string"
+    ? normalizeReleaseMetadata({ binaryVersion: compatibility })
+    : normalizeReleaseMetadata(compatibility);
   throw new LauncherError(
     "version_mismatch",
-    `Bifrost binary at ${binaryPath} is ${found}; expected ${requiredVersion}.`
+    `Bifrost binary at ${binaryPath} is ${found}; expected ${metadata.minimumBinaryVersion} through the stable ${parseSemver(metadata.binaryVersion).major}.${parseSemver(metadata.binaryVersion).minor} series (preferred ${metadata.binaryVersion}).`
   );
 }
 
-async function isVersionCompatibleBinary(binaryPath, requiredVersion, options) {
+async function isExactVersionBinary(binaryPath, requiredVersion, options) {
   try {
-    await validateVersion(binaryPath, requiredVersion, options);
-    return true;
+    const found = await validateVersion(binaryPath, requiredVersion, options);
+    return found === normalizeVersion(requiredVersion);
   } catch {
     return false;
   }
@@ -623,8 +873,24 @@ export function parseBifrostVersion(output) {
   return match?.[1] ?? null;
 }
 
-export function isVersionCompatible(installed, required) {
-  return installed === String(required).trim().replace(/^v/, "");
+export function isVersionCompatible(installed, compatibility) {
+  if (!installed) {
+    return false;
+  }
+  try {
+    const metadata = typeof compatibility === "string"
+      ? normalizeReleaseMetadata({ binaryVersion: compatibility })
+      : normalizeReleaseMetadata(compatibility);
+    const candidate = parseSemver(installed);
+    const preferred = parseSemver(metadata.binaryVersion);
+    const minimum = parseSemver(metadata.minimumBinaryVersion);
+    return candidate.major === preferred.major
+      && candidate.minor === preferred.minor
+      && compareSemver(candidate, minimum) >= 0
+      && (metadata.allowPrerelease || candidate.prerelease === null);
+  } catch {
+    return false;
+  }
 }
 
 async function validateExecutable(command, fsImpl, platform, label) {
@@ -781,13 +1047,18 @@ export async function resolveBifrostLaunch(options = {}) {
     allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
-  return {
+  const launch = {
     command: binary.path,
     args: buildBifrostArgs(root, options.toolset, options.passThrough),
     cwd: root,
     env,
-    source: binary.source
+    source: binary.source,
+    preferredVersion: binary.preferredVersion,
+    selectedVersion: binary.selectedVersion,
+    compatibilityMode: binary.compatibilityMode
   };
+  schedulePreferredBifrostPreparation(launch, options);
+  return launch;
 }
 
 export async function resolveBifrostLspLaunch(options = {}) {
@@ -799,13 +1070,18 @@ export async function resolveBifrostLspLaunch(options = {}) {
     allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
-  return {
+  const launch = {
     command: binary.path,
     args: buildBifrostLspArgs(root, options.passThrough),
     cwd: root,
     env,
-    source: binary.source
+    source: binary.source,
+    preferredVersion: binary.preferredVersion,
+    selectedVersion: binary.selectedVersion,
+    compatibilityMode: binary.compatibilityMode
   };
+  schedulePreferredBifrostPreparation(launch, options);
+  return launch;
 }
 
 export function spawnBifrost(binaryPath, args, options = {}) {
@@ -862,11 +1138,37 @@ export function spawnBifrost(binaryPath, args, options = {}) {
   return child;
 }
 
+export function schedulePreferredBifrostPreparation(launch, options = {}) {
+  const env = options.env ?? launch.env ?? process.env;
+  if (
+    launch.compatibilityMode !== "compatible" ||
+    env.BIFROST_LAUNCHER_AUTO_INSTALL === "0"
+  ) {
+    return null;
+  }
+  const spawnImpl = options.spawnImpl ?? spawn;
+  try {
+    const helper = spawnImpl(process.execPath, [thisFile, "prepare-preferred"], {
+      detached: true,
+      env,
+      stdio: "ignore",
+      windowsHide: true
+    });
+    helper.once("error", () => {});
+    helper.unref();
+    return helper;
+  } catch {
+    return null;
+  }
+}
+
 export function formatLauncherStatus(status) {
   const details = [
     `status=${status.status}`,
-    `required=${status.requiredVersion ?? "unknown"}`,
+    `preferred=${status.preferredVersion ?? "unknown"}`,
+    `selected=${status.selectedVersion ?? "none"}`,
     `source=${status.source ?? "none"}`,
+    `compatibility=${status.compatibilityMode ?? "none"}`,
     `binary=${status.binaryPath ?? "none"}`,
     `cache=${status.cachePath ?? "unknown"}`,
     `auto-install=${status.autoInstall ? "enabled" : "disabled"}`
@@ -901,10 +1203,16 @@ function formatCause(error) {
 async function main() {
   try {
     const parsed = parseLauncherArgs(process.argv.slice(2));
-    if (parsed.command === "doctor" || parsed.command === "prepare") {
+    if (
+      parsed.command === "doctor" ||
+      parsed.command === "prepare" ||
+      parsed.command === "prepare-preferred"
+    ) {
       const status = parsed.command === "doctor"
         ? await inspectBifrostInstallation()
-        : await prepareBifrostInstallation(installProgressHandlers());
+        : parsed.command === "prepare"
+          ? await prepareBifrostInstallation(installProgressHandlers())
+          : await preparePreferredBifrostInstallation();
       console.log(parsed.json ? JSON.stringify(status) : formatLauncherStatus(status));
       process.exitCode = status.status === "ready" ? 0 : 1;
       return;
@@ -931,6 +1239,11 @@ async function main() {
         toolset: parsed.toolset,
         passThrough: parsed.passThrough
       });
+    }
+    if (launch.compatibilityMode === "compatible") {
+      console.error(
+        `Bifrost launcher: preferred ${launch.preferredVersion}, selected compatible ${launch.selectedVersion} from ${launch.source}.`
+      );
     }
     spawnBifrost(launch.command, launch.args, {
       cwd: launch.cwd,

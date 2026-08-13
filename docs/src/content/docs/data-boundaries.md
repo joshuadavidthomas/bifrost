@@ -44,20 +44,47 @@ Removing the database while Bifrost is stopped forces later work to rebuild it. 
 
 ## Plugin Launcher Downloads and Cache
 
-The agent plugin does not bundle the Bifrost executable. Its launcher resolves, in order:
+The agent plugin does not bundle the Bifrost executable. Release metadata names
+a preferred, checksum-pinned binary and the minimum compatible binary in that
+minor series. Stable patch releases in the range keep the existing MCP and LSP
+contracts: they may add tools or optional fields, but they do not remove tools
+or change existing meanings. A breaking plugin-facing change requires a new
+minor release, and skills that require a newer tool raise the declared minimum.
 
-1. `BIFROST_BINARY_PATH`;
-2. a launcher-managed copy of the plugin's pinned release;
-3. `bifrost` on `PATH` only when `BIFROST_LAUNCHER_ALLOW_PATH=1`;
-4. a GitHub release download whose archive and checksum sidecar are verified against pinned SHA-256 metadata.
+All Portable Agent Plugins v1/Codex, Claude Code, Cursor, Pi, and Amp adapters
+use the same launcher for MCP, and Claude Code uses it for LSP as well. The
+launcher resolves, in order:
+
+1. `BIFROST_BINARY_PATH`, when explicitly configured and compatible;
+2. an exact preferred binary in the launcher-managed cache;
+3. the newest compatible cached patch, selected by version rather than directory order;
+4. a compatible `bifrost` on `PATH` only when `BIFROST_LAUNCHER_ALLOW_PATH=1`;
+5. the exact preferred GitHub release, whose archive and checksum sidecar are verified against pinned SHA-256 metadata.
+
+Different major or minor versions are rejected. Prerelease versions are also
+rejected unless release metadata explicitly permits them. The launcher never
+downloads an unpinned compatible fallback.
+
+When the shared agent launcher starts a compatible fallback, it does not delay
+MCP or LSP registration. If automatic installation is enabled, it starts a
+detached helper that downloads and verifies only the checksum-pinned preferred
+release into the managed cache. The running server remains on the compatible
+binary and keeps its negotiated capabilities. A fresh host task selects the
+prepared preferred binary and negotiates its current tool surface.
+
+The VS Code extension and the identical VSIX published to Open VSX carry the
+same preferred/minimum/prerelease fields. Their LSP provisioner reuses an exact
+or compatible managed binary before offering to download the checksum-pinned
+preferred release. Declining that download therefore does not disable LSP when
+a compatible managed patch is already cached.
 
 Managed binaries are versioned under the launcher cache. The default root is `~/Library/Caches/bifrost-agent` on macOS, `%LOCALAPPDATA%/Bifrost/AgentPlugin` on Windows, and `$XDG_CACHE_HOME/bifrost-agent` or `~/.cache/bifrost-agent` on Linux. Set `BIFROST_LAUNCHER_CACHE_DIR` to relocate it or `BIFROST_LAUNCHER_AUTO_INSTALL=0` to prohibit automatic downloads.
 
-Run the package launcher's `doctor` command to inspect the required version,
-selected source, and cache path without modifying the cache or downloading
+Run the package launcher's `doctor` command to inspect the preferred and
+selected versions, source, compatibility mode, and cache path without modifying the cache or downloading
 anything. It executes the selected candidate with `--version`, so only inspect
-trusted binary locations. Run `prepare` to perform the same exact-version,
-checksum-verified resolution before starting an MCP host. Both commands accept
+trusted binary locations. Run `prepare` to perform the same range-aware,
+checksum-pinned resolution before starting an MCP host. Both commands accept
 `--json`. If preparation changes the available binary, start a fresh host task
 so the MCP tool list is negotiated again.
 

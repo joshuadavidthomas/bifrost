@@ -142,8 +142,9 @@ currently do not carry version fields:
 - `.agents/plugins/marketplace.json`
 - `.claude-plugin/marketplace.json`
 
-The VS Code extension and bundled agent plugin also pin the Bifrost release
-archive checksums:
+The VS Code extension and bundled agent plugin also share the preferred,
+minimum, and prerelease compatibility fields and pin the preferred Bifrost
+release archive checksums:
 
 - `editors/vscode/package.json`
 - `plugins/bifrost-agent/bifrost-release.json`

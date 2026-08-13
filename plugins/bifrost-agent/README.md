@@ -56,25 +56,37 @@ explicit fixed-project root. Amp uses a different direct server-map shape for
 
 Binary resolution order is:
 
-1. `BIFROST_BINARY_PATH`, when set.
-2. The launcher-managed cache for the pinned Bifrost release.
-3. A compatible `bifrost` already on `PATH`, only when
+1. `BIFROST_BINARY_PATH`, when set to a compatible binary as an explicit override.
+2. The exact preferred Bifrost release in the launcher-managed cache.
+3. The newest compatible cached patch in the declared minor-series range.
+4. A compatible `bifrost` already on `PATH`, only when
    `BIFROST_LAUNCHER_ALLOW_PATH=1` is set.
-4. A checksum-verified GitHub release download into the managed cache.
+5. A checksum-verified download of the exact preferred release.
+
+The launcher rejects other major or minor versions and rejects prereleases
+unless release metadata explicitly allows them. It never downloads an
+unpinned compatible fallback. Every packaged host adapter uses this shared
+selection for MCP, and the Claude Code LSP adapter uses the same result.
+When compatibility mode starts a server and automatic installation is enabled,
+the launcher also starts a detached checksum-verified preparation of the exact
+preferred release. The current server continues using its selected compatible
+binary; the next fresh host task can select the prepared preferred binary.
+Set `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable both foreground and background
+downloads.
 
 Set `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable downloads, or
 `BIFROST_LAUNCHER_CACHE_DIR=/path/to/cache` to choose the managed cache
-location. `BIFROST_BINARY_PATH` is the preferred local development override
-because it bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
+location. `BIFROST_BINARY_PATH` is the explicit local development override
+that bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
 stdio MCP traffic stays on stdin/stdout.
 
 The launcher also has commands that do not require a workspace. `doctor`
-checks the pinned version and configured binary candidates without modifying
-the cache or downloading anything. Compatibility checks execute each selected
+reports the preferred and selected versions, source, and exact or compatibility
+mode without modifying the cache or downloading anything. Compatibility checks execute each selected
 candidate with `--version`, so use `doctor` only with binary locations you
 trust. `prepare` follows the normal resolution order and,
-when automatic installation is enabled, downloads and verifies the pinned
-release without starting MCP. Both accept `--json` for stable machine-readable
+when automatic installation is enabled, downloads and verifies the preferred
+pinned release without starting MCP. Both accept `--json` for stable machine-readable
 output:
 
 ```bash
@@ -439,7 +451,7 @@ testing, use the checked-out binary and an explicit workspace root.
 ```json
 {
   "bifrost": {
-    "command": "/absolute/path/to/bifrost",
+    "command": "/absolute/path/to/plugin/bin/bifrost-launcher.mjs",
     "cwd": "/absolute/path/to/workspace",
     "args": ["--root", ".", "--mcp", "symbol|extended"]
   }
