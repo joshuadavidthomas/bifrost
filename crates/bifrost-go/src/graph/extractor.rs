@@ -196,7 +196,18 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             // or a typed symbol) would hide references to the package variable.
             // Only function/block-scoped `var`/`:=` are locals.
             if !go_is_top_level_decl(node) {
-                seed_local_bindings(node, ctx, locals);
+                if node.kind() == "short_var_declaration" {
+                    for value in rhs_expressions(node) {
+                        scan_node(value, ctx, locals);
+                    }
+                    seed_assignment_like(node, ctx, locals, true);
+                } else {
+                    for_each_var_spec(node, &mut |spec| {
+                        scan_var_spec_before_binding(spec, ctx, locals);
+                        seed_var_spec(spec, ctx, locals);
+                    });
+                }
+                return;
             }
         }
         "assignment_statement" => {
@@ -212,6 +223,19 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
     }
 
     scan_children(node, ctx, locals);
+}
+
+fn scan_var_spec_before_binding(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        scan_node(type_node, ctx, locals);
+    }
+    for value in rhs_expressions(node) {
+        scan_node(value, ctx, locals);
+    }
 }
 
 fn scan_callable_header(

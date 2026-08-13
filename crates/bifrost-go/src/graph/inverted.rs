@@ -196,8 +196,19 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
         "var_declaration" | "short_var_declaration" => {
             if node.kind() == "var_declaration" && is_top_level_declaration(node) {
                 scan_top_level_value_initializers(node, ctx);
+            } else if node.kind() == "short_var_declaration" {
+                for value in rhs_expressions(node) {
+                    scan_node(value, ctx, locals);
+                }
+                seed_assignment_like(node, ctx, locals, true);
+                return;
+            } else {
+                for_each_var_spec(node, &mut |spec| {
+                    scan_var_spec_before_binding(spec, ctx, locals);
+                    seed_var_spec(spec, ctx, locals);
+                });
+                return;
             }
-            seed_local_bindings(node, ctx, locals);
         }
         "assignment_statement" => {
             seed_local_bindings(node, ctx, locals);
@@ -207,6 +218,19 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
         _ => {}
     }
     scan_children(node, ctx, locals);
+}
+
+fn scan_var_spec_before_binding(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        scan_node(type_node, ctx, locals);
+    }
+    for value in rhs_expressions(node) {
+        scan_node(value, ctx, locals);
+    }
 }
 
 fn scan_callable_header(
