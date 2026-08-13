@@ -4,6 +4,9 @@ export interface BifrostLaunch {
   cwd: string;
   env: NodeJS.ProcessEnv;
   source: "explicit" | "managed" | "path" | "installed";
+  preferredVersion: string;
+  selectedVersion: string;
+  compatibilityMode: "exact" | "compatible";
 }
 
 export function resolveBifrostLaunch(options: {

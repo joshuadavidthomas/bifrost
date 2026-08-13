@@ -211,7 +211,14 @@ function collectProjectionUpdates(repoRoot, version) {
       }
     }),
     updateJson(repoRoot, "plugins/bifrost-agent/bifrost-release.json", (json) => {
+      const previousPreferred = json.binaryVersion;
       json.binaryVersion = version;
+      if (!sameMinorSeries(previousPreferred, version)) {
+        json.minimumBinaryVersion = version;
+      } else {
+        json.minimumBinaryVersion ??= version;
+      }
+      json.allowPrerelease ??= false;
     }),
     updateJson(repoRoot, "plugins/bifrost-agent/package.json", (json) => {
       json.version = version;
@@ -236,6 +243,13 @@ function collectProjectionUpdates(repoRoot, version) {
       json.version = version;
       json.bifrost ??= {};
       json.bifrost.binaryVersion = version;
+      json.bifrost.minimumBinaryVersion = sameMinorSeries(
+        existingReleaseMetadata.binaryVersion,
+        version,
+      )
+        ? (existingReleaseMetadata.minimumBinaryVersion ?? version)
+        : version;
+      json.bifrost.allowPrerelease = existingReleaseMetadata.allowPrerelease ?? false;
       if (canCopyReleaseChecksums) {
         json.bifrost.archiveSha256 = existingReleaseMetadata.archiveSha256;
       }
@@ -259,6 +273,15 @@ function collectProjectionUpdates(repoRoot, version) {
   ].filter(Boolean);
 
   return { updates, canCopyReleaseChecksums };
+}
+
+function sameMinorSeries(left, right) {
+  const leftParts = String(left ?? "").split(".");
+  const rightParts = String(right ?? "").split(".");
+  return leftParts.length >= 2
+    && rightParts.length >= 2
+    && leftParts[0] === rightParts[0]
+    && leftParts[1] === rightParts[1];
 }
 
 function syncCompatibilityRequirement(requirement, version, sourceName) {

@@ -28,6 +28,8 @@ export interface ReleaseAsset {
 export interface InstallOptions extends PlatformSpec {
   storageDir: string;
   version: string;
+  minimumBinaryVersion?: string;
+  allowPrerelease?: boolean;
   expectedSha256: string;
   fetchImpl?: typeof fetch;
   log?: (message: string) => void;
@@ -36,6 +38,18 @@ export interface InstallOptions extends PlatformSpec {
 export interface VersionProbe {
   version: string | null;
   rawOutput: string;
+}
+
+export interface BinaryCompatibility {
+  binaryVersion: string;
+  minimumBinaryVersion: string;
+  allowPrerelease: boolean;
+}
+
+export interface ManagedBinarySelection {
+  path: string;
+  version: string;
+  compatibilityMode: "exact" | "compatible";
 }
 
 export function releaseTargetFor(
@@ -128,6 +142,54 @@ export async function findManagedBinary(
   }
 }
 
+export async function findCompatibleManagedBinary(
+  storageDir: string,
+  compatibility: BinaryCompatibility,
+  platform: NodeJS.Platform = process.platform,
+  arch: NodeJS.Architecture = process.arch,
+  probeImpl: (binaryPath: string) => Promise<VersionProbe> = probeBifrostVersion
+): Promise<ManagedBinarySelection | null> {
+  const normalized = normalizeBinaryCompatibility(compatibility);
+  const binariesDir = path.join(storageDir, "binaries");
+  let entries: string[];
+  try {
+    entries = await fs.readdir(binariesDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  const compatibleVersions = entries
+    .filter((entry) => isVersionCompatible(entry, normalized))
+    .sort((left, right) => compareVersions(right, left));
+  const exactIndex = compatibleVersions.indexOf(normalized.binaryVersion);
+  if (exactIndex > 0) {
+    compatibleVersions.splice(exactIndex, 1);
+    compatibleVersions.unshift(normalized.binaryVersion);
+  }
+
+  for (const version of compatibleVersions) {
+    const candidate = managedBinaryPath(storageDir, version, platform, arch);
+    try {
+      await fs.access(candidate);
+      const probe = await probeImpl(candidate);
+      if (probe.version !== version || !isVersionCompatible(probe.version, normalized)) {
+        continue;
+      }
+      return {
+        path: candidate,
+        version,
+        compatibilityMode: version === normalized.binaryVersion ? "exact" : "compatible"
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 export async function installManagedBinary(options: InstallOptions): Promise<string> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const log = options.log ?? (() => undefined);
@@ -186,7 +248,11 @@ export async function installManagedBinary(options: InstallOptions): Promise<str
       await fs.chmod(tmpDestination, 0o755);
     }
     await fs.rename(tmpDestination, destination);
-    await cleanupOldManagedVersions(options.storageDir, options.version);
+    await cleanupOldManagedVersions(options.storageDir, {
+      binaryVersion: options.version,
+      minimumBinaryVersion: options.minimumBinaryVersion ?? options.version,
+      allowPrerelease: options.allowPrerelease ?? false
+    });
     log(`Installed Bifrost ${options.version} at ${destination}`);
     return destination;
   } finally {
@@ -199,7 +265,7 @@ export async function installManagedBinary(options: InstallOptions): Promise<str
 
 export async function cleanupOldManagedVersions(
   storageDir: string,
-  keepVersion: string
+  compatibility: string | BinaryCompatibility
 ): Promise<void> {
   const binariesDir = path.join(storageDir, "binaries");
   let entries: string[];
@@ -214,7 +280,7 @@ export async function cleanupOldManagedVersions(
 
   await Promise.all(
     entries
-      .filter((entry) => entry !== keepVersion)
+      .filter((entry) => !isVersionCompatible(entry, compatibility))
       .map((entry) => fs.rm(path.join(binariesDir, entry), { recursive: true, force: true }))
   );
 }
@@ -272,8 +338,103 @@ export async function probeBifrostVersion(binaryPath: string): Promise<VersionPr
   };
 }
 
-export function isVersionCompatible(installed: string | null, required: string): boolean {
-  return installed === required.trim().replace(/^v/, "");
+export function isVersionCompatible(
+  installed: string | null,
+  compatibility: string | BinaryCompatibility
+): boolean {
+  if (!installed) {
+    return false;
+  }
+  if (typeof compatibility === "string") {
+    return normalizeVersion(installed) === normalizeVersion(compatibility);
+  }
+  try {
+    const normalized = normalizeBinaryCompatibility(compatibility);
+    const candidate = parseVersion(installed, "installed version");
+    const preferred = parseVersion(normalized.binaryVersion, "binaryVersion");
+    const minimum = parseVersion(normalized.minimumBinaryVersion, "minimumBinaryVersion");
+    return (
+      candidate.major === preferred.major &&
+      candidate.minor === preferred.minor &&
+      compareParsedVersions(candidate, minimum) >= 0 &&
+      (normalized.allowPrerelease || candidate.prerelease === null)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeBinaryCompatibility(
+  compatibility: BinaryCompatibility
+): BinaryCompatibility {
+  const binaryVersion = normalizeVersion(compatibility.binaryVersion);
+  const minimumBinaryVersion = normalizeVersion(compatibility.minimumBinaryVersion);
+  const preferred = parseVersion(binaryVersion, "binaryVersion");
+  const minimum = parseVersion(minimumBinaryVersion, "minimumBinaryVersion");
+  if (typeof compatibility.allowPrerelease !== "boolean") {
+    throw new Error("Bifrost allowPrerelease must be a boolean");
+  }
+  if (preferred.major !== minimum.major || preferred.minor !== minimum.minor) {
+    throw new Error(
+      `Bifrost minimumBinaryVersion ${minimumBinaryVersion} must use the preferred ${preferred.major}.${preferred.minor} minor series`
+    );
+  }
+  if (compareParsedVersions(minimum, preferred) > 0) {
+    throw new Error(
+      `Bifrost minimumBinaryVersion ${minimumBinaryVersion} cannot exceed binaryVersion ${binaryVersion}`
+    );
+  }
+  return { binaryVersion, minimumBinaryVersion, allowPrerelease: compatibility.allowPrerelease };
+}
+
+interface ParsedVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string | null;
+}
+
+function normalizeVersion(version: string): string {
+  return version.trim().replace(/^v/, "");
+}
+
+function parseVersion(version: string, label: string): ParsedVersion {
+  const normalized = normalizeVersion(version);
+  const match =
+    /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(
+      normalized
+    );
+  if (!match) {
+    throw new Error(`Invalid Bifrost ${label}: ${version}`);
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ?? null
+  };
+}
+
+function compareVersions(left: string, right: string): number {
+  return compareParsedVersions(parseVersion(left, "version"), parseVersion(right, "version"));
+}
+
+function compareParsedVersions(left: ParsedVersion, right: ParsedVersion): number {
+  for (const key of ["major", "minor", "patch"] as const) {
+    if (left[key] !== right[key]) {
+      return left[key] - right[key];
+    }
+  }
+  if (left.prerelease === right.prerelease) {
+    return 0;
+  }
+  if (left.prerelease === null) {
+    return 1;
+  }
+  if (right.prerelease === null) {
+    return -1;
+  }
+  return left.prerelease.localeCompare(right.prerelease, "en", { numeric: true });
 }
 
 async function downloadBytes(fetchImpl: typeof fetch, url: string): Promise<Buffer> {

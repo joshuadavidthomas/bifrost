@@ -222,6 +222,21 @@ if ((cursorMcpServer?.startup_timeout_sec ?? 0) < minimumStartupTimeoutSec) {
   );
 }
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
+const piSessionSource = fs.readFileSync(
+  "plugins/bifrost-agent/extensions/bifrost-session.ts",
+  "utf8",
+);
+assert.match(
+  piSessionSource,
+  /from "\.\.\/bin\/bifrost-launcher\.mjs"/u,
+  "Pi must resolve Bifrost through the shared launcher module",
+);
+const pluginReadme = fs.readFileSync("plugins/bifrost-agent/README.md", "utf8");
+assert.match(
+  pluginReadme,
+  /"command": "\/absolute\/path\/to\/plugin\/bin\/bifrost-launcher\.mjs"/u,
+  "Amp instructions must invoke the shared launcher",
+);
 
 const expectedAgents = [
   "./agents/architect-reviewer.md",
@@ -254,6 +269,42 @@ if (releaseMetadata.binaryVersion !== cargoVersion) {
     `${releaseMetadataPath} binaryVersion ${releaseMetadata.binaryVersion} does not match Cargo.toml version ${cargoVersion}`,
   );
 }
+const preferredParts = releaseMetadata.binaryVersion.split(".");
+const minimumParts = String(releaseMetadata.minimumBinaryVersion ?? "").split(".");
+if (
+  minimumParts.length !== 3 ||
+  minimumParts[0] !== preferredParts[0] ||
+  minimumParts[1] !== preferredParts[1]
+) {
+  throw new Error(
+    `${releaseMetadataPath} minimumBinaryVersion must be in the preferred binary's minor series`,
+  );
+}
+if (Number(minimumParts[2]) > Number(preferredParts[2])) {
+  throw new Error(
+    `${releaseMetadataPath} minimumBinaryVersion cannot exceed binaryVersion`,
+  );
+}
+assert.equal(
+  releaseMetadata.allowPrerelease,
+  false,
+  `${releaseMetadataPath} must explicitly reject prerelease fallback binaries`,
+);
+const vscodeManifestPath = "editors/vscode/package.json";
+const vscodeManifest = JSON.parse(fs.readFileSync(vscodeManifestPath, "utf8"));
+assert.deepStrictEqual(
+  {
+    binaryVersion: vscodeManifest.bifrost?.binaryVersion,
+    minimumBinaryVersion: vscodeManifest.bifrost?.minimumBinaryVersion,
+    allowPrerelease: vscodeManifest.bifrost?.allowPrerelease,
+  },
+  {
+    binaryVersion: releaseMetadata.binaryVersion,
+    minimumBinaryVersion: releaseMetadata.minimumBinaryVersion,
+    allowPrerelease: releaseMetadata.allowPrerelease,
+  },
+  `${vscodeManifestPath} must use the agent launcher's binary compatibility range`,
+);
 for (const target of SUPPORTED_TARGETS) {
   const hash = releaseMetadata.archiveSha256?.[target];
   if (!/^[a-f0-9]{64}$/.test(hash ?? "")) {

@@ -116,11 +116,14 @@ void test("parses and validates SHA-256 sidecars", () => {
   );
 });
 
-void test("installs verified binary and cleans old managed versions", async () => {
+void test("installs verified binary and preserves compatible managed versions", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const oldDir = path.join(temp, "binaries", "0.6.7", "linux-x64");
   fs.mkdirSync(oldDir, { recursive: true });
   fs.writeFileSync(path.join(oldDir, "bifrost"), "old");
+  const incompatibleDir = path.join(temp, "binaries", "0.5.9", "linux-x64");
+  fs.mkdirSync(incompatibleDir, { recursive: true });
+  fs.writeFileSync(path.join(incompatibleDir, "bifrost"), "incompatible");
 
   const archiveName = "bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz";
   const stage = "bifrost-v0.6.8-x86_64-unknown-linux-gnu";
@@ -143,6 +146,8 @@ void test("installs verified binary and cleans old managed versions", async () =
   const installed = await provisioning.installManagedBinary({
     storageDir: temp,
     version: "0.6.8",
+    minimumBinaryVersion: "0.6.7",
+    allowPrerelease: false,
     expectedSha256: checksum,
     platform: "linux",
     arch: "x64",
@@ -151,7 +156,75 @@ void test("installs verified binary and cleans old managed versions", async () =
 
   assert.equal(installed, path.join(temp, "binaries", "0.6.8", "linux-x64", "bifrost"));
   assert.equal(fs.readFileSync(installed, "utf8"), "new-binary");
-  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.6.7")), false);
+  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.6.7")), true);
+  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.5.9")), false);
+});
+
+void test("selects exact then newest compatible managed binaries", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const versions = ["0.9.1", "0.9.5", "0.9.3", "0.8.9"];
+  for (const version of versions) {
+    const binary = provisioning.managedBinaryPath(temp, version, "linux", "x64");
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, version);
+  }
+  const compatibility = {
+    binaryVersion: "0.9.3",
+    minimumBinaryVersion: "0.9.0",
+    allowPrerelease: false
+  };
+  const probe = (binary: string) =>
+    Promise.resolve({
+      version: fs.readFileSync(binary, "utf8"),
+      rawOutput: ""
+    });
+
+  const exact = await provisioning.findCompatibleManagedBinary(
+    temp,
+    compatibility,
+    "linux",
+    "x64",
+    probe
+  );
+  assert.equal(exact?.version, "0.9.3");
+  assert.equal(exact?.compatibilityMode, "exact");
+
+  fs.rmSync(path.join(temp, "binaries", "0.9.3"), { recursive: true });
+  const newest = await provisioning.findCompatibleManagedBinary(
+    temp,
+    compatibility,
+    "linux",
+    "x64",
+    probe
+  );
+  assert.equal(newest?.version, "0.9.5");
+  assert.equal(newest?.compatibilityMode, "compatible");
+});
+
+void test("skips mislabeled, prerelease, and cross-minor managed binaries", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const reported = new Map([
+    ["0.9.4", "0.9.2"],
+    ["0.9.3-rc.1", "0.9.3-rc.1"],
+    ["0.8.9", "0.8.9"]
+  ]);
+  for (const version of reported.keys()) {
+    const binary = provisioning.managedBinaryPath(temp, version, "linux", "x64");
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, version);
+  }
+
+  const selected = await provisioning.findCompatibleManagedBinary(
+    temp,
+    { binaryVersion: "0.9.5", minimumBinaryVersion: "0.9.0", allowPrerelease: false },
+    "linux",
+    "x64",
+    (binary) => {
+      const directoryVersion = path.basename(path.dirname(path.dirname(binary)));
+      return Promise.resolve({ version: reported.get(directoryVersion) ?? null, rawOutput: "" });
+    }
+  );
+  assert.equal(selected, null);
 });
 
 void test("rejects checksum mismatch during install", async () => {
@@ -569,4 +642,14 @@ void test("parses bifrost --version output", () => {
   assert.equal(provisioning.parseBifrostVersion("bifrost v0.6.8\n"), "0.6.8");
   assert.equal(provisioning.parseBifrostVersion("not bifrost\n"), null);
   assert.equal(provisioning.isVersionCompatible("0.6.8", "v0.6.8"), true);
+  const compatibility = {
+    binaryVersion: "0.6.8",
+    minimumBinaryVersion: "0.6.3",
+    allowPrerelease: false
+  };
+  assert.equal(provisioning.isVersionCompatible("0.6.3", compatibility), true);
+  assert.equal(provisioning.isVersionCompatible("0.6.9", compatibility), true);
+  assert.equal(provisioning.isVersionCompatible("0.6.2", compatibility), false);
+  assert.equal(provisioning.isVersionCompatible("0.7.0", compatibility), false);
+  assert.equal(provisioning.isVersionCompatible("0.6.9-rc.1", compatibility), false);
 });
