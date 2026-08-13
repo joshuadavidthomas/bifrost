@@ -196,6 +196,7 @@ pub fn python_deferred_annotation_identifier_ranges(
             .parent()
             .is_some_and(|parent| parent.kind() == "concatenated_string")
         || !python_node_is_in_annotation(string)
+        || python_string_is_literal_value(string, source)
     {
         return None;
     }
@@ -242,4 +243,72 @@ pub fn python_deferred_annotation_identifier_ranges(
         }
     }
     Some(ranges)
+}
+
+/// Whether `string` is a value argument of `Literal[...]`, rather than a
+/// deferred type expression merely because the whole subscript is an
+/// annotation.
+fn python_string_is_literal_value(string: Node<'_>, source: &str) -> bool {
+    let start = string.start_byte();
+    let end = string.end_byte();
+    let mut current = string;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "subscript" => {
+                let Some(value) = parent.child_by_field_name("value") else {
+                    return false;
+                };
+                if value.start_byte() <= start && end <= value.end_byte() {
+                    return false;
+                }
+                return python_literal_annotation_base(value, source);
+            }
+            "generic_type" => {
+                let Some(value) = parent.named_child(0) else {
+                    return false;
+                };
+                return python_literal_annotation_base(value, source);
+            }
+            _ => current = parent,
+        }
+    }
+    false
+}
+
+fn python_literal_annotation_base(value: Node<'_>, source: &str) -> bool {
+    match value.kind() {
+        "identifier" => node_text(value, source) == "Literal",
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                value.child_by_field_name("object"),
+                value.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            object.kind() == "identifier"
+                && matches!(node_text(object, source), "typing" | "typing_extensions")
+                && attribute.kind() == "identifier"
+                && node_text(attribute, source) == "Literal"
+        }
+        "member_type" => {
+            let mut identifiers = Vec::new();
+            let mut stack = vec![value];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "identifier" {
+                    identifiers.push(node_text(node, source));
+                    continue;
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            matches!(
+                identifiers.as_slice(),
+                ["typing", "Literal"] | ["typing_extensions", "Literal"]
+            )
+        }
+        _ => false,
+    }
 }

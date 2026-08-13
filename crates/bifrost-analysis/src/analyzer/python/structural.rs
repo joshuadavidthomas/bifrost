@@ -125,6 +125,39 @@ mod structural_spec_tests {
         }
     }
 
+    #[test]
+    fn literal_string_values_are_not_deferred_type_operands() {
+        let source = concat!(
+            "import typing\n",
+            "import typing_extensions\n",
+            "from typing import Literal\n",
+            "class NOASSERTION:\n",
+            "    pass\n",
+            "def deferred(value: \"NOASSERTION\") -> None:\n",
+            "    pass\n",
+            "def direct(value: Literal[\"NOASSERTION\"]) -> None:\n",
+            "    pass\n",
+            "def qualified(value: typing.Literal[\"NOASSERTION\"]) -> None:\n",
+            "    pass\n",
+            "def extension(value: typing_extensions.Literal[\"NOASSERTION\"]) -> None:\n",
+            "    pass\n",
+        );
+        let found = occurrence_roles_of(
+            &PYTHON_STRUCTURAL_SPEC,
+            &tree_sitter_python::LANGUAGE.into(),
+            source,
+        );
+        let occurrences: Vec<_> = source.match_indices("NOASSERTION").collect();
+        assert_eq!(occurrences.len(), 5);
+        assert_occurrence_role(&found, occurrences[1].0, OccurrenceRole::TypeOperand);
+        for (offset, _) in occurrences.into_iter().skip(2) {
+            assert!(
+                found.iter().all(|(start, _, _)| *start != offset),
+                "Literal value at {offset} must not become a type operand: {found:?}"
+            );
+        }
+    }
+
     /// Python scopes with the indented suite its grammar calls `block`. The
     /// module node is deliberately not a block: a file scope is not a
     /// statement list nested inside another one.
