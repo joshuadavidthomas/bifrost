@@ -66,4 +66,47 @@ ABSL_NAMESPACE_END
             edges.edges.keys().collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn inverted_edges_record_ordinary_object_macro_references() {
+        let source = r#"#define LIMIT 7
+int use(void) { return LIMIT + 1; }
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        fs::write(root.join("ordinary.c"), source).expect("write fixture");
+        let file = ProjectFile::new(&root, "ordinary.c");
+        let analyzer = CppAnalyzer::from_project(TestProject::new(&root, Language::Cpp));
+        let declarations = analyzer.get_all_declarations();
+        let macro_unit = declarations
+            .iter()
+            .find(|unit| unit.is_macro() && unit.identifier() == "LIMIT")
+            .expect("LIMIT macro");
+        let caller = declarations
+            .iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "use")
+            .expect("use function");
+        let roots = std::iter::once(file.clone()).collect();
+        let visibility =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let nodes = [macro_unit.fq_name(), caller.fq_name()]
+            .into_iter()
+            .collect();
+
+        let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(
+            &analyzer,
+            std::slice::from_ref(&file),
+            &visibility,
+            &nodes,
+            |_| true,
+        );
+
+        assert!(
+            edges
+                .edges
+                .contains_key(&(caller.fq_name(), macro_unit.fq_name())),
+            "the bulk graph must use the same active macro verdict: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
 }

@@ -693,6 +693,36 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node_text(node, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    if is_ordinary_macro_reference_node(node) {
+        match ctx.visibility.resolve_ordinary_macro_reference(
+            &ctx.analyzer,
+            ctx.file,
+            node,
+            ctx.source,
+        ) {
+            OrdinaryMacroReferenceResolution::Resolved(unit)
+                if ctx.target_group.contains(&unit) =>
+            {
+                *ctx.raw_match_count += 1;
+                push_hit(node, ctx);
+            }
+            OrdinaryMacroReferenceResolution::Ambiguous
+                if ctx
+                    .visibility
+                    .macro_target_is_visible_candidate(ctx.file, &ctx.spec.target) =>
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(node, ctx);
+            }
+            OrdinaryMacroReferenceResolution::Resolved(_)
+            | OrdinaryMacroReferenceResolution::Ambiguous
+            | OrdinaryMacroReferenceResolution::Missing => {}
+        }
+        return;
+    }
     if !matches!(
         node.kind(),
         "identifier"
@@ -700,14 +730,12 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "type_identifier"
             | "namespace_identifier"
             | "preproc_arg"
-    ) || node_text(node, ctx.source) != ctx.spec.member_name
-        || node.parent().is_some_and(|parent| {
-            matches!(parent.kind(), "preproc_def" | "preproc_function_def")
-                && parent
-                    .child_by_field_name("name")
-                    .is_some_and(|name| same_node(name, node))
-        })
-    {
+    ) || node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "preproc_def" | "preproc_function_def")
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| same_node(name, node))
+    }) {
         return;
     }
     if ctx.visibility.macro_binding_matches_target_at(

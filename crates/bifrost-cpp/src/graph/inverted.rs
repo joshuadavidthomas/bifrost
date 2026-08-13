@@ -37,12 +37,12 @@ use crate::graph::extractor::{
 };
 use crate::graph::resolver::{
     CppTemplateResolutionError, DesignatedInitializerOwner, EnclosingMemberOwnerResolution,
-    LexicalCallableValueResolution, LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind,
-    VisibilityIndex, VisibleMemberResolution, canonical_cpp_scope_components,
-    constructor_style_local_declaration, cpp_callable_arity, cpp_template_reference_arguments,
-    cpp_type_name_components, declarator_name_node, designated_initializer_owner,
-    extract_variable_name, first_type_child, function_terminal_node, has_ancestor_kind,
-    infer_cpp_initializer_binding, infer_cpp_initializer_type, is_c_source_file,
+    LexicalCallableValueResolution, LexicalTypeResolution, OrdinaryMacroReferenceResolution,
+    OrdinaryTypeImportCell, TargetKind, VisibilityIndex, VisibleMemberResolution,
+    canonical_cpp_scope_components, constructor_style_local_declaration, cpp_callable_arity,
+    cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
+    designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
+    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type, is_c_source_file,
     is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     normalize_type_text, out_of_line_destructor_type_reference,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
@@ -200,6 +200,20 @@ fn record_reference(
     ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    match ctx
+        .visibility
+        .resolve_ordinary_macro_reference(&ctx.analyzer, ctx.file, node, ctx.source)
+    {
+        OrdinaryMacroReferenceResolution::Resolved(macro_unit) => {
+            ctx.record(macro_unit.fq_name(), node);
+            return;
+        }
+        OrdinaryMacroReferenceResolution::Ambiguous => {
+            ctx.record_unproven(node_text(node, ctx.source), node);
+            return;
+        }
+        OrdinaryMacroReferenceResolution::Missing => {}
+    }
     if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
         record_recovered_macro_return_type_reference(return_type, ctx);
         return;

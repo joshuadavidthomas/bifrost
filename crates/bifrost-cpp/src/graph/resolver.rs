@@ -107,6 +107,13 @@ pub enum NamespaceValueResolution {
     Missing,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrdinaryMacroReferenceResolution {
+    Resolved(CodeUnit),
+    Ambiguous,
+    Missing,
+}
+
 pub fn resolve_namespace_value(
     analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
@@ -1755,6 +1762,58 @@ impl<'a> VisibilityIndex<'a> {
             }
             node.start_byte() == binding.declaration_byte
         })
+    }
+
+    /// Resolve an ordinary expression-position macro token at its exact byte.
+    ///
+    /// Calls and preprocessor-condition tokens have separate resolution
+    /// surfaces. Declaration names, macro parameters, and labels are not
+    /// references. Keeping that role policy here makes forward and both
+    /// inverse graph builders consume the same activation verdict (#2093).
+    pub fn resolve_ordinary_macro_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        node: Node<'_>,
+        source: &str,
+    ) -> OrdinaryMacroReferenceResolution {
+        if !is_ordinary_macro_reference_node(node) {
+            return OrdinaryMacroReferenceResolution::Missing;
+        }
+        let name = node_text(node, source);
+        if name.is_empty() {
+            return OrdinaryMacroReferenceResolution::Missing;
+        }
+        let visible = self
+            .visible_identifier_candidates(file, name)
+            .filter(|candidate| candidate.is_macro())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut exact = Vec::new();
+        for candidate in &visible {
+            if self.macro_binding_matches_target_at(
+                analyzer,
+                file,
+                name,
+                node.start_byte(),
+                candidate,
+            ) && !exact
+                .iter()
+                .any(|existing| same_visible_symbol(existing, candidate))
+            {
+                exact.push(candidate.clone());
+            }
+        }
+        match exact.len() {
+            1 => OrdinaryMacroReferenceResolution::Resolved(exact.pop().unwrap()),
+            2.. => OrdinaryMacroReferenceResolution::Ambiguous,
+            0 if !visible.is_empty()
+                && self.macro_name_may_be_bound_at(file, name, node.start_byte()) =>
+            {
+                OrdinaryMacroReferenceResolution::Ambiguous
+            }
+            0 => OrdinaryMacroReferenceResolution::Missing,
+        }
     }
 
     /// Whether this target is an indexed macro visible from this file.
@@ -8949,6 +9008,38 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
         current = ancestor.parent();
     }
     false
+}
+
+pub fn is_ordinary_macro_reference_node(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "field_identifier") || is_declaration_name(node) {
+        return false;
+    }
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(node)
+        {
+            return false;
+        }
+        if matches!(parent.kind(), "labeled_statement" | "goto_statement")
+            && parent.child_by_field_name("label") == Some(node)
+        {
+            return false;
+        }
+    }
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind().starts_with("preproc_") {
+            return false;
+        }
+        if matches!(
+            ancestor.kind(),
+            "translation_unit" | "function_definition" | "compound_statement"
+        ) {
+            break;
+        }
+        current = ancestor.parent();
+    }
+    true
 }
 
 /// Whether a parameter declaration belongs to the callable scope whose body can

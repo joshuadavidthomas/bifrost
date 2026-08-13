@@ -9,10 +9,11 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 ## Progress
 
 - [x] (2026-08-13 13:10Z) Read #2093, `.agents/PLANS.md`, and the existing forward, targeted-inverse, bulk-inverse, and macro-environment paths.
-- [ ] Define one shared structured macro-reference role and exact-activation resolution verdict in `brokk-bifrost-cpp`.
-- [ ] Route forward ordinary identifiers, targeted macro scans, and bulk inverted edges through the shared verdict.
-- [ ] Add InlineTestProject behavior coverage for the advertised expression surfaces and fail-closed controls.
-- [ ] Run focused validation, commit, rebuild the release runner, replay representative corpus witnesses, push, publish evidence, and close #2093 without waiting for the full rank-31+ rerun.
+- [x] (2026-08-13 14:02Z) Defined one shared structured macro-reference role and exact-activation resolution verdict in `brokk-bifrost-cpp`.
+- [x] (2026-08-13 14:08Z) Routed forward navigation, targeted macro scans, and bulk inverted edges through the shared verdict while preserving the existing function-like call path.
+- [x] (2026-08-13 14:18Z) Added InlineTestProject coverage for every advertised expression surface and fail-closed control, plus a bulk-edge unit pin.
+- [x] (2026-08-13 14:31Z) Passed focused #2093, #1812, #1819, #1960, resolver, bulk-edge, affected-crate clippy, and dependency validation.
+- [ ] Commit, rebuild the release runner, replay representative corpus witnesses, push, publish evidence, and close #2093 without waiting for the full rank-31+ rerun.
 
 ## Surprises & Discoveries
 
@@ -25,6 +26,12 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
 - Observation: the bulk inverted C/C++ pass currently records types, calls, fields, and designated initializers but has no ordinary macro reference arm.
   Evidence: `crates/bifrost-cpp/src/graph/inverted.rs::record_reference` has macro-specific recovered-type handling but no active-macro resolution for an ordinary identifier.
 
+- Observation: a macro-produced member spelling does not enter the ordinary identifier branch in forward navigation.
+  Evidence: the first behavior run resolved every `ACTIVE` value occurrence but returned `unsupported_cpp_receiver` for `holder->FIELD_NAME`; `cpp_reference_node` classified the focus as `CppReferenceNode::Field`. Moving the shared macro verdict before reference-shape dispatch fixed that causal case.
+
+- Observation: the public workspace graph intentionally excludes Macro CodeUnits from its node catalog.
+  Evidence: `WorkspaceUsageCatalog::build_with_cancellation` retains classes, callables, and Java module scopes only. Bulk parity is therefore pinned at the internal `build_cpp_edges` seam with an explicit macro node set rather than by widening the public graph contract.
+
 ## Decision Log
 
 - Decision: centralize macro occurrence admission and exact target selection in `crates/bifrost-cpp/src/graph/resolver.rs`.
@@ -35,15 +42,19 @@ Bifrost already indexes C preprocessor macros and reconstructs their activation 
   Rationale: function-like macro calls are owned by #1812 and #1819, while preprocessor-condition activation/order is owned by #1960. The shared role helper will therefore reject a call expression's `function` child and all preprocessor declaration/parameter/condition roles. This keeps the fix small and prevents unrelated issue families from being silently reclassified.
   Date/Author: 2026-08-13 / Codex
 
+- Decision: apply the active object-like macro verdict before C/C++ reference-shape and ordinary binding precedence.
+  Rationale: preprocessing occurs before C/C++ name lookup. An active object-like macro expands even when its spelling coincides with a local, field, or selected member; only an inactive or undefined macro may fall through to those language bindings. This ordering is also required for the field-selector witness, whose tree-sitter role bypasses the ordinary identifier branch.
+  Date/Author: 2026-08-13 / Codex
+
 ## Outcomes & Retrospective
 
-No production code has changed yet. The source audit confirms that this is a shared resolver gap rather than missing macro extraction. The next milestone is a language-crate verdict used by all three consumers.
+The shared resolver verdict and all three consumers are implemented. Focused behavior now covers array bounds, initializers, binary and argument expressions, casts, returns, and selected member spellings. Before-definition, after-`#undef`, contradictory conditional definitions, labels, macro definition/formal names, and the existing function-like call surface remain fail-closed or on their established paths. Focused tests, clippy, and dependency validation are green; production corpus replay and publication remain.
 
 ## Context and Orientation
 
 The repository uses tree-sitter-cpp for both `.c` and `.cpp` files. A macro definition is indexed as a `CodeUnit` whose kind is Macro. `VisibilityIndex` in `crates/bifrost-cpp/src/graph/resolver.rs` replays macro events in source and include order to build the environment visible immediately before any byte. Its `macro_binding_matches_target_at` method proves that the active binding is a particular indexed macro definition; `macro_name_may_be_bound_at` represents an uncertain environment.
 
-Forward navigation lives in `crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs`. The ordinary identifier branch already rejects declaration and preprocessor-body roles, checks local bindings, and applies field precedence. Macro resolution belongs after those role and ordinary-language precedence checks but before the final no-definition answer.
+Forward navigation lives in `crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs`. The macro verdict runs after location validation and the C `this` special case but before `cpp_reference_node` dispatch. This matches preprocessing order and lets macro-produced member spellings resolve before the field route consumes them. Missing macro state falls through unchanged to declaration, local, member, type, and callable resolution.
 
 Targeted inverse usage scanning lives in `crates/bifrost-cpp/src/graph/extractor.rs`. It receives one macro target and asks whether each candidate occurrence names that target. Bulk inverted edge construction lives in `crates/bifrost-cpp/src/graph/inverted.rs`; it walks a file once and records the exact callee identity for every supported reference. Both should call the same shared occurrence role and resolution verdict as forward navigation.
 
@@ -53,7 +64,7 @@ An “ordinary macro reference” in this plan means an identifier-like AST leaf
 
 In `crates/bifrost-cpp/src/graph/resolver.rs`, add a public occurrence predicate that accepts only the structured ordinary roles above. Reuse the existing `is_declaration_name` helper and inspect exact parent fields for macro definitions, macro parameter lists, labels, calls, and preprocessor directives. Add a public resolution enum with `Resolved(CodeUnit)`, `Ambiguous`, and `Missing`. Add a `VisibilityIndex` method that receives the graph source, file, node, and source text; it rejects non-ordinary roles, reads the exact-byte macro environment, gathers visible indexed macro units with the same terminal, and uses `macro_binding_matches_target_at` to prove the active definition. One exact logical target resolves. More than one exact target or a possibly bound name without one provable target is ambiguous. No active binding is missing.
 
-In `crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs`, replace the analysis-local ordinary macro candidate interpretation with the shared verdict. Preserve the existing declaration/preprocessor rejection and local/member/global-field precedence, then return the resolved macro candidate before the final no-definition diagnostic. An ambiguous verdict returns an honest macro ambiguity/no-definition result without selecting a same-name definition.
+In `crates/bifrost-analysis/src/analyzer/usages/get_definition/cpp.rs`, consult the shared verdict before reference-shape dispatch. A resolved active macro returns its exact definition, ambiguity returns an honest macro ambiguity/no-definition result, and missing falls through to the existing declaration/local/member/type/callable paths without change.
 
 In `crates/bifrost-cpp/src/graph/extractor.rs`, make `maybe_record_macro_hit` call the shared occurrence predicate and verdict. It emits a proven hit only when the resolved macro equals the requested target. An ambiguous verdict can retain the existing unproven behavior for visible matching targets; missing emits nothing. In `crates/bifrost-cpp/src/graph/inverted.rs`, add an early ordinary-macro arm before general identifier/type processing. A resolved macro records its exact FQN at the identifier range; ambiguity records only an unproven requested name where the bulk input asks for that terminal; missing falls through to ordinary language resolution.
 

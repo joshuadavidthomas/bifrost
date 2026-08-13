@@ -26,7 +26,8 @@ use brokk_bifrost_cpp::call_match::{
     normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::resolver::{
-    cpp_alias_declaration_target_text, is_c_source_file, same_logical_symbol,
+    OrdinaryMacroReferenceResolution, cpp_alias_declaration_target_text, is_c_source_file,
+    same_logical_symbol,
 };
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
@@ -291,6 +292,23 @@ pub(super) fn resolve_cpp<'a>(
                 "C `this` has no visible local binding",
             )
         };
+    }
+    let dispatch = CppDispatch::new(analyzer);
+    let graph = dispatch.source();
+    match visibility.resolve_ordinary_macro_reference(&graph, file, node, source) {
+        OrdinaryMacroReferenceResolution::Resolved(macro_unit) => {
+            return candidates_outcome(vec![macro_unit]);
+        }
+        OrdinaryMacroReferenceResolution::Ambiguous => {
+            return no_definition(
+                "ambiguous_cpp_macro_reference",
+                format!(
+                    "active C/C++ macro `{}` is ambiguous at this reference",
+                    site.text
+                ),
+            );
+        }
+        OrdinaryMacroReferenceResolution::Missing => {}
     }
     let reference = cpp_reference_node(node);
     if let Some(CppReferenceNode::Type(type_node)) = reference {
