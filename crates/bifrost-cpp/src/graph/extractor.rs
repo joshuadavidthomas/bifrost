@@ -8234,6 +8234,7 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize, bool)> {
 }
 
 fn collect_source_using_index(
+    visibility: &VisibilityIndex<'_>,
     source_file: &ProjectFile,
     root: Node<'_>,
     source: &str,
@@ -8242,87 +8243,101 @@ fn collect_source_using_index(
     let orphaned_namespaces = collect_orphaned_namespace_envelopes(root, source);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let required_guards = if callable_preprocessor_context_is_visible(node, source) {
-            Some(HashSet::default())
-        } else {
-            preprocessor_guard_environment(node, source)
-        };
-        let Some(required_guards) = required_guards else {
-            let mut cursor = node.walk();
-            stack.extend(node.children(&mut cursor));
-            continue;
-        };
-        let target = if let Some(namespace_node) = using_namespace_directive_name_node(node) {
-            let mut namespace_components = Vec::new();
-            append_cpp_name_components(namespace_node, source, &mut namespace_components).map(
-                |_| EffectiveUsingTarget::Namespace {
-                    namespace_components,
-                    global: is_globally_qualified_cpp_name(namespace_node),
+        let target = match node.kind() {
+            "using_directive" | "using_declaration" => {
+                if let Some(namespace_node) = using_namespace_directive_name_node(node) {
+                    let mut namespace_components = Vec::new();
+                    append_cpp_name_components(namespace_node, source, &mut namespace_components)
+                        .map(|_| EffectiveUsingTarget::Namespace {
+                            namespace_components,
+                            global: is_globally_qualified_cpp_name(namespace_node),
+                        })
+                } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+                    let mut target_components = Vec::new();
+                    (append_cpp_name_components(type_node, source, &mut target_components)
+                        .is_some()
+                        && target_components.len() >= 2)
+                        .then(|| EffectiveUsingTarget::Ordinary {
+                            name: target_components
+                                .last()
+                                .expect("ordinary using has a terminal component")
+                                .clone(),
+                            target_components,
+                            global: is_globally_qualified_cpp_name(type_node),
+                        })
+                } else {
+                    None
+                }
+            }
+            "declaration" => recovered_macro_using_declaration_type_node(node, source).and_then(
+                |(type_node, global)| {
+                    let mut target_components = Vec::new();
+                    (append_cpp_name_components(type_node, source, &mut target_components)
+                        .is_some()
+                        && target_components.len() >= 2)
+                        .then(|| EffectiveUsingTarget::Ordinary {
+                            name: target_components
+                                .last()
+                                .expect("recovered ordinary using has a terminal component")
+                                .clone(),
+                            target_components,
+                            global,
+                        })
                 },
-            )
-        } else if let Some((type_node, global)) =
-            recovered_macro_using_declaration_type_node(node, source)
-        {
-            let mut target_components = Vec::new();
-            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
-                && target_components.len() >= 2)
-                .then(|| EffectiveUsingTarget::Ordinary {
-                    name: target_components
-                        .last()
-                        .expect("recovered ordinary using has a terminal component")
-                        .clone(),
-                    target_components,
-                    global,
-                })
-        } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
-            let mut target_components = Vec::new();
-            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
-                && target_components.len() >= 2)
-                .then(|| EffectiveUsingTarget::Ordinary {
-                    name: target_components
-                        .last()
-                        .expect("ordinary using has a terminal component")
-                        .clone(),
-                    target_components,
-                    global: is_globally_qualified_cpp_name(type_node),
-                })
-        } else {
-            None
+            ),
+            _ => None,
         };
-        if let Some(target) = target
-            && let Some((scope_start, scope_end, scope_depth, block_scope)) =
-                ordinary_using_scope(node)
-        {
-            let declaration_namespace = enclosing_namespace_components(node, source);
-            let declaration_namespace = if declaration_namespace.is_empty() {
-                recovered_orphaned_namespace_components(node, source, &orphaned_namespaces)
-                    .unwrap_or(declaration_namespace)
+        if let Some(target) = target {
+            // Guard ancestry is one of the most expensive tree-sitter operations: Node::parent
+            // searches from the root. The project index visits every AST node, but only these
+            // structured using declarations need a guard environment. Keep the cheap target
+            // classification ahead of both ancestor walks so non-using nodes remain a one-pass
+            // walk and the total cost is O(nodes + using declarations * ancestor depth).
+            visibility.note_using_guard_context_inspection_for_test();
+            let required_guards = if callable_preprocessor_context_is_visible(node, source) {
+                Some(HashSet::default())
             } else {
-                declaration_namespace
+                preprocessor_guard_environment(node, source)
             };
-            let namespace_scope = using_named_scope(node, source);
-            let lexical_depth = declaration_namespace.len();
-            let binding = OrdinaryTypeImport {
-                target,
-                source: source_file.clone(),
-                declaration_byte: node.end_byte(),
-                scope_start,
-                scope_end,
-                scope_depth,
-                block_scope,
-                lexical_depth,
-                declaration_namespace,
-                namespace_scope,
-                resolved_target_components: None,
-                required_guards,
+            let Some(required_guards) = required_guards else {
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+                continue;
             };
-            match &binding.target {
-                EffectiveUsingTarget::Ordinary { name, .. } => index
-                    .ordinary_by_name
-                    .entry(name.clone())
-                    .or_default()
-                    .push(binding),
-                EffectiveUsingTarget::Namespace { .. } => index.directives.push(binding),
+            if let Some((scope_start, scope_end, scope_depth, block_scope)) =
+                ordinary_using_scope(node)
+            {
+                let declaration_namespace = enclosing_namespace_components(node, source);
+                let declaration_namespace = if declaration_namespace.is_empty() {
+                    recovered_orphaned_namespace_components(node, source, &orphaned_namespaces)
+                        .unwrap_or(declaration_namespace)
+                } else {
+                    declaration_namespace
+                };
+                let namespace_scope = using_named_scope(node, source);
+                let lexical_depth = declaration_namespace.len();
+                let binding = OrdinaryTypeImport {
+                    target,
+                    source: source_file.clone(),
+                    declaration_byte: node.end_byte(),
+                    scope_start,
+                    scope_end,
+                    scope_depth,
+                    block_scope,
+                    lexical_depth,
+                    declaration_namespace,
+                    namespace_scope,
+                    resolved_target_components: None,
+                    required_guards,
+                };
+                match &binding.target {
+                    EffectiveUsingTarget::Ordinary { name, .. } => index
+                        .ordinary_by_name
+                        .entry(name.clone())
+                        .or_default()
+                        .push(binding),
+                    EffectiveUsingTarget::Namespace { .. } => index.directives.push(binding),
+                }
             }
         }
         let mut cursor = node.walk();
@@ -8518,6 +8533,7 @@ fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIn
             continue;
         };
         let source_index = collect_source_using_index(
+            visibility,
             &source_file,
             prepared.tree().root_node(),
             prepared.source(),
@@ -8532,6 +8548,19 @@ fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIn
         project.directives.extend(source_index.directives);
     }
     project
+}
+
+fn project_using_index<'a>(visibility: &'a VisibilityIndex<'_>) -> &'a ProjectUsingIndex {
+    visibility.project_using_index(|| build_project_using_index(visibility))
+}
+
+/// Build the immutable project-wide using index before a parallel file scan.
+///
+/// Keeping the `OnceLock` publication here avoids making every scanner carry
+/// an eager index, while callers that are about to fan out can prevent one
+/// worker from doing the whole build as its peers wait on the lock.
+pub fn prewarm_project_using_index(visibility: &VisibilityIndex<'_>) {
+    let _ = project_using_index(visibility);
 }
 
 fn effective_using_target_tiers(binding: &OrdinaryTypeImport) -> Vec<Vec<String>> {
@@ -8727,7 +8756,7 @@ pub fn effective_using_bindings_for_name(
     imports
         .projection_cell(name)
         .get_or_init(|| {
-            let project = visibility.project_using_index(|| build_project_using_index(visibility));
+            let project = project_using_index(visibility);
             let mut projected = Vec::new();
             for binding in project
                 .ordinary_by_name

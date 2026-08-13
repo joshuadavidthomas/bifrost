@@ -14,7 +14,9 @@ use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, r
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_cpp::declarations::CppSentinelRecoveredClass;
-use brokk_bifrost_cpp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
+use brokk_bifrost_cpp::graph::extractor::{
+    ScanState, prepare_file, prewarm_project_using_index, scan_prepared_file,
+};
 use brokk_bifrost_cpp::graph::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -341,6 +343,7 @@ where
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
     let dispatch = CppDispatch::new(analyzer);
+    prewarm_project_using_index(visibility);
     build_edge_output(files, keep_file, |file| {
         parse_and_collect(
             analyzer,

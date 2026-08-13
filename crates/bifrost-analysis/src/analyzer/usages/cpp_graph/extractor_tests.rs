@@ -94,10 +94,11 @@ mod effective_using_scale_tests {
                 after_absent.1,
                 after_absent.2,
                 after_absent.3,
-                after_absent.4
+                after_absent.4,
+                after_absent.5
             ),
-            (0, 0, 0, 0),
-            "an absent name must not activate donors, expand namespaces, hydrate callables, or inspect unrelated declarations"
+            (0, 0, 0, 0, HEADER_COUNT),
+            "the project index must inspect guard ancestry only for the one structured using directive per header, never for unrelated AST nodes"
         );
         std::thread::scope(|scope| {
             for _ in 0..16 {
