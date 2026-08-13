@@ -107,15 +107,27 @@ excluded); I1(c) and I2–I5 run in the service phase through
 ## Corpus and ranking
 
 - Clones: `/mnt/minasmorgul/repo-clones` (via the
-  `/home/jonathan/Projects/brokkbench/clones` symlink). Membership:
-  `brokkbench/sft-tools-commits/<language>/<slug>.jsonl`.
-- Ranking: per-repo task count = `tasks.sft_count_for_repo` from
-  `brokkbench/tasks.py`, accessed through its venv python helper (never parse task files
-  manually — enforced by test). Ties: raw scan-record count, then slug. Languages where
-  every sft_count is zero (scala) fall back to raw scan count. **Scala is exhausted at
-  rank 84** — no further scala widening exists.
-- Absent or broken clones: substitute the next ranked repo and record the substitution
-  in the tier closeout.
+  `/home/jonathan/Projects/brokkbench/clones` symlink).
+- **The canonical corpus ranking is the committed frozen snapshot
+  `.agents/plans/mcp-property-fuzzer/corpus-ranking.json`** (generated 2026-08-13,
+  11 languages, 528-1,691 repos each; top anchors verified against tier-1 records).
+  Window construction needs only this file plus the committed ledgers: take the
+  language's ordered list, subtract every (language, repo) already recorded in
+  `m4-tier*.jsonl`, and the next N entries are the window. Running a campaign this way
+  has no brokkbench dependency at all.
+- Regenerate the snapshot only when the corpus materially changes (new clones, new SFT
+  task data): `brokkbench/.venv/bin/python3 scripts/mcp-fuzzer-repo-rank.py
+  --commits-root brokkbench/sft-tools-commits > <the snapshot path>`. The derivation it
+  freezes: per-repo task count = `tasks.sft_count_for_repo` from `brokkbench/tasks.py`,
+  accessed through its venv python helper (never parse task files manually — enforced
+  by test). Ties: raw scan-record count, then slug. Languages where every sft_count is
+  zero (scala) fall back to raw scan count. **Scala is exhausted at rank 84** — no
+  further scala widening exists.
+- The fuzzer binary's corpus-mode selection still shells out to the brokkbench helper
+  at runtime; campaign runs bypass it entirely by driving explicit `--repo` lists from
+  the frozen windows.
+- Absent or broken clones: substitute the next ranked unprobed repo from the snapshot
+  and record the substitution in the tier closeout.
 
 ## Known signature families
 
