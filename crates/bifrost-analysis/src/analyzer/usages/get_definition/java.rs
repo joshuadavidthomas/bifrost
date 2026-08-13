@@ -1521,7 +1521,9 @@ fn resolve_java_bare_identifier(
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
     if java_identifier_is_annotation_name(node) {
-        if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
+        if let Some(unit) =
+            java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
+        {
             return candidates_outcome(vec![unit]);
         }
         return java_bare_name_static_import_or_boundary(analyzer, java, session, file, name);
@@ -1567,7 +1569,9 @@ fn resolve_java_bare_identifier(
             format!("`{name}` resolves to a local Java binding"),
         );
     }
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
+    if let Some(unit) =
+        java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
+    {
         return candidates_outcome(vec![unit]);
     }
     java_bare_name_static_import_or_boundary(analyzer, java, session, file, name)
@@ -1686,7 +1690,16 @@ fn java_receiver_type_for_java(
                 })
                 .or_else(|| {
                     (!bindings.is_shadowed(name))
-                        .then(|| session.resolve_type_name_in_file(java, file, name))
+                        .then(|| {
+                            java_type_text_with_context(
+                                analyzer,
+                                java,
+                                session,
+                                file,
+                                name,
+                                object.start_byte(),
+                            )
+                        })
                         .flatten()
                 })
         }
