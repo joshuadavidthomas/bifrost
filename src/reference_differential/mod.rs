@@ -2,7 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
-    census_membership_identifier_ranges, go_is_declaration_or_import_name,
+    census_membership_identifier_ranges, go_is_declaration_or_import_name, php_is_declaration_name,
     python_deferred_annotation_membership_ranges, reference_candidate_ranges,
     reference_candidate_requires_point_lookup,
 };
@@ -919,6 +919,19 @@ fn collect_sampled_sites(
                         node.start_byte() == range.start_byte
                             && node.end_byte() == range.end_byte
                             && go_is_declaration_or_import_name(node)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Php
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && php_is_declaration_name(node)
                     })
             {
                 summary.declaration_sites_excluded =

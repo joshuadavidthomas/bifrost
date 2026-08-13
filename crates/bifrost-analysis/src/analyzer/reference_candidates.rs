@@ -5,6 +5,8 @@ use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_ident
 use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
+use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
+use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
 use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
 use tree_sitter::Node;
 
@@ -252,8 +254,8 @@ fn collect_candidate_ranges(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Option<ReferenceCandidateRanges> {
     let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, false)];
+    while let Some((node, inside_error)) = stack.pop() {
         if is_cancelled() {
             return None;
         }
@@ -269,11 +271,12 @@ fn collect_candidate_ranges(
         // still colors and resolves inside a broken edit.
         if (matches!(frontier, CandidateFrontier::Census)
             || (matches!(frontier, CandidateFrontier::CensusMembership)
-                && language != Language::Java))
+                && !matches!(language, Language::Java | Language::Php)))
             && node.is_error()
         {
             continue;
         }
+        let inside_error = inside_error || node.is_error();
         let compound = matches!(
             frontier,
             CandidateFrontier::References
@@ -297,6 +300,11 @@ fn collect_candidate_ranges(
                         && node.kind() == "shorthand_property_identifier_pattern")
             }
         };
+        let candidate = candidate
+            && !(inside_error
+                && language == Language::Php
+                && matches!(frontier, CandidateFrontier::CensusMembership)
+                && !php_is_recovered_membership_reference(node));
         if candidate
             && !is_excluded_reference_candidate(language, node, frontier)
             && (node.named_child_count() == 0 || compound)
@@ -317,7 +325,7 @@ fn collect_candidate_ranges(
 
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            stack.push(child);
+            stack.push((child, inside_error));
         }
     }
     ranges.sort_unstable();
@@ -404,6 +412,14 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
             || (parent.kind() == "package_clause"
                 && matches!(node.kind(), "identifier" | "package_identifier"))
     })
+}
+
+/// Whether a PHP terminal is a namespace or constant declaration name rather
+/// than a definition probe. The language-owned helper remains the source of
+/// truth; this analysis facade keeps the root runner independent of language
+/// crate dependencies.
+pub fn php_is_declaration_name(node: Node<'_>) -> bool {
+    php_declaration_name(node)
 }
 
 fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
@@ -781,6 +797,45 @@ mod tests {
         assert!(
             !membership.contains(&recovered_parameter),
             "the recovered parameter declaration is not a reference: {membership:?}"
+        );
+    }
+
+    #[test]
+    fn php_census_membership_backs_only_structured_references_inside_recovery() {
+        let source = r#"<?php
+namespace App\Demo;
+
+class Id {
+    public static function make(): self { return new self(); }
+}
+
+class Result {
+    public ?Result $adjacent;
+    public function withInput(): self { return $this; }
+    public function copy(): self {
+        return clone($this, [
+            'id' => Id::make(),
+            'next' => $this->adjacent?->withInput(),
+            'noise' => unknown_token,
+        ]);
+    }
+}
+"#;
+        let census = census_offsets(Language::Php, "Use.php", source);
+        let membership = census_membership_offsets(Language::Php, "Use.php", source);
+        let static_scope = source.find("Id::make").expect("static scope");
+        let nullsafe_member = source.find("withInput(),").expect("nullsafe member call");
+        let arbitrary_recovery = source.rfind("unknown_token").expect("recovery noise");
+
+        assert!(
+            !census.contains(&static_scope) && !census.contains(&nullsafe_member),
+            "ordinary census must continue to skip ERROR subtrees: {census:?}"
+        );
+        assert!(membership.contains(&static_scope), "{membership:?}");
+        assert!(membership.contains(&nullsafe_member), "{membership:?}");
+        assert!(
+            !membership.contains(&arbitrary_recovery),
+            "arbitrary recovery leaves are not membership references: {membership:?}"
         );
     }
 
