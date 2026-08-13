@@ -1094,6 +1094,7 @@ fn projected_report(
             witnesses,
             witnesses_truncated,
             omitted_witnesses_lower_bound: u64::try_from(omitted_witnesses).unwrap_or(u64::MAX),
+            display_path: None,
         },
         witness_refs,
     ))

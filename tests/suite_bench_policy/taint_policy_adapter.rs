@@ -56,6 +56,17 @@ const WORKSPACE_GENERATION: u64 = 71;
 const MODEL_ARTIFACT_SHA256: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+const JAVA_DISPLAY_PATH_SOURCE: &str = r#"class Foo {
+    static String userInput() { return "attacker controlled"; }
+    static String relay(String value) { return value; }
+    static void eval(String code) {}
+
+    static void unsafe() {
+        eval(relay(userInput()));
+    }
+}
+"#;
+
 const JAVA_EXTERNAL_SOURCE: &str = r#"
 class App {
     static native String attacker();
@@ -370,6 +381,33 @@ fn java_summary_policy(id: &str, message: &str) -> String {
               (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
                 :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitive"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+fn java_display_path_policy(id: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Precise taint display path"
+          :message "untrusted input reaches eval"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id input :display-name "user input" :categories [input.user]
+                :selector (rql :schema-version 1
+                  (language java (call :callee (name "userInput"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id eval :display-name "eval sink" :categories [code.execution]
+                :selector (rql :schema-version 1
+                  (language java (call :callee (name "eval"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
             :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
@@ -1717,8 +1755,8 @@ fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOut
         "missing source step:\n{concise}"
     );
     assert!(
-        concise.contains(" propagation  "),
-        "missing propagation step:\n{concise}"
+        human.contains("propagation: taint propagation"),
+        "missing canonical propagation step:\n{human}"
     );
     assert!(
         concise.contains(" sink         "),
@@ -1863,6 +1901,107 @@ fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOut
     assert!(
         saw_propagation,
         "model-backed flow must include propagation"
+    );
+}
+
+#[test]
+fn java_relay_has_a_precise_deduplicated_display_path() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Foo.java", JAVA_DISPLAY_PATH_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let input = [PolicyEvaluationInput::embedded(
+        PolicySourceIdentity::new("test:display-path.rqlp"),
+        java_display_path_policy("test.java-display-path"),
+    )];
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 8, 13).expect("fixed evaluation date"),
+    );
+    let outcome =
+        evaluate_policy_inputs_with_analyzer(project.root(), &input, &workspace, &options, None)
+            .expect("Java relay display-path evaluation");
+    let [finding] = outcome.report().runs()[0].findings() else {
+        panic!("expected one Java relay finding: {:#?}", outcome.report());
+    };
+    assert!(
+        finding.witnesses()[0].steps().len() > 4,
+        "the canonical fixture must stay noisy: {:?}",
+        finding.witnesses()
+    );
+    let canonical_locations = finding
+        .witnesses()
+        .iter()
+        .flat_map(|witness| witness.steps())
+        .filter_map(|step| step.location().cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        canonical_locations.len() > canonical_locations.iter().collect::<BTreeSet<_>>().len(),
+        "the canonical fixture must retain duplicate locations"
+    );
+    assert!(
+        finding
+            .witnesses()
+            .iter()
+            .flat_map(|witness| witness.steps())
+            .all(|step| matches!(
+                step.label(),
+                "taint source" | "taint propagation" | "taint summary boundary"
+            ))
+    );
+
+    let mut canonical = Vec::new();
+    write_policy_json(outcome.report(), &mut canonical, usize::MAX).expect("canonical report JSON");
+    let canonical: serde_json::Value =
+        serde_json::from_slice(&canonical).expect("canonical report JSON value");
+    let canonical_finding = &canonical["runs"][0]["findings"][0];
+    assert!(canonical_finding.get("display_path").is_none());
+    assert_eq!(
+        canonical_finding["witnesses"][0]["steps"]
+            .as_array()
+            .expect("canonical witness steps")
+            .len(),
+        finding.witnesses()[0].steps().len()
+    );
+
+    let mut verbose = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+        &mut verbose,
+        usize::MAX,
+    )
+    .expect("verbose Java relay rendering");
+    let verbose = String::from_utf8(verbose).expect("UTF-8 verbose output");
+    for witness in finding.witnesses() {
+        assert!(verbose.contains(witness.id().as_str()));
+    }
+    assert!(verbose.contains("taint propagation"));
+
+    let mut concise = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::default(),
+        &mut concise,
+        usize::MAX,
+    )
+    .expect("concise Java relay rendering");
+    let concise = String::from_utf8(concise).expect("UTF-8 concise output");
+    assert_eq!(
+        concise,
+        concat!(
+            "[warning]  Foo.java:7:9\n",
+            "    untrusted input reaches eval\n",
+            "\n",
+            "    #   Kind         Location  Code / symbol\n",
+            "    1   source       Foo.java:7:20  userInput()\n",
+            "    2   call         Foo.java:7:14  relay(userInput())\n",
+            "    3   propagation  Foo.java:3:41  return value;\n",
+            "    4   return       Foo.java:7:14  return from relay(userInput())\n",
+            "    5   sink         Foo.java:7:9  eval(relay(userInput()))\n",
+            "    2 alternate paths omitted; use --verbose for retained evidence\n",
+            "\n",
+            "summary: 1 active finding; 0 suppressed findings; 1 complete policy run\n",
+        )
     );
 }
 

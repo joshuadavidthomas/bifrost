@@ -1811,6 +1811,13 @@ fn assemble_taint_projection_batch(
                     super::cvss::CvssAssessmentSet::has_truncated_source_scenarios,
                 ))),
         );
+        let display_path = report.display_path;
+        debug_assert!(display_path.as_ref().is_none_or(|path| {
+            report
+                .witnesses
+                .iter()
+                .any(|witness| witness.id() == path.witness_id())
+        }));
         let finding = PolicyFinding::try_new(
             metadata.id.clone(),
             policy.semantic_hash(),
@@ -1838,7 +1845,10 @@ fn assemble_taint_projection_batch(
             budget,
         );
         match finding {
-            Ok(finding) if finding.id() == expected_id => findings.push(finding),
+            Ok(mut finding) if finding.id() == expected_id => {
+                finding.attach_display_path(display_path);
+                findings.push(finding);
+            }
             Err(error) if error.is_budget_limit_exceeded() => {
                 omit_finding_for_report_budget(
                     &mut validated.completion,

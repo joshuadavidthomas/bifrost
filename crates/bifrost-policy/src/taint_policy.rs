@@ -2049,8 +2049,18 @@ fn project_taint_report(
     if witness_incomplete {
         incomplete.push(FindingIncompleteReason::WitnessTruncated);
     }
-    let (witnesses, witness_refs, omitted_witnesses) =
-        project_taint_witnesses(workspace, group, finding_key, budget)?;
+    let ProjectedTaintWitnesses {
+        witnesses,
+        witness_refs,
+        omitted: omitted_witnesses,
+        display_path,
+    } = project_taint_witnesses(
+        workspace,
+        group,
+        finding_key,
+        finding_incomplete || origins_truncated || witness_incomplete,
+        budget,
+    )?;
     if omitted_witnesses > 0 || witnesses.iter().any(BoundedWitness::truncated) {
         incomplete.push(FindingIncompleteReason::WitnessTruncated);
     }
@@ -2113,29 +2123,51 @@ fn project_taint_report(
             witnesses,
             witnesses_truncated: omitted_witnesses > 0,
             omitted_witnesses_lower_bound: u64::try_from(omitted_witnesses).unwrap_or(u64::MAX),
+            display_path,
         },
         witness_refs,
     ))
+}
+
+struct ProjectedTaintWitnesses {
+    witnesses: Vec<BoundedWitness>,
+    witness_refs: Vec<WitnessId>,
+    omitted: usize,
+    display_path: Option<crate::display_path::TaintDisplayPath>,
 }
 
 fn project_taint_witnesses(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
     finding_key: &str,
+    finding_incomplete: bool,
     budget: &PolicyBudget,
-) -> Result<(Vec<BoundedWitness>, Vec<WitnessId>, usize), String> {
-    let mut retained = Vec::<&SummaryWitness>::new();
-    for witness in group.origins.iter().flat_map(|origin| origin.witnesses()) {
-        let witness = witness.as_ref();
-        if !retained.contains(&witness) {
-            retained.push(witness);
+) -> Result<ProjectedTaintWitnesses, String> {
+    let mut retained = Vec::<(&TaintOriginFindingEvidence, &SummaryWitness)>::new();
+    for origin in &group.origins {
+        for witness in origin.witnesses() {
+            let witness = witness.as_ref();
+            if !retained
+                .iter()
+                .any(|(_, retained_witness)| *retained_witness == witness)
+            {
+                retained.push((origin, witness));
+            }
         }
     }
     let retained_limit = retained.len().min(budget.max_witnesses_per_finding());
     let mut omitted = retained.len().saturating_sub(retained_limit);
     let mut witnesses = Vec::new();
     let mut witness_refs = Vec::new();
-    for (index, witness) in retained.into_iter().take(retained_limit).enumerate() {
+    let mut display_candidates = Vec::new();
+    let sink_locator = group
+        .findings
+        .first()
+        .expect("a projected source group has a finding")
+        .key()
+        .sink()
+        .site();
+    for (index, (origin, witness)) in retained.into_iter().take(retained_limit).enumerate() {
         let id_key =
             super::semantic_identity::stable_hex(format!("{finding_key}:{index}").as_bytes());
         let id = WitnessId::try_new("bifrost", id_key).map_err(|error| error.to_string())?;
@@ -2159,10 +2191,23 @@ fn project_taint_witnesses(
             omitted = omitted.saturating_add(1);
             continue;
         };
+        display_candidates.push(crate::display_path::project_taint_display_candidate(
+            workspace,
+            origin.origin().value_flow_key().site(),
+            sink_locator,
+            id.clone(),
+            witness,
+            finding_incomplete,
+        )?);
         witnesses.push(projected);
         witness_refs.push(id);
     }
-    Ok((witnesses, witness_refs, omitted))
+    Ok(ProjectedTaintWitnesses {
+        witnesses,
+        witness_refs,
+        omitted,
+        display_path: crate::display_path::select_taint_display_path(display_candidates),
+    })
 }
 
 fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProjectionPayload {

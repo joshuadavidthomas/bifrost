@@ -15,6 +15,7 @@ mod composition;
 mod coordinator;
 mod cvss;
 mod definition;
+mod display_path;
 mod evaluator;
 mod finding;
 mod finding_identity;
