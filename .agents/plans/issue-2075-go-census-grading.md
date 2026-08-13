@@ -12,8 +12,8 @@ The reference differential runner currently reports ordinary Go locals, Go's pre
 - [x] (2026-08-13 20:31Z) Added canonical diagnostics for Go local bindings and predeclared symbols.
 - [x] (2026-08-13 20:31Z) Required exact owner evidence before a Go composite-literal label can use a coincidental same-file declaration as tier-2 evidence.
 - [x] (2026-08-13 20:37Z) Added an end-to-end census behavior test for the three negative groups, a known-owner positive control, and package shadowing precedence.
-- [ ] (2026-08-13 20:45Z) Run validation (completed: focused tests, Go crate tests, dependency check, focused clippy, and five exact corpus replays; remaining: complete current rank-31+ Go census).
-- [ ] Commit, push, comment with evidence, and close #2075.
+- [x] (2026-08-13 21:12Z) Ran focused tests, Go crate tests, dependency check, focused clippy, five exact corpus replays, and the complete current rank-31+ Go forward census.
+- [ ] (2026-08-13 21:12Z) Finish issue handoff (completed: checkpoint committed and pushed as `cd932d076`; remaining: commit the final plan record, push it, comment with evidence, and close #2075).
 
 ## Surprises & Discoveries
 
@@ -44,7 +44,7 @@ The reference differential runner currently reports ordinary Go locals, Go's pre
 
 ## Outcomes & Retrospective
 
-The root behavior is implemented and focused validation passes. Exact replays prove that `error` and `len` are adjudicated with `predeclared_symbol_reference`, an external-owner label is tier 3, and two historical product gaps now resolve consistently through earlier Go fixes. The full current rank-31+ Go census and issue-tracker closure remain.
+The root behavior is implemented and validated. Exact replays prove that `error` and `len` are adjudicated with `predeclared_symbol_reference`, an external-owner label is tier 3, and two historical product gaps now resolve consistently through earlier Go fixes. The current 20-repository rank-31+ Go forward census completed with zero file errors and zero candidate-limit files. All 1,083 owner-unresolved literal labels were non-actionable; ten unrelated product gaps remained Missing across five repositories, demonstrating that the change did not blanket-suppress current analyzer defects. The code was pushed to master in `cd932d076`; only the final plan-record commit and issue-tracker closure remain.
 
 ## Context and Orientation
 
@@ -88,6 +88,8 @@ Run focused featureless clippy before pushing:
 
 Build the release runner, replay representative saved rows with `--cache-mode ephemeral`, then rerun the Go rank-31+ leg at its pinned repository revisions. Expect locals and predeclared symbols to be adjudicated, external-owner labels to be tier 3, and the known-owner control to stay tier 2 Missing.
 
+For the full grading proof, cap inverse work at one target because issue #2075 changes only forward census classification. The completed artifact is `/tmp/go-ranks31-50-cd932d076-forward.jsonl`; it contains 20 completed repository envelopes. The original campaign directory was read-only during this run, so the append-only artifact intentionally lives under `/tmp`.
+
 ## Validation and Acceptance
 
 The new semantic test must fail before implementation because the local and predeclared sites are graded Missing and the unknown-owner label receives tier 2. It must pass afterward with these exact properties:
@@ -124,3 +126,5 @@ Plan revision note (2026-08-13): Initial plan created after source and ledger au
 Plan revision note (2026-08-13): Recorded that the shared lexical-definition route has already superseded the historical generic local misses. The acceptance now preserves that stronger resolved answer while retaining canonical diagnostics for the secondary Go shadow path.
 
 Plan revision note (2026-08-13): Recorded the completed implementation, focused validation, and exact replay outcomes before the checkpoint commit. The full corpus rerun remains the final evidence milestone.
+
+Plan revision note (2026-08-13): Recorded the successful 20-repository current forward census, including the 1,083 correctly non-actionable owner boundaries and the ten remaining actionable product gaps. The first artifact path failed because the historical campaign mount was read-only; the identical rerun succeeded under `/tmp`.
