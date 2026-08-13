@@ -1458,14 +1458,19 @@ pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
 
 /// Parse `source` under the grammar registered for `language`.
 ///
-/// `file` selects the grammar flavor, which only TypeScript distinguishes (`.tsx`); every
-/// other language answers one grammar for both. `None` means the language has no grammar
-/// (`Language::None`) or the source did not parse.
+/// `file` selects the grammar flavor, which TypeScript distinguishes for `.tsx`.
+/// C# additionally uses its directive-aware pre-parse so every consumer sees the
+/// same selected conditional-compilation branches as declaration extraction and
+/// usage analysis. `None` means the language has no grammar (`Language::None`) or
+/// the source did not parse.
 pub fn parse_tree_for_language(
     file: &ProjectFile,
     language: Language,
     source: &str,
 ) -> Option<Tree> {
+    if language == Language::CSharp {
+        return brokk_bifrost_csharp::preprocessor::parse_csharp(source);
+    }
     let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;
