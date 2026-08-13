@@ -1555,6 +1555,7 @@ impl<'a> RustUsageWalks<'a> {
                         importer_module: edge.importer_module.clone(),
                         extent: edge.extent.clone(),
                         path,
+                        is_glob_import: matches!(edge.kind, RustImportEdgeKind::Glob),
                         namespace: target.namespace,
                         origin: binding.origin,
                         domain: effective,

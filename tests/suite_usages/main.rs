@@ -31,6 +31,7 @@ mod issue_1855_scala_site_java_declaration;
 mod issue_1924_typescript_imported_returns;
 mod issue_1925_typescript_later_lexical_binding;
 mod issue_2026_php_direct_factory_receivers;
+mod issue_2034_rust_inverse_glob_precedence;
 mod issue_2055_python_module_qualified_attributes;
 mod issue_2056_python_module_receiver_root;
 mod issue_2073_go_package_variable_selector_base;
