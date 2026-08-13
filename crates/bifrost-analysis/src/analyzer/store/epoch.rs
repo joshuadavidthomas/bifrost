@@ -446,11 +446,14 @@ lang_epoch!(
 // relocation.
 // Salt bumped again (#1971): Python module identity now starts at a nested
 // setuptools import root declared in pyproject.toml.
+// Salt bumped again (#2052): repeated assignments to one logical class field
+// now retain every physical navigation range so class-body lookup can select
+// the binding active at the reference site.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the

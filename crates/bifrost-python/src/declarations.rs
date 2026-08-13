@@ -565,8 +565,19 @@ impl<'a> PythonVisitor<'a> {
                 short_name,
                 fq,
             );
-            self.parsed
-                .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+            if scope
+                .last()
+                .is_some_and(|parent| parent.kind == ScopeKind::Class)
+            {
+                // Reassigning a class attribute does not mint a new logical
+                // member. Preserve every physical binding range so class-body
+                // references between assignments can select the active one.
+                self.parsed
+                    .add_code_unit(code_unit.clone(), node, self.source, None, None);
+            } else {
+                self.parsed
+                    .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+            }
             self.parsed.add_signature(
                 code_unit.clone(),
                 py_node_text(node, self.source).trim().to_string(),

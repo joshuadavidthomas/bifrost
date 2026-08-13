@@ -1507,6 +1507,13 @@ pub(super) fn resolve_python(
                     format!("`{text}` is a local Python value"),
                 );
             }
+            if let Some(local) = ctx.same_file.get(text) {
+                let class_candidates =
+                    python_visible_class_binding_candidates(analyzer, file, identifier, local);
+                if !class_candidates.is_empty() {
+                    return candidates_outcome(class_candidates);
+                }
+            }
             if let Some(candidates) = python_visible_module_binding_candidates(
                 analyzer,
                 py,
@@ -1739,11 +1746,13 @@ fn python_visible_module_binding_candidates(
             }
             ModuleBindingEventKind::Other => {
                 if let Some(local) = context.same_file.get(name) {
-                    candidates.extend(python_visible_same_file_candidates(
+                    candidates.extend(python_same_file_candidates_for_binding_event(
                         analyzer,
                         &context.file,
+                        root,
                         node,
                         local,
+                        event.visible_from,
                     ));
                 }
             }
@@ -1754,7 +1763,107 @@ fn python_visible_module_binding_candidates(
     Some(candidates)
 }
 
+fn python_same_file_candidates_for_binding_event(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    root: Node<'_>,
+    node: Node<'_>,
+    candidates: &[CodeUnit],
+    event_visible_from: usize,
+) -> Vec<CodeUnit> {
+    let visible = python_visible_same_file_candidates(analyzer, file, node, candidates);
+    // A function and a later assignment intentionally share one Python FQN.
+    // Associate this timeline event with the latest physical declaration that
+    // was active when the event became visible instead of merging both units.
+    let latest_end = visible
+        .iter()
+        .flat_map(|candidate| analyzer.ranges(candidate))
+        .filter(|range| range.end_byte <= event_visible_from)
+        .map(|range| range.end_byte)
+        .max();
+    let Some(latest_end) = latest_end else {
+        return Vec::new();
+    };
+    let reference_path = python_conditional_branch_path(node);
+    visible
+        .into_iter()
+        .filter(|candidate| {
+            analyzer.ranges(candidate).iter().any(|range| {
+                range.end_byte == latest_end
+                    && root
+                        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                        .is_some_and(|declaration| {
+                            python_conditional_paths_are_compatible(
+                                &reference_path,
+                                &python_conditional_branch_path(declaration),
+                            )
+                        })
+            })
+        })
+        .collect()
+}
+
+fn python_conditional_branch_path(mut node: Node<'_>) -> Vec<(usize, usize)> {
+    let mut path = Vec::new();
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "if_statement" | "elif_clause") {
+            let in_condition = parent
+                .child_by_field_name("condition")
+                .is_some_and(|condition| {
+                    condition.start_byte() <= node.start_byte()
+                        && node.end_byte() <= condition.end_byte()
+                });
+            if !in_condition {
+                path.push((parent.start_byte(), node.start_byte()));
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "module" | "function_definition" | "class_definition"
+        ) {
+            break;
+        }
+        node = parent;
+    }
+    path
+}
+
+fn python_conditional_paths_are_compatible(
+    left: &[(usize, usize)],
+    right: &[(usize, usize)],
+) -> bool {
+    left.iter().all(|(conditional, arm)| {
+        right
+            .iter()
+            .find(|(other, _)| other == conditional)
+            .is_none_or(|(_, other_arm)| other_arm == arm)
+    })
+}
+
 fn python_visible_same_file_candidates(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let class_candidates =
+        python_visible_class_binding_candidates(analyzer, file, node, candidates);
+    if !class_candidates.is_empty() {
+        return class_candidates;
+    }
+    candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.is_module()
+                && analyzer
+                    .parent_of(candidate)
+                    .is_some_and(|parent| parent.is_module())
+        })
+        .cloned()
+        .collect()
+}
+
+fn python_visible_class_binding_candidates(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     node: Node<'_>,
@@ -1783,20 +1892,33 @@ fn python_visible_same_file_candidates(
                 scope = analyzer.parent_of(&scope)?;
             }
         });
+    let Some(enclosing_class) = enclosing_class else {
+        return Vec::new();
+    };
+    let latest_end = candidates
+        .iter()
+        .filter(|candidate| {
+            analyzer
+                .parent_of(candidate)
+                .is_some_and(|parent| parent == enclosing_class)
+        })
+        .flat_map(|candidate| analyzer.ranges(candidate))
+        .filter(|range| range.end_byte <= node.start_byte())
+        .map(|range| range.end_byte)
+        .max();
+    let Some(latest_end) = latest_end else {
+        return Vec::new();
+    };
     candidates
         .iter()
         .filter(|candidate| {
-            !candidate.is_module()
-                && analyzer.parent_of(candidate).is_some_and(|parent| {
-                    parent.is_module()
-                        || enclosing_class
-                            .as_ref()
-                            .is_some_and(|scope| scope == &parent)
-                            && analyzer
-                                .ranges(candidate)
-                                .iter()
-                                .any(|range| range.end_byte <= node.start_byte())
-                })
+            analyzer
+                .parent_of(candidate)
+                .is_some_and(|parent| parent == enclosing_class)
+                && analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.end_byte == latest_end)
         })
         .cloned()
         .collect()

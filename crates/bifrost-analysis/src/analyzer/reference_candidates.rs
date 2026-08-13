@@ -2,6 +2,7 @@ use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
+use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
@@ -121,10 +122,13 @@ pub fn census_identifier_ranges(
         .expect("non-cancellable collection cannot be cancelled")
 }
 
-/// The raw identifier membership used to validate inverse hits independently
-/// of probe eligibility. It retains the census contract and additionally
-/// includes grammar nodes that are simultaneous source references and binders,
-/// such as JS/TS shorthand destructuring properties (#2037).
+/// The identifier membership used to validate inverse hits independently of
+/// probe eligibility. It retains the census contract and additionally includes
+/// grammar nodes that are simultaneous source references and binders, such as
+/// JS/TS shorthand destructuring properties (#2037). Java membership also
+/// descends parser-recovery subtrees while excluding structured declaration and
+/// label roles: valid inverse references remain backed without proposing those
+/// recovery tokens as forward census sites (#2086).
 pub fn census_membership_identifier_ranges(
     root: Node<'_>,
     language: Language,
@@ -263,10 +267,10 @@ fn collect_candidate_ranges(
         // leaves the rest of the file proposed. The index-filtered and
         // semantic-token frontiers keep their existing reach, because the LSP
         // still colors and resolves inside a broken edit.
-        if matches!(
-            frontier,
-            CandidateFrontier::Census | CandidateFrontier::CensusMembership
-        ) && node.is_error()
+        if (matches!(frontier, CandidateFrontier::Census)
+            || (matches!(frontier, CandidateFrontier::CensusMembership)
+                && language != Language::Java))
+            && node.is_error()
         {
             continue;
         }
@@ -345,6 +349,12 @@ fn is_excluded_reference_candidate(
     {
         return true;
     }
+    if language == Language::Java
+        && matches!(frontier, CandidateFrontier::CensusMembership)
+        && (java_is_declaration_name(node) || java_is_label_name(node))
+    {
+        return true;
+    }
     if !matches!(frontier, CandidateFrontier::References) {
         return false;
     }
@@ -357,6 +367,15 @@ fn is_excluded_reference_candidate(
         Language::JavaScript | Language::TypeScript => is_export_alias_identifier(node),
         _ => false,
     }
+}
+
+fn java_is_label_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "labeled_statement" | "break_statement" | "continue_statement"
+        )
+    })
 }
 
 /// Whether a Go identifier occupies a declaration or import binding role.
@@ -732,6 +751,37 @@ mod tests {
             python_deferred_annotation_membership_ranges(tree.root_node(), source, 4),
             ReferenceCandidateRanges::LimitExceeded { limit: 4, .. }
         ));
+    }
+
+    #[test]
+    fn java_census_membership_backs_recovered_references_without_proposing_them() {
+        let source = concat!(
+            "@interface Nullable {}\n",
+            "class Ticket {}\n",
+            "class Use {\n",
+            "  void trigger(Ticket @Nullable [] tickets) {}\n",
+            "  void recovered(Ticket @Nullable ... keys) {}\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::Java, "Use.java", source);
+        let membership = census_membership_offsets(Language::Java, "Use.java", source);
+        let recovered_type = source
+            .find("Ticket @Nullable ...")
+            .expect("recovered type reference");
+        let recovered_parameter = source.find("keys)").expect("recovered parameter");
+
+        assert!(
+            !census.contains(&recovered_type),
+            "the forward census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&recovered_type),
+            "the valid type reference must back inverse precision: {membership:?}"
+        );
+        assert!(
+            !membership.contains(&recovered_parameter),
+            "the recovered parameter declaration is not a reference: {membership:?}"
+        );
     }
 
     /// Tree-sitter error recovery destroys enclosing declaration nodes: a
