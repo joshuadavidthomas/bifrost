@@ -902,7 +902,7 @@ fn render_too_broad_scope(scope: &TooBroadScope) -> String {
                     scope.target, scope.matched, scope.cap
                 ),
                 format!("Sample of the match: {}", scope.sample.join(", ")),
-                "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.".to_string(),
+                scope.note.clone(),
             ]
             .join("\n")
         }
@@ -915,8 +915,8 @@ fn render_too_broad_scope(scope: &TooBroadScope) -> String {
                 "a skipped resolution fan-out cannot carry a sample: {scope:?}"
             );
             format!(
-                "Too broad: target {} matched {} declarations, over the {}-declaration resolution limit for one selector, so no candidate list was produced.\nQualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call.",
-                scope.target, scope.matched, scope.cap
+                "Too broad: target {} matched {} declarations, over the {}-declaration resolution limit for one selector, so no candidate list was produced.\n{}",
+                scope.target, scope.matched, scope.cap, scope.note
             )
         }
     }

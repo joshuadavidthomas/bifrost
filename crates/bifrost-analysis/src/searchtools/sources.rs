@@ -1278,7 +1278,7 @@ pub(super) fn expanded_comment_start(language: Language, source: &str, start_byt
     // Share the analyzer's comment-walk so both source-rendering paths agree on
     // what counts as a declaration's attached comment block (and inherit fixes
     // like the blank-line terminator that excludes file-level license headers).
-    crate::analyzer::tree_sitter_analyzer::expanded_comment_start(source, start_byte)
+    crate::analyzer::tree_sitter_analyzer::expanded_comment_start(language, source, start_byte)
 }
 
 pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
