@@ -13,7 +13,8 @@ Large C++ files should not spend minutes rewalking the same guarded include grap
 - [x] (2026-08-13 08:44Z) Replaced donor-pair memoization with a single-flight per-reference-file projection index.
 - [x] (2026-08-13 08:49Z) Added concurrent behavior and deterministic work-count coverage: four donors, two guard paths, a cycle, and an absent donor share one six-state build.
 - [x] (2026-08-13 08:55Z) Passed focused featureless validation, formatting, targeted clippy, dependency checks, and diff checks.
-- [ ] Commit and push the checkpoint, close #2097, then rerun pinned AMReX and Tink to finish the C++ ledger.
+- [x] (2026-08-13 09:19Z) Committed as `545778bc`, merged current `origin/master` without rebasing as `03fbff9d`, pushed to `master`, and closed #2097 with focused validation evidence.
+- [ ] Rebuild the release runner and rerun pinned AMReX and Tink into a provenance-preserving supplement to finish the C++ ledger.
 
 ## Surprises & Discoveries
 
@@ -45,7 +46,9 @@ Large C++ files should not spend minutes rewalking the same guarded include grap
 
 ## Outcomes & Retrospective
 
-The implementation and focused validation are complete. One reference-file index now serves every donor query, and cold concurrent donor queries publish one build. The exact scale fixture proves one six-state traversal where the former design performed a separate graph build per queried donor. End-to-end conditional include behavior remains unchanged. Completion still requires the checkpoint commit/push and the AMReX/Tink replay. The key lesson is that caching a whole-graph computation by its final donor query can still be effectively uncached when one reference file asks about hundreds of donors.
+The implementation is pushed and #2097 is closed. One reference-file index now serves every donor query, and cold concurrent donor queries publish one build. The exact scale fixture proves one six-state traversal where the former design performed a separate graph build per queried donor. End-to-end conditional include behavior remains unchanged. Completion still requires the AMReX/Tink replay. The key lesson is that caching a whole-graph computation by its final donor query can still be effectively uncached when one reference file asks about hundreds of donors.
+
+The original C++ report already contains 18 durable clean repository rows at Bifrost `3691bb01`. The missing AMReX and Tink rows must be written to a separate supplement at the fixed pushed commit. Appending them to the old JSONL would make one artifact silently mix analyzer revisions. Final acceptance therefore combines the base 18-row report and the two-row supplement while retaining both commit identities and hashes.
 
 ## Context and Orientation
 
@@ -67,7 +70,7 @@ Add test-support counters for index builds and expanded include states, initiali
 
 Add low-level behavior/cost tests in the existing resolver test module or the closest current C++ graph test module. Build a small inline include graph with one conditional root, several donors, a cycle, and two distinct guard paths to one donor. Query several donor sources through one visibility index. Assert exact projections, one index build, and a state count bounded by the unique structured states rather than multiplied by donor queries. Add a concurrent query test if the current module can safely construct one shared visibility instance without a new standalone binary.
 
-Run existing guarded include and external type visibility behavior tests to prove no semantic drift. Then rerun pinned AMReX and Tink with the exact corpus command and append both completed clean records to the existing 18-record output.
+Run existing guarded include and external type visibility behavior tests to prove no semantic drift. Then rerun pinned AMReX and Tink with the exact corpus command into a separate two-record supplement. Treat the original 18 records and the supplement as one audited selection, but do not merge unlike `bifrost_head` values into one JSONL.
 
 ## Concrete Steps
 
@@ -92,7 +95,7 @@ Then run:
     node scripts/check-workspace-dependencies.mjs
     git diff --check
 
-After commit and push, rebuild the release runner and rerun only `AMReX-Codes__amrex` and `google__tink` at their pinned clean commits, using the same clone root and limits as the interrupted campaign. Append to `/mnt/optane/tmp/bifrost-fird/final-3691bb01/cpp-ranks31-50-3691bb01.jsonl`. Expect exactly 20 completed rows, all with `repo_dirty=false` and the pushed Bifrost head.
+After commit and push, rebuild the release runner and rerun only `AMReX-Codes__amrex` and `google__tink` at their pinned clean commits, using the same clone root and limits as the interrupted campaign. Write them under `/mnt/optane/tmp/bifrost-fird/final-03fbff9d/` as a two-row supplement. Expect 18 completed clean base rows at `3691bb01` plus two completed clean supplement rows at `03fbff9d`.
 
 ## Validation and Acceptance
 
@@ -100,11 +103,11 @@ The low-level cost test must fail on the old implementation because querying mul
 
 Existing guarded-include resolution tests must retain their exact targets and ambiguity/fail-closed behavior. Compilation and clippy must pass for the language crate and analysis consumers.
 
-The corpus acceptance is observable steady completion. Pinned AMReX must pass file 607 and finish all 622 forward files without reproducing the donor-times-graph tail. Tink must complete afterward. The final report must contain 20 clean completed rows and zero repository-level errors.
+The corpus acceptance is observable steady completion. Pinned AMReX must pass file 607 and finish all 622 forward files without reproducing the donor-times-graph tail. Tink must complete afterward. The combined base-plus-supplement evidence must contain 20 clean completed rows and zero repository-level errors, with commit provenance explicit for each artifact.
 
 ## Idempotence and Recovery
 
-The code edits and tests are safe to repeat. The projection index belongs to a `VisibilityIndex`, so analyzer update naturally discards it with the query object; no persistent schema or cache migration is involved. If a test or build is interrupted, rerun it normally. If the corpus replay is interrupted, already durable JSONL rows remain valid; select only missing repositories on retry. Do not reset or clean unrelated user changes.
+The code edits and tests are safe to repeat. The projection index belongs to a `VisibilityIndex`, so analyzer update naturally discards it with the query object; no persistent schema or cache migration is involved. If a test or build is interrupted, rerun it normally. If the corpus replay is interrupted, already durable JSONL rows remain valid; select only missing repositories on retry. Never append rows from a different Bifrost revision to an existing report. Do not reset or clean unrelated user changes.
 
 ## Artifacts and Notes
 
