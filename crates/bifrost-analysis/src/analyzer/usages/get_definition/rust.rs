@@ -30,6 +30,8 @@ use brokk_bifrost_rust::graph_support::{
 use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
+use super::{DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RustResolutionSemantics {
     Full,
@@ -340,7 +342,7 @@ fn resolve_rust_bounded_in_session(
 
     if node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte) {
         return no_definition(
-            "local_receiver",
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
             "the focused Rust receiver is a local expression, which is not indexed",
         );
     }
@@ -830,18 +832,25 @@ fn resolve_rust_unscoped(
             site.focus_end_byte,
         )
         && matches!(node.kind(), "identifier" | "shorthand_field_identifier")
-        && (lexical_scope::is_pattern_binding_identifier(node)
-            || lexical_scope::name_shadowed_in_tree(
-                tree.root_node(),
-                source,
-                reference,
-                site.focus_start_byte,
-            ))
     {
-        return no_definition(
-            "local_binding",
-            format!("`{reference}` is a local Rust binding, which is not indexed"),
+        let shadowed = lexical_scope::name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            reference,
+            site.focus_start_byte,
         );
+        if lexical_scope::is_pattern_binding_identifier(node) && !shadowed {
+            return no_definition(
+                "local_binding",
+                format!("`{reference}` is a local Rust binding, which is not indexed"),
+            );
+        }
+        if shadowed {
+            return no_definition(
+                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                format!("`{reference}` is a local Rust binding, which is not indexed"),
+            );
+        }
     }
     if let Some(tree) = tree
         && let Some(operation) = operation
@@ -1064,7 +1073,7 @@ fn resolve_rust_unscoped(
                 )
             {
                 return no_definition(
-                    "local_binding",
+                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
                     format!("`{reference}` is a local Rust item, which is not indexed"),
                 );
             }
@@ -1303,7 +1312,7 @@ fn rust_struct_field_name_outcome(
                 && name.end_byte() == site.focus_end_byte =>
         {
             Some(no_definition(
-                "declaration_site",
+                DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
                 "Rust field declaration names do not reference another definition",
             ))
         }
@@ -1318,7 +1327,7 @@ fn rust_struct_field_name_outcome(
                 field.kind() == "field_pattern" && field.child_by_field_name("pattern").is_none()
             }) {
                 return Some(no_definition(
-                    "local_binding",
+                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
                     "Rust shorthand struct-pattern fields introduce local bindings",
                 ));
             }
@@ -1404,6 +1413,12 @@ fn rust_exact_reference_role_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if brokk_bifrost_rust::graph::ast::is_rust_declaration_name(focused) {
+        return Some(no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            "Rust declaration names do not reference another definition",
+        ));
+    }
     if crate::analyzer::usages::rust_graph::rust_bare_token_tree_non_reference_role(focused, source)
     {
         let focused_name = rust_node_text(focused, source).trim();
@@ -1416,13 +1431,13 @@ fn rust_exact_reference_role_outcome(
     }
     if rust_enclosing_lifetime(focused).is_some() {
         return Some(no_definition(
-            "local_lifetime",
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
             "Rust lifetime parameters are lexical bindings and are not indexed definitions",
         ));
     }
     if focused.kind() == "self" && focused_rust_field_receiver(focused, site.focus_start_byte) {
         return Some(no_definition(
-            "local_receiver",
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
             "the focused Rust receiver is a local expression, which is not indexed",
         ));
     }
@@ -1432,7 +1447,7 @@ fn rust_exact_reference_role_outcome(
         && rust_type_parameter_visible_from(focused, source, focused_name)
     {
         return Some(no_definition(
-            "local_type_parameter",
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
             format!("`{focused_name}` is a lexical Rust type parameter, which is not indexed"),
         ));
     }
@@ -1460,20 +1475,27 @@ fn rust_exact_reference_role_outcome(
         );
     }
 
-    if matches!(focused.kind(), "identifier" | "shorthand_field_identifier")
-        && (lexical_scope::is_pattern_binding_identifier(focused)
-            || (lexical_scope::name_shadowed_in_tree(
-                tree.root_node(),
-                source,
-                focused_name,
-                site.focus_start_byte,
-            ) && (rust_identifier_is_explicit_receiver(focused)
-                || !site.text.contains(['.', ':']))))
-    {
-        return Some(no_definition(
-            "local_binding",
-            format!("`{focused_name}` is a local Rust binding, which is not indexed"),
-        ));
+    if matches!(focused.kind(), "identifier" | "shorthand_field_identifier") {
+        let shadowed = lexical_scope::name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            focused_name,
+            site.focus_start_byte,
+        );
+        if lexical_scope::is_pattern_binding_identifier(focused) && !shadowed {
+            return Some(no_definition(
+                "local_binding",
+                format!("`{focused_name}` is a local Rust binding, which is not indexed"),
+            ));
+        }
+        if shadowed
+            && (rust_identifier_is_explicit_receiver(focused) || !site.text.contains(['.', ':']))
+        {
+            return Some(no_definition(
+                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                format!("`{focused_name}` is a local Rust binding, which is not indexed"),
+            ));
+        }
     }
     None
 }
@@ -3473,7 +3495,7 @@ fn rust_focused_terminal_scoped_declaration_outcome(
         )
     {
         return Some(no_definition(
-            "local_binding",
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
             format!("`{owner}` is a local Rust item, which is not indexed"),
         ));
     }
@@ -4454,7 +4476,7 @@ fn resolve_rust_field(
         {
             return (receiver.kind() == "self").then(|| {
                 no_definition(
-                    "local_receiver",
+                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
                     "the focused Rust receiver is a local expression, which is not indexed",
                 )
             });

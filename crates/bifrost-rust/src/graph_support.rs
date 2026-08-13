@@ -1581,6 +1581,12 @@ pub fn is_rust_enum_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit)
     rust_declaration_node_is(index, code_unit, |node, _source| node.kind() == "enum_item")
 }
 
+pub fn is_rust_enum_variant_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
+    rust_declaration_node_is(index, code_unit, |node, _source| {
+        node.kind() == "enum_variant"
+    })
+}
+
 pub fn is_rust_const_or_static_declaration(
     index: &dyn CodeUnitIndex,
     code_unit: &CodeUnit,

@@ -108,7 +108,7 @@ impl RustSymbolNamespace {
         }
     }
 
-    fn accepts(self, reference: RustReferenceNamespace) -> bool {
+    pub fn accepts(self, reference: RustReferenceNamespace) -> bool {
         matches!(reference, RustReferenceNamespace::Any)
             || matches!(
                 (self, reference),

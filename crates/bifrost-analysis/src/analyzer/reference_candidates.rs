@@ -8,6 +8,9 @@ use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
 use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
 use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
+use brokk_bifrost_rust::declarations::rust_node_text;
+use brokk_bifrost_rust::graph::ast::is_rust_declaration_name;
+use brokk_bifrost_rust::lexical_scope::is_pattern_binding_identifier;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +423,28 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
 /// crate dependencies.
 pub fn php_is_declaration_name(node: Node<'_>) -> bool {
     php_declaration_name(node)
+}
+
+/// Whether a Rust identifier is the name field of an indexed item declaration.
+///
+/// The language-owned AST helper is shared with diagnostics and usage scans;
+/// the analysis facade exposes it to the corpus runner without duplicating the
+/// Rust grammar's declaration-kind list.
+pub fn rust_is_declaration_name(node: Node<'_>) -> bool {
+    is_rust_declaration_name(node)
+}
+
+/// Whether the Rust parser reads this identifier as a local binding pattern.
+///
+/// Bare enum variants in match patterns share this syntax, so callers must
+/// retain a site when indexed enum-variant evidence exists for the spelling.
+pub fn rust_is_pattern_binding_name(node: Node<'_>) -> bool {
+    is_pattern_binding_identifier(node)
+}
+
+/// Canonical source spelling for one Rust identifier-like node.
+pub fn rust_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    rust_node_text(node, source)
 }
 
 fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {

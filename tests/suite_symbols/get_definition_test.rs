@@ -8327,7 +8327,7 @@ impl Provider {
     let result = &value["results"][0];
     assert_eq!(result["status"], "no_definition", "{value}");
     assert_eq!(
-        result["diagnostics"][0]["kind"], "local_receiver",
+        result["diagnostics"][0]["kind"], "local_variable_reference",
         "{value}"
     );
 
