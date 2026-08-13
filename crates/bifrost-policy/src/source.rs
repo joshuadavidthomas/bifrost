@@ -14,6 +14,7 @@ use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::materialization::{
     DeclarationOrigin, GenerationKind,
 };
+use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteDomainKind;
 use brokk_bifrost_analysis::analyzer::structural::{
     MAX_CAPTURE_LENGTH, PrecedenceTier, RouteHopKind,
     occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
@@ -4791,7 +4792,7 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         &[
             PolicyRecord::Assert,
             PolicyRecord::AssertResolution,
-            PolicyRecord::AssertReaching,
+            PolicyRecord::AssertBindingScope,
             PolicyRecord::AssertBoundary,
             PolicyRecord::AssertGeneration,
             PolicyRecord::AssertDeclarationState,
@@ -4800,6 +4801,8 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertCanonical,
             PolicyRecord::AssertRoute,
             PolicyRecord::AssertRoundTrip,
+            PolicyRecord::AssertFlowEstablishment,
+            PolicyRecord::AssertRewriteTermination,
         ],
         "assert record",
     )?;
@@ -4808,7 +4811,9 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         PolicyRecord::AssertResolution => {
             Ok(PolicyAssert::Resolution(decode_resolution_assert(expr)?))
         }
-        PolicyRecord::AssertReaching => Ok(PolicyAssert::Reaching(decode_reaching_assert(expr)?)),
+        PolicyRecord::AssertBindingScope => Ok(PolicyAssert::BindingScope(
+            decode_binding_scope_assert(expr)?,
+        )),
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
         PolicyRecord::AssertGeneration => {
             Ok(PolicyAssert::Generation(decode_generation_assert(expr)?))
@@ -4829,6 +4834,12 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         PolicyRecord::AssertRoundTrip => {
             Ok(PolicyAssert::RoundTrip(decode_round_trip_assert(expr)?))
         }
+        PolicyRecord::AssertFlowEstablishment => Ok(PolicyAssert::FlowEstablishment(
+            decode_flow_establishment_assert(expr)?,
+        )),
+        PolicyRecord::AssertRewriteTermination => Ok(PolicyAssert::RewriteTermination(
+            decode_rewrite_termination_assert(expr)?,
+        )),
         other => unreachable!("select_record returned {other:?}"),
     }
 }
@@ -5010,15 +5021,15 @@ fn decode_resolution_assert(expr: &Expr) -> Result<ResolutionAssert, PolicySourc
     Ok(assertion)
 }
 
-fn decode_reaching_assert(expr: &Expr) -> Result<ReachingAssert, PolicySourceError> {
+fn decode_binding_scope_assert(expr: &Expr) -> Result<BindingScopeAssert, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
-        PolicyRecord::AssertReaching,
+        PolicyRecord::AssertBindingScope,
         DecodeContext::policy(PolicyAnalysisKind::Assertion),
     )?;
     let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
     let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
-    let role = decode_reference_role(fields.required("role"), "`assert-reaching`")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-binding-scope`")?;
     let containment = match expect_atom(
         fields.required("declared"),
         AtomDomain::DeclaredContainment,
@@ -5041,7 +5052,7 @@ fn decode_reaching_assert(expr: &Expr) -> Result<ReachingAssert, PolicySourceErr
             ),
         ));
     }
-    Ok(ReachingAssert {
+    Ok(BindingScopeAssert {
         id,
         at,
         role,
@@ -5345,6 +5356,67 @@ fn decode_round_trip_assert(expr: &Expr) -> Result<RoundTripAssert, PolicySource
     let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
     let role = decode_reference_role(fields.required("role"), "`assert-round-trip`")?;
     Ok(RoundTripAssert { id, at, role })
+}
+
+/// The temporal assert reads a *read* of a value, so its role must be one the
+/// resolver can spell a read at. Reference-class roles are exactly those; a
+/// declaration name is not a read of anything.
+fn decode_flow_establishment_assert(
+    expr: &Expr,
+) -> Result<FlowEstablishmentAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertFlowEstablishment,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-flow-establishment`")?;
+    let require = match fields.get("require") {
+        None => EstablishmentRequirement::Reached,
+        Some(value) => match expect_atom(
+            value,
+            AtomDomain::EstablishmentRequirement,
+            "establishment requirement",
+        )? {
+            PolicyAtomValue::RequireReached => EstablishmentRequirement::Reached,
+            PolicyAtomValue::RequireDominated => EstablishmentRequirement::Dominated,
+            value => unreachable!("EstablishmentRequirement registry returned {value:?}"),
+        },
+    };
+    let forbid_same_evaluation = fields
+        .get("forbid-same-evaluation")
+        .map(|value| decode_boolean(value, "forbid-same-evaluation flag"))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(FlowEstablishmentAssert {
+        id,
+        at,
+        role,
+        require,
+        forbid_same_evaluation,
+    })
+}
+
+fn decode_rewrite_termination_assert(
+    expr: &Expr,
+) -> Result<RewriteTerminationAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertRewriteTermination,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let domain_expr = fields.required("domain");
+    let token = expect_token(domain_expr, "rewrite domain")?;
+    expect_atom(domain_expr, AtomDomain::RewriteDomain, "rewrite domain")?;
+    let domain = RewriteDomainKind::from_label(&token.replace('-', "_"))
+        .expect("the RQLP rewrite-domain atoms mirror the analyzer registry labels");
+    let scope = fields
+        .get("scope")
+        .map(|value| decode_assert_capture(value, "assert capture name"))
+        .transpose()?;
+    Ok(RewriteTerminationAssert { id, domain, scope })
 }
 
 fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourceError> {

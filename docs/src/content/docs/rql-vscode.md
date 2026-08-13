@@ -75,7 +75,7 @@ typestate witness to navigate each ordered source-backed step; tooltips retain
 evidence and truncation/omission metadata. Selecting a file result opens the
 file at its first line. Pipeline wrappers such as `enclosing-decl`,
 `cfg-successor-edges`, `typestate`, `witness`, `occurrences-in`,
-`reaching-binding`, `candidates-of`, `edges-of`, `edges-from`, and `file-of`
+`binding-of`, `candidates-of`, `edges-of`, `edges-from`, and `file-of`
 therefore remain navigable from the same view. Occurrence rows show their
 class, role, and namespace; their tooltips show the raw and decoded spellings
 and what the row's target resolved to. Lexical scope rows show their kind and

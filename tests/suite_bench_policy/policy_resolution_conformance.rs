@@ -192,9 +192,9 @@ const READ_BEFORE_DECLARATION: &str = "class Order {\n    int run() {\n        i
 /// The same tokens in two orders. The requirement is that the read reach a
 /// binding declared *outside* the method, so the half where the local is in
 /// effect violates it and the half where the read sits above the declarator has
-/// no reaching binding at all.
+/// no binding-of answer at all.
 ///
-/// The near-miss is clean because a missing reaching binding is a complete
+/// The near-miss is clean because a missing binding-of answer is a complete
 /// negative -- the name resolves to something that is not a lexical binding, so
 /// there is no declaring scope for a containment requirement to constrain. It
 /// is not clean because the run failed to conclude, which is what the
@@ -206,7 +206,7 @@ fn a_read_above_its_declarator_reaches_no_binding_to_constrain() {
             "test.conformance.before-after-use",
             r#"(inside (callable :capture "region")
                      (identifier :text/regex "^seed$" :capture "target"))"#,
-            r#"(assert-reaching :id declared-outside :at "target" :role value_reference
+            r#"(assert-binding-scope :id declared-outside :at "target" :role value_reference
                           :declared outside :relative-to "region")"#,
         ),
         Language::Java,
@@ -225,7 +225,7 @@ const RUST_NEARER_NAMESAKE: &str = "fn render() -> usize {\n    let value = 1;\n
 
 /// The near-miss adds one `let` inside the loop and changes nothing else. The
 /// read is spelled identically in both halves and refers to a different binding
-/// in each, which is the whole point of reaching-binding semantics: source-order
+/// in each, which is the whole point of binding-of semantics: source-order
 /// co-presence cannot tell these apart.
 #[test]
 fn a_nearer_namesake_inside_the_loop_satisfies_a_containment_requirement() {
@@ -234,7 +234,7 @@ fn a_nearer_namesake_inside_the_loop_satisfies_a_containment_requirement() {
             "test.conformance.namesakes",
             r#"(inside (loop :capture "region")
                      (identifier :text/regex "^value$" :capture "target"))"#,
-            r#"(assert-reaching :id declared-inside :at "target" :role value_reference
+            r#"(assert-binding-scope :id declared-inside :at "target" :role value_reference
                           :declared inside :relative-to "region")"#,
         ),
         Language::Rust,
@@ -262,7 +262,7 @@ fn a_type_operand_of_a_colliding_spelling_never_triggers_a_value_assert() {
             "test.conformance.namespace-collision",
             r#"(inside (callable :capture "region")
                      (identifier :text/regex "^Item$" :capture "target"))"#,
-            r#"(assert-reaching :id declared-outside :at "target" :role receiver_position
+            r#"(assert-binding-scope :id declared-outside :at "target" :role receiver_position
                           :declared outside :relative-to "region")"#,
         ),
         Language::Java,
@@ -437,7 +437,7 @@ fn a_closure_body_inside_a_loop_is_an_explicit_tested_lexical_positive() {
             "test.conformance.deferred-body",
             r#"(inside (loop :capture "region")
                      (call :callee (name "sort") :args [(capture "target")]))"#,
-            r#"(assert-reaching :id declared-inside :at "target" :role value_reference
+            r#"(assert-binding-scope :id declared-inside :at "target" :role value_reference
                           :declared inside :relative-to "region")"#,
         ),
         Language::Java,

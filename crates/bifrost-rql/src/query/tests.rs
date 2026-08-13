@@ -1,8 +1,14 @@
 use super::*;
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{ALL_ROLES, NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    RewriteDomainKind, RewriteOutcomeKind,
 };
 use brokk_bifrost_core::analyzer::usages::model::{ReferenceKind, UsageHitSurface, UsageProof};
 use serde_json::{Value, json};
@@ -516,6 +522,234 @@ fn typed_cfg_algebra_parses_and_lowers() {
     .expect("CFG RQL should lower");
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
+}
+
+/// The flow-state vocabulary (#1480) parses from both frontends, lowers to the
+/// same typed steps, and types its pipeline end to end.
+#[test]
+fn flow_state_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "handler" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "state_events_of", "event_class": ["establish", "read"], "subject": ["binding"] },
+            { "op": "flow_relations_of", "flow_relation": ["reaching"], "certainty": ["exact"] },
+            { "op": "flow_target" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::StateEventsOf(StateEventFilter {
+                classes: vec![StateEventClass::Establish, StateEventClass::Read],
+                subjects: vec![FlowSubjectKind::Binding],
+            }),
+            QueryStep::FlowRelationsOf(FlowRelationFilter {
+                relations: vec![FlowRelationLabel::Reaching],
+                certainties: vec![FlowCertainty::Exact],
+            }),
+            QueryStep::FlowTarget,
+        ]
+    );
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::StateEvent);
+
+    let rql = CodeQuery::from_sexp(
+        "(flow-target (flow-relations-of :relation [reaching] :certainty [exact] \
+           (state-events-of :class [establish read] :subject [binding] \
+             (procedure-of (function :name \"handler\")))))",
+    )
+    .expect("flow-state RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+/// The hyphenated RQL spellings canonicalize to the wire labels, and the
+/// `flow-source` projection types back to a state event.
+#[test]
+fn flow_state_hyphenated_values_canonicalize_to_wire_labels() {
+    let rql = CodeQuery::from_sexp(
+        "(flow-source (flow-relations-of :relation [same-evaluation] \
+           (state-events-of (procedure-of (function)))))",
+    )
+    .expect("same-evaluation should lower");
+    assert_eq!(
+        rql.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::StateEventsOf(StateEventFilter::default()),
+            QueryStep::FlowRelationsOf(FlowRelationFilter {
+                relations: vec![FlowRelationLabel::SameEvaluation],
+                certainties: Vec::new(),
+            }),
+            QueryStep::FlowSource,
+        ]
+    );
+    assert_eq!(rql.validate_steps().unwrap(), QueryValueKind::StateEvent);
+}
+
+/// Flow relations can be seeded from a procedure directly, and a state event
+/// row is addressable by `file-of` like every other source-backed row.
+#[test]
+fn flow_relations_seed_from_a_procedure_and_state_events_reach_files() {
+    let relations =
+        CodeQuery::from_sexp("(flow-relations-of (procedure-of (function)))").expect("lowers");
+    assert_eq!(
+        relations.validate_steps().unwrap(),
+        QueryValueKind::FlowRelation
+    );
+    let files = CodeQuery::from_sexp("(file-of (state-events-of (procedure-of (function))))")
+        .expect("lowers");
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+}
+
+/// The typed algebra rejects a projection applied to the wrong row family, and
+/// says which family it wanted.
+#[test]
+fn flow_state_projections_reject_incompatible_inputs() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "flow_source" }]
+    }));
+    assert!(error.message.contains("flow_relation"), "{error:?}");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "state_events_of" }]
+    }));
+    assert!(
+        error.message.contains("procedure or declaration"),
+        "{error:?}"
+    );
+}
+
+/// A bad constrained value is rejected by the decoder, on the offending field's
+/// own path, and the allowed set is what the registry says.
+#[test]
+fn flow_state_filters_reject_values_outside_their_vocabulary() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "state_events_of", "event_class": ["establish", "obliterate"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].event_class[1]");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "flow_relations_of", "certainty": ["probably"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].certainty[0]");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "state_events_of", "relation": ["reaching"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].relation");
+}
+
+/// The bounded rewrite-path vocabulary (#1480) parses from both frontends,
+/// lowers to the same typed step, and types its pipeline end to end.
+#[test]
+fn rewrite_path_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "use_alias" },
+        "steps": [
+            { "op": "file_of" },
+            {
+                "op": "rewrite_paths_of",
+                "domain": ["rust_import_alias"],
+                "rewrite_outcome": ["cycle", "exceeded_budget"]
+            }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::FileOf,
+            QueryStep::RewritePathsOf(RewritePathFilter {
+                domains: vec![RewriteDomainKind::RustImportAlias],
+                outcomes: vec![
+                    RewriteOutcomeKind::Cycle,
+                    RewriteOutcomeKind::ExceededBudget
+                ],
+            }),
+        ]
+    );
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::RewritePath);
+
+    // The author writes the hyphenated spellings; they canonicalize to the
+    // wire labels the registry owns.
+    let rql = CodeQuery::from_sexp(
+        "(rewrite-paths-of :domain [rust-import-alias] :outcome [cycle exceeded-budget] \
+           (file-of (function :name \"use_alias\")))",
+    )
+    .expect("rewrite-path RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+/// The typed algebra rejects a rewrite-path step applied to anything but a
+/// file, and says what it wanted.
+#[test]
+fn rewrite_paths_reject_incompatible_inputs() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "rewrite_paths_of" }]
+    }));
+    assert!(error.message.contains("file"), "{error:?}");
+}
+
+/// A bad constrained value is rejected by the decoder on the offending field's
+/// own path, and an option that belongs to another family is rejected too.
+#[test]
+fn rewrite_path_filters_reject_values_outside_their_vocabulary() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "rewrite_paths_of", "rewrite_outcome": ["diverged"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].rewrite_outcome[0]");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "rewrite_paths_of", "domain": ["python_import_alias"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].domain[0]");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "rewrite_paths_of", "certainty": ["exact"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].certainty");
 }
 
 #[test]

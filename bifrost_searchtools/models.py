@@ -1934,9 +1934,9 @@ class CodeQueryBinding:
     ``ast_id`` is absent when the binder's local name is not spelled by a
     classified token, which is how a wildcard import and an adapter without a
     structured import path surface. ``shadowed`` is ``True`` only for rows a
-    ``reaching_binding`` step with ``include_shadowed`` emitted as losers.
-    ``reached_from_ast_id`` is present exactly on rows a ``reaching_binding``
-    step produced and names the occurrence the row is the reaching binding of,
+    ``binding_of`` step with ``include_shadowed`` emitted as losers.
+    ``reached_from_ast_id`` is present exactly on rows a ``binding_of``
+    step produced and names the occurrence the row is the binding of,
     so a correlated consumer can join the answer back to its own capture.
     """
 
@@ -2193,6 +2193,286 @@ class CodeQueryReferenceEdge:
         return f"{header}\n{detail}"
 
 
+@dataclass(frozen=True)
+class CodeQueryStateEventRef:
+    """One end of a flow relation, rendered inline on the relation row (#1480)."""
+
+    id: str
+    path: str
+    range: CodeQueryRange
+    event_class: str
+    subject: str
+    program_point: int
+    ast_id: str | None = None
+    member: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryStateEventRef:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            event_class=data["event_class"],
+            subject=data["subject"],
+            program_point=int(data["program_point"]),
+            ast_id=data.get("ast_id"),
+            member=data.get("member"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryStateEvent:
+    """One flow-sensitive state event: an establishment, kill, or read (#1480).
+
+    The event is anchored to ``program_point`` of the control-flow graph
+    ``procedure_id`` names, and derived from the production semantic IR alone.
+    Source order and containment are never evidence for a state event.
+
+    ``subject`` is ``binding`` or ``property``; ``member`` is present only for a
+    property subject. ``subject_value`` is the lowered value the subject is
+    identified by, so two events of one subject inside one procedure carry the
+    same number.
+
+    ``completeness`` is ``complete`` exactly when the derivation answered this
+    row's own axis, and ``uncovered_axes`` names every axis it left uncovered.
+    A ``partial`` row is not a weaker event: it says the row *set* may be
+    missing members, which the response's diagnostics also report.
+    """
+
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    event_class: str
+    subject: str
+    subject_value: int
+    program_point: int
+    value: int
+    completeness: str
+    generation: int
+    ast_id: str | None = None
+    member: str | None = None
+    uncovered_axes: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryStateEvent:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            event_class=data["event_class"],
+            subject=data["subject"],
+            subject_value=int(data["subject_value"]),
+            program_point=int(data["program_point"]),
+            value=int(data["value"]),
+            completeness=data["completeness"],
+            generation=int(data["generation"]),
+            ast_id=data.get("ast_id"),
+            member=data.get("member"),
+            uncovered_axes=list(data.get("uncovered_axes", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        subject = self.subject + (f".{self.member}" if self.member else "")
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[state_event; {self.event_class}; {subject}]"
+        )
+        detail = (
+            f"  point {self.program_point}, value {self.value}, "
+            f"{self.completeness}, generation {self.generation}"
+        )
+        lines = [header, detail]
+        if self.uncovered_axes:
+            lines.append(f"  uncovered axes: {', '.join(self.uncovered_axes)}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowRelation:
+    """One flow relation between two state events of one procedure (#1480).
+
+    ``source`` is always the establishment or kill end and ``target`` the read
+    end. ``relation`` is ``reaching``, ``dominates``, or ``same_evaluation``;
+    ``certainty`` is ``exact`` when the relation holds on every path and ``may``
+    otherwise.
+
+    The row carries no subject of its own: a ``same_evaluation`` row
+    legitimately relates two different subjects, such as a property write to a
+    binding read.
+    """
+
+    id: str
+    procedure_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    relation: str
+    certainty: str
+    source: CodeQueryStateEventRef
+    target: CodeQueryStateEventRef
+    completeness: str
+    generation: int
+    uncovered_axes: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowRelation:
+        return cls(
+            id=data["id"],
+            procedure_id=data["procedure_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            relation=data["relation"],
+            certainty=data["certainty"],
+            source=CodeQueryStateEventRef.from_dict(data["source"]),
+            target=CodeQueryStateEventRef.from_dict(data["target"]),
+            completeness=data["completeness"],
+            generation=int(data["generation"]),
+            uncovered_axes=list(data.get("uncovered_axes", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[flow_relation; {self.relation}; {self.certainty}] "
+            f"{self.source.event_class} -> {self.target.event_class}"
+        )
+        detail = (
+            f"  source {self.source.path}:{self.source.range.start_line} "
+            f"point {self.source.program_point}, "
+            f"target {self.target.path}:{self.target.range.start_line} "
+            f"point {self.target.program_point}"
+        )
+        lines = [header, detail, f"  {self.completeness}, generation {self.generation}"]
+        if self.uncovered_axes:
+            lines.append(f"  uncovered axes: {', '.join(self.uncovered_axes)}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class CodeQueryRewriteStep:
+    """One step of a bounded rewrite chase (#1480).
+
+    ``state_key`` is the *semantic* state the cycle check keys on, which is not
+    the rewritten object: the object usually grows every hop and can never
+    repeat, so keying on it would never detect a cycle. ``rule`` names which
+    rewrite fired, so a step sequence reads as a derivation.
+    """
+
+    state_key: str
+    input: str
+    output: str
+    rule: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryRewriteStep:
+        return cls(
+            state_key=data["state_key"],
+            input=data["input"],
+            output=data["output"],
+            rule=data["rule"],
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryRewritePath:
+    """One bounded chase through one declared finite rewrite domain (#1480).
+
+    ``declared_bound`` is the size of the finite state space the domain walks,
+    named by the chase itself rather than an arbitrary cap, and ``steps`` is the
+    ordered derivation that bound governs.
+
+    The three outcomes mean different things. ``converged`` carries
+    ``fixed_point``. ``cycle`` carries ``witness``, the ordered state sequence
+    whose last element repeats its first and closes the loop -- a concrete
+    counterexample. ``exceeded_budget`` carries only ``explored``: it is absence
+    of evidence, never a proven cycle and never a clean convergence.
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    domain: str
+    origin_specifier: str
+    declared_bound: int
+    step_count: int
+    outcome: str
+    completeness: str
+    generation: int
+    steps: list[CodeQueryRewriteStep] = field(default_factory=list)
+    fixed_point: str | None = None
+    witness: list[str] = field(default_factory=list)
+    explored: int | None = None
+    uncovered_domains: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryRewritePath:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=int(data["start_byte"]),
+            end_byte=int(data["end_byte"]),
+            domain=data["domain"],
+            origin_specifier=data["origin_specifier"],
+            declared_bound=int(data["declared_bound"]),
+            step_count=int(data["step_count"]),
+            outcome=data["outcome"],
+            completeness=data["completeness"],
+            generation=int(data["generation"]),
+            steps=[CodeQueryRewriteStep.from_dict(step) for step in data.get("steps", [])],
+            fixed_point=data.get("fixed_point"),
+            witness=list(data.get("witness", [])),
+            explored=data.get("explored"),
+            uncovered_domains=list(data.get("uncovered_domains", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[rewrite_path; {self.domain}; {self.outcome}] {self.origin_specifier}"
+        )
+        lines = [
+            header,
+            f"  {self.step_count} of {self.declared_bound} steps, generation {self.generation}",
+        ]
+        for step in self.steps:
+            lines.append(f"  [{step.state_key}] {step.input} -> {step.output} ({step.rule})")
+        if self.fixed_point is not None:
+            lines.append(f"  fixed point: {self.fixed_point}")
+        if self.witness:
+            lines.append(f"  cycle witness: {' -> '.join(self.witness)}")
+        if self.explored is not None:
+            lines.append(f"  explored {self.explored} steps before the bound")
+        if self.uncovered_domains:
+            lines.append(f"  uncovered domains: {', '.join(self.uncovered_domains)}")
+        return "\n".join(lines)
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -2214,6 +2494,9 @@ CodeQueryResultItem = (
     | CodeQueryBinding
     | CodeQueryResolutionCandidate
     | CodeQueryReferenceEdge
+    | CodeQueryStateEvent
+    | CodeQueryFlowRelation
+    | CodeQueryRewritePath
 )
 
 
@@ -2575,6 +2858,12 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryDeclarationState.from_dict(data)
     if result_type == "reference_edge":
         return CodeQueryReferenceEdge.from_dict(data)
+    if result_type == "state_event":
+        return CodeQueryStateEvent.from_dict(data)
+    if result_type == "flow_relation":
+        return CodeQueryFlowRelation.from_dict(data)
+    if result_type == "rewrite_path":
+        return CodeQueryRewritePath.from_dict(data)
     if result_type == "qualified_path":
         return CodeQueryQualifiedPath.from_dict(data)
     if result_type == "path_segment":

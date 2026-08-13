@@ -5,7 +5,7 @@
 //! the motivating false-positive corpus for this whole slice reduces to one
 //! missing predicate -- is the value operated on inside this loop declared
 //! inside or outside the loop body? -- and that test answers it as a query,
-//! from a capture through `reaching-binding` and `scope-of` to a containment
+//! from a capture through `binding-of` and `scope-of` to a containment
 //! check against the loop's own scope, on both halves of the fixture.
 
 use crate::common::InlineTestProject;
@@ -85,7 +85,7 @@ class Sorter {
 /// loop body, so each iteration sorts a fresh list.
 ///
 /// The join is structural throughout: the capture reaches the binding through
-/// `reaching_binding` (activation intervals and scope ancestry, never source
+/// `binding_of` (activation intervals and scope ancestry, never source
 /// order), and the binding reaches its declaring scope through `scope_of`. The
 /// verdict is then the scope index of that declaring scope compared against
 /// the scopes the two methods contain -- no range arithmetic and no spelling.
@@ -102,7 +102,7 @@ fn loop_invariance_discriminator_separates_the_two_fixture_halves() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["value_reference"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     assert_eq!(
@@ -136,7 +136,7 @@ fn loop_invariance_discriminator_separates_the_two_fixture_halves() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["value_reference"] },
-            "steps": [{ "op": "reaching_binding" }, { "op": "scope_of" }]
+            "steps": [{ "op": "binding_of" }, { "op": "scope_of" }]
         }),
     ));
     let scoped_indices = rows(&scoped)
@@ -389,7 +389,7 @@ fn binding_occurrence_joins_back_by_ast_id() {
     }
 }
 
-/// A shadowing Rust fixture: the reaching binding of a read is the nearest
+/// A shadowing Rust fixture: the binding of a read is the nearest
 /// `let`, and `:include-shadowed` makes the outer one a visible second row
 /// rather than a collapsed answer.
 #[test]
@@ -404,7 +404,7 @@ fn include_shadowed_turns_a_shadowed_binding_into_a_visible_row() {
         json!({
             "languages": ["rust"],
             "occurrences": { "role": ["value_reference"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     ));
     let with_shadowed = serialized(&run(
@@ -413,7 +413,7 @@ fn include_shadowed_turns_a_shadowed_binding_into_a_visible_row() {
             "languages": ["rust"],
             "occurrences": { "role": ["value_reference"] },
             "steps": [
-                { "op": "reaching_binding", "include_shadowed": true }
+                { "op": "binding_of", "include_shadowed": true }
             ]
         }),
     ));
@@ -448,7 +448,7 @@ fn a_name_with_no_lexical_binding_yields_a_complete_empty_answer() {
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["value_reference"] },
-            "steps": [{ "op": "reaching_binding" }]
+            "steps": [{ "op": "binding_of" }]
         }),
     );
     assert!(
@@ -685,11 +685,11 @@ fn rql_and_json_round_trip_to_one_canonical_query() {
             }),
         ),
         (
-            "(scope-of (reaching-binding :include-shadowed true (occurrences :class reference)))",
+            "(scope-of (binding-of :include-shadowed true (occurrences :class reference)))",
             json!({
                 "occurrences": { "class": ["reference"] },
                 "steps": [
-                    { "op": "reaching_binding", "include_shadowed": true },
+                    { "op": "binding_of", "include_shadowed": true },
                     { "op": "scope_of" }
                 ]
             }),

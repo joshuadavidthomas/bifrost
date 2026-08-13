@@ -138,8 +138,8 @@ pub(super) fn evaluate_assertion_policy(
             PolicyAssert::Resolution(_) | PolicyAssert::Boundary(_)
         )
     });
-    let reaching_roles = asserted_roles(spec, |assertion| {
-        matches!(assertion, PolicyAssert::Reaching(_))
+    let binding_scope_roles = asserted_roles(spec, |assertion| {
+        matches!(assertion, PolicyAssert::BindingScope(_))
     });
     let needs_generation = spec
         .asserts
@@ -178,6 +178,13 @@ pub(super) fn evaluate_assertion_policy(
         }
     };
     let severity = finding_severity(&metadata.severity, None);
+    let presentation = AssertionFindingPresentation {
+        policy,
+        policy_id: &metadata.id,
+        severity,
+        message: &message,
+        classification: &classification,
+    };
 
     let needs_identity_producers = spec.asserts.iter().any(|assertion| {
         matches!(
@@ -188,6 +195,10 @@ pub(super) fn evaluate_assertion_policy(
     let mut identity_support =
         needs_identity_producers.then(|| IdentityAssertSupport::new(context.analyzer));
     let mut edge_assert_context = EdgeAssertContext::new(context.analyzer, context.cancellation);
+    let mut flow_assert_context =
+        FlowStateAssertContext::new(context.workspace, context.cancellation);
+    let mut rewrite_assert_context =
+        RewriteAssertContext::new(context.analyzer, context.cancellation);
 
     // Declaration-state rows are derived directly rather than queried: no
     // seed spans the whole state family, and the rows joined here are exact
@@ -230,7 +241,9 @@ pub(super) fn evaluate_assertion_policy(
     paths.sort_unstable();
 
     let mut findings: Vec<PolicyFinding> = Vec::new();
-    let mut unconcluded_files: Vec<(&str, Vec<PolicyIncompleteReason>)> = Vec::new();
+    // Owned paths: the termination family reports files the subject selector
+    // never selected, so the accounting cannot borrow from the subject paths.
+    let mut unconcluded_files: Vec<(String, Vec<PolicyIncompleteReason>)> = Vec::new();
     let mut row_completions: Vec<CodeQueryCompletion> = Vec::new();
 
     for path in paths {
@@ -268,11 +281,11 @@ pub(super) fn evaluate_assertion_policy(
                 }
             }
         }
-        if !reaching_roles.is_empty() {
+        if !binding_scope_roles.is_empty() {
             match assertion_occurrence_query(
                 &file_paths,
-                &reaching_roles,
-                vec![QueryStep::ReachingBinding(ReachingBindingOptions::default())],
+                &binding_scope_roles,
+                vec![QueryStep::BindingOf(BindingOfOptions::default())],
                 budget,
             ) {
                 Ok(query) => queries.push(query),
@@ -398,14 +411,14 @@ pub(super) fn evaluate_assertion_policy(
         if !file_incomplete.is_empty() {
             file_incomplete.sort();
             file_incomplete.dedup();
-            unconcluded_files.push((path, file_incomplete));
+            unconcluded_files.push((path.to_string(), file_incomplete));
             continue;
         }
 
         let mut rows_by_ast_id: HashMap<&str, Vec<&CodeQueryOccurrence>> = HashMap::new();
         let mut candidates_by_ast_id: HashMap<&str, Vec<&CodeQueryResolutionCandidate>> =
             HashMap::new();
-        // A reaching binding is an answer about one occurrence, and the row
+        // A binding-of answer is an answer about one occurrence, and the row
         // says which one: the join is that identity, never the binding's name.
         // The identity is path-qualified because a canonical AST id repeats
         // verbatim across files with identical content, and the binding must
@@ -476,7 +489,13 @@ pub(super) fn evaluate_assertion_policy(
             for assertion in &spec.asserts {
                 // Soundness rule 2: an unbound `:at` is an authoring error,
                 // never a vacuous pass.
-                let Some(ast_ids) = subject.ast_ids(assertion.at()) else {
+                // The termination family is about a file set rather than one
+                // captured node, so it binds no subject capture and is
+                // evaluated once per run, after this loop.
+                let Some(at) = assertion.at() else {
+                    continue;
+                };
+                let Some(ast_ids) = subject.ast_ids(at) else {
                     return failed_policy_run_with_reason(
                         policy,
                         PolicyAnalysisType::Assertion,
@@ -485,7 +504,7 @@ pub(super) fn evaluate_assertion_policy(
                         &format!(
                             "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
                             assertion.id(),
-                            assertion.at(),
+                            at,
                             subject.path.as_str()
                         ),
                         work,
@@ -541,6 +560,18 @@ pub(super) fn evaluate_assertion_policy(
                         &mut edge_assert_context,
                         &mut late_incomplete,
                     ),
+                    PolicyAssert::FlowEstablishment(assertion) => {
+                        evaluate_flow_establishment_assert(
+                            assertion,
+                            subject,
+                            &ast_ids,
+                            &mut flow_assert_context,
+                            &mut late_incomplete,
+                        )
+                    }
+                    // Evaluated once per run, below; the subject loop skipped
+                    // it at the `:at` check above.
+                    PolicyAssert::RewriteTermination(_) => None,
                     PolicyAssert::Canonical(assertion) => {
                         match subject.ast_ids(&assertion.equals) {
                             Some(equals_ids) => evaluate_canonical_assert(
@@ -611,9 +642,9 @@ pub(super) fn evaluate_assertion_policy(
                         context,
                         &mut late_incomplete,
                     ),
-                    PolicyAssert::Reaching(assertion) => {
+                    PolicyAssert::BindingScope(assertion) => {
                         match subject.ast_ids(&assertion.relative_to) {
-                            Some(_) => evaluate_reaching_assert(
+                            Some(_) => evaluate_binding_scope_assert(
                                 assertion,
                                 subject,
                                 &ast_ids,
@@ -695,41 +726,12 @@ pub(super) fn evaluate_assertion_policy(
                     }
                 };
 
-                let completeness = if related_truncated {
-                    FindingCompleteness::partial(vec![
-                        FindingIncompleteReason::RelatedLocationsTruncated,
-                    ])
-                    .expect("one typed finding-incomplete reason is canonical")
-                } else {
-                    FindingCompleteness::Complete
-                };
-                let proof = ProofMetadata::try_new(
-                    ProofState::Proven,
-                    vec![ProofReason::DirectStructuralMatch],
-                    Vec::new(),
-                )
-                .expect("a proven direct structural match is a canonical proof");
-                let finding = PolicyFinding::try_new(
-                    metadata.id.clone(),
-                    policy.semantic_hash(),
-                    severity,
-                    message.clone(),
-                    classification.clone(),
-                    FindingCertainty::Definite,
-                    completeness,
+                let finding = presentation.assemble(
                     subject.location.clone(),
                     related,
                     related_truncated,
                     omitted_related,
-                    PolicyFindingEvidence::Assertion { evidence },
-                    false,
-                    0,
-                    None,
-                    None,
-                    proof,
-                    Vec::new(),
-                    false,
-                    0,
+                    evidence,
                     budget,
                 );
                 match finding {
@@ -755,7 +757,235 @@ pub(super) fn evaluate_assertion_policy(
         } else {
             late_incomplete.sort();
             late_incomplete.dedup();
-            unconcluded_files.push((path, late_incomplete));
+            unconcluded_files.push((path.to_string(), late_incomplete));
+        }
+    }
+
+    // The termination family states a property of a *file set*, not of one
+    // captured node, so it is evaluated once per run rather than once per
+    // subject row, and one assert produces at most one finding: "these chases
+    // cycle" is a single statement whose evidence is an ordered list, not one
+    // finding per offending import. Its accounting joins the same per-file
+    // ledger every other family uses, so an unreliable file degrades exactly
+    // itself.
+    for assertion in &spec.asserts {
+        let PolicyAssert::RewriteTermination(assertion) = assertion else {
+            continue;
+        };
+        let work = work_report(total_work, findings.len(), 0);
+        // The finding is anchored at a subject row, exactly as every other
+        // family's is: an assertion finding's identity is its subject node,
+        // and the offending chases are stated as evidence beside it. The
+        // deterministic choice is the first subject in path order.
+        let anchor_subject = subjects
+            .iter()
+            .filter(|subject| {
+                assertion
+                    .scope
+                    .as_ref()
+                    .is_none_or(|capture| subject.captures.contains_key(capture))
+            })
+            .min_by_key(|subject| {
+                (
+                    subject.path.as_str(),
+                    subject
+                        .location
+                        .byte_span()
+                        .map_or(u64::MAX, |span| span.start()),
+                )
+            });
+        let files = match &assertion.scope {
+            // Without a scope the assert is about the domain itself, which is
+            // a workspace property: the mined regression was a chase over the
+            // workspace's own imports, not over a captured token.
+            None => rewrite_assert_context.workspace_files().to_vec(),
+            Some(capture) => {
+                let mut paths = subjects
+                    .iter()
+                    .filter(|subject| subject.captures.contains_key(capture))
+                    .map(|subject| subject.path.as_str())
+                    .collect::<Vec<_>>();
+                if paths.is_empty() {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InvalidExecutionPlan,
+                        &format!(
+                            "assert `{}` scopes to capture `{}`, which the subject selector does not bind anywhere",
+                            assertion.id, capture
+                        ),
+                        work,
+                        budget,
+                    );
+                }
+                paths.sort_unstable();
+                paths.dedup();
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        ProjectFile::new(
+                            context.analyzer.project().root().to_path_buf(),
+                            path.to_string(),
+                        )
+                    })
+                    .collect()
+            }
+        };
+
+        let mut cycles: Vec<String> = Vec::new();
+        let mut origins: Vec<PolicySourceLocation> = Vec::new();
+        for file in files {
+            let derived = rewrite_assert_context.for_file(&file);
+            let key = workspace_relative_key(&file);
+            if !derived.completeness.covers(assertion.domain) {
+                unconcluded_files.push((
+                    key,
+                    derived
+                        .completeness
+                        .reasons()
+                        .iter()
+                        .map(|reason| match reason {
+                            RewritePathIncompleteReason::Cancelled => {
+                                PolicyIncompleteReason::Cancelled
+                            }
+                            RewritePathIncompleteReason::NoDomainAnalyzer(_)
+                            | RewritePathIncompleteReason::NoIndexedSource => {
+                                PolicyIncompleteReason::CapabilityIncomplete
+                            }
+                        })
+                        .collect(),
+                ));
+                continue;
+            }
+            for path in derived
+                .paths
+                .iter()
+                .filter(|path| path.domain == assertion.domain)
+            {
+                match termination_verdict(&path.outcome) {
+                    TerminationVerdict::Satisfied => continue,
+                    // Absence of evidence: the chase stopped without deciding,
+                    // so this file concludes nothing in either direction. It
+                    // is never a finding and never a pass.
+                    TerminationVerdict::Inconclusive => {
+                        unconcluded_files
+                            .push((key.clone(), vec![PolicyIncompleteReason::PartialDiscovery]));
+                        continue;
+                    }
+                    TerminationVerdict::Counterexample => {}
+                }
+                let witness = path.outcome.witness();
+                cycles.push(format!(
+                    "the chase from `{}` at {}:{} repeats a semantic state; witness: {} (declared bound {}, {} step(s))",
+                    path.origin.specifier,
+                    key,
+                    path.origin.range.start_line,
+                    witness.join(" -> "),
+                    path.declared_bound,
+                    path.steps.len(),
+                ));
+                if let Ok(origin_path) = WorkspaceRelativePath::new(key.as_str()) {
+                    origins.push(PolicySourceLocation::artifact(origin_path));
+                } else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a rewrite origin could not be projected into a workspace-relative path",
+                        work,
+                        budget,
+                    );
+                }
+            }
+        }
+
+        if cycles.is_empty() {
+            continue;
+        }
+        // Nothing to anchor the finding to: the subject selector chose no row
+        // this assert applies to, which is the same vacuous shape every other
+        // family has and not a verdict of its own.
+        let Some(anchor_subject) = anchor_subject else {
+            continue;
+        };
+        let count = u64::try_from(cycles.len()).unwrap_or(u64::MAX);
+        let anchor = super::super::finding_identity::AssertionFindingAnchor::new(
+            anchor_subject.path.clone(),
+            assertion
+                .scope
+                .as_ref()
+                .and_then(|capture| anchor_subject.ast_ids(capture))
+                .and_then(|ids| ids.first().copied())
+                .unwrap_or(""),
+            assertion.id.as_str(),
+        );
+        let Ok(evidence) = super::super::finding::AssertionFindingEvidence::try_new(
+            anchor,
+            "rewrite_termination",
+            "declaration",
+            "rewrite_path",
+            assertion.expectation(),
+            Some(cycles.join("; ")),
+            count,
+            // This family reads no occurrence rows, so there is no adapter
+            // role gap for it to report.
+            Vec::new(),
+        ) else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "a violated assertion could not be projected into validated policy evidence",
+                work,
+                budget,
+            );
+        };
+        let Ok(related) = std::iter::once((
+            PolicyLocationRelationship::Subject,
+            anchor_subject.location.clone(),
+        ))
+        .chain(
+            origins
+                .into_iter()
+                .map(|origin| (PolicyLocationRelationship::Evidence, origin)),
+        )
+        .map(|(relationship, location)| {
+            RelatedPolicyLocation::try_new(relationship, location, Vec::new())
+        })
+        .collect::<Result<Vec<_>, _>>() else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "an evidence row could not be projected into a related policy location",
+                work,
+                budget,
+            );
+        };
+        match presentation.assemble(
+            anchor_subject.location.clone(),
+            related,
+            false,
+            0,
+            evidence,
+            budget,
+        ) {
+            Ok(finding) => findings.push(finding),
+            Err(()) => {
+                return failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a validated assertion violation could not be retained as a finding",
+                    work,
+                    budget,
+                );
+            }
         }
     }
 
@@ -822,11 +1052,74 @@ pub(super) fn evaluate_assertion_policy(
     )
 }
 
+/// The presentation values every assertion finding of one run shares.
+///
+/// Two producers build assertion findings: the per-subject loop, and the
+/// termination family, which is about a file set rather than a captured node
+/// and therefore runs once per policy run. They must project identically, so
+/// the projection lives here rather than being written twice.
+struct AssertionFindingPresentation<'presentation> {
+    policy: &'presentation LoadedPolicy,
+    policy_id: &'presentation super::super::definition::PolicyId,
+    severity: FindingSeverity,
+    message: &'presentation str,
+    classification: &'presentation super::super::classification::FindingClassification,
+}
+
+impl AssertionFindingPresentation<'_> {
+    fn assemble(
+        &self,
+        location: PolicySourceLocation,
+        related: Vec<RelatedPolicyLocation>,
+        related_truncated: bool,
+        omitted_related: u64,
+        evidence: super::super::finding::AssertionFindingEvidence,
+        budget: &PolicyBudget,
+    ) -> Result<PolicyFinding, ()> {
+        let completeness = if related_truncated {
+            FindingCompleteness::partial(vec![FindingIncompleteReason::RelatedLocationsTruncated])
+                .expect("one typed finding-incomplete reason is canonical")
+        } else {
+            FindingCompleteness::Complete
+        };
+        let proof = ProofMetadata::try_new(
+            ProofState::Proven,
+            vec![ProofReason::DirectStructuralMatch],
+            Vec::new(),
+        )
+        .expect("a proven direct structural match is a canonical proof");
+        PolicyFinding::try_new(
+            self.policy_id.clone(),
+            self.policy.semantic_hash(),
+            self.severity,
+            self.message.to_string(),
+            self.classification.clone(),
+            FindingCertainty::Definite,
+            completeness,
+            location,
+            related,
+            related_truncated,
+            omitted_related,
+            PolicyFindingEvidence::Assertion { evidence },
+            false,
+            0,
+            None,
+            None,
+            proof,
+            Vec::new(),
+            false,
+            0,
+            budget,
+        )
+        .map_err(|_| ())
+    }
+}
+
 /// Retain one diagnostic that names every file whose verdict this run could
 /// not conclude, with each file's typed reasons. The complete set is listed
 /// unless the report prose bound forces a tail count.
 fn retain_unconcluded_files_diagnostic(
-    unconcluded_files: &[(&str, Vec<PolicyIncompleteReason>)],
+    unconcluded_files: &[(String, Vec<PolicyIncompleteReason>)],
     diagnostics: &mut Vec<PolicyDiagnostic>,
     diagnostics_truncated: &mut bool,
     max_diagnostics: usize,
@@ -1462,17 +1755,19 @@ struct AssertionViolation<'rows> {
     /// Candidate rows the resolver considered, listed as considered
     /// candidates. The selected ones lead.
     candidates: Vec<&'rows CodeQueryResolutionCandidate>,
-    /// The binding a reaching assert reached, listed as the reaching binding.
+    /// The binding a binding-scope assert reached, listed as the binding-of answer.
     binding: Option<&'rows CodeQueryBinding>,
     /// The scope the binding is declared in.
     declaring_scope: Option<&'rows CodeQueryLexicalScope>,
     /// Generation-site rows a generation assert fired on; the site and each
     /// generated declaration's naming argument become related locations.
     generation_sites: Vec<&'rows CodeQueryGenerationSite>,
-    /// Prebuilt locations for edge-assert evidence: the unmatched edge's site
-    /// and target files. Built at evaluation time because edge rows are
-    /// derivation rows, not wire rows.
-    edge_locations: Vec<PolicySourceLocation>,
+    /// Prebuilt evidence locations for the families that read a derivation
+    /// layer rather than wire rows: the unmatched edge's site and target
+    /// files, or the considered establishments of a temporal assert. Built at
+    /// evaluation time, in the order the evidence is stated, because these
+    /// rows never travelled through a query.
+    derivation_locations: Vec<PolicySourceLocation>,
     /// Producer-derived evidence locations (route provenance, compared
     /// tokens, terminal declarations), already shaped as policy locations
     /// because their rows never travelled through a query.
@@ -1491,7 +1786,7 @@ impl<'rows> AssertionViolation<'rows> {
             binding: None,
             declaring_scope: None,
             generation_sites: Vec::new(),
-            edge_locations: Vec::new(),
+            derivation_locations: Vec::new(),
             extra_locations: Vec::new(),
         }
     }
@@ -1692,7 +1987,7 @@ fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
 fn edge_description(row: &ReferenceEdgeRow) -> String {
     format!(
         "{}:{}..{} -> {} [{}; {}; {}; {}; {}]",
-        row.site.file.rel_path().display(),
+        workspace_relative_key(&row.site.file),
         row.site.range.start_byte,
         row.site.range.end_byte,
         row.target.fq_name(),
@@ -1708,7 +2003,7 @@ fn edge_description(row: &ReferenceEdgeRow) -> String {
     )
 }
 
-fn edge_location(file: &ProjectFile) -> Option<PolicySourceLocation> {
+fn derivation_file_location(file: &ProjectFile) -> Option<PolicySourceLocation> {
     WorkspaceRelativePath::new(file.rel_path().to_string_lossy())
         .ok()
         .map(PolicySourceLocation::artifact)
@@ -1825,7 +2120,7 @@ fn evaluate_edge_parity_assert<'rows>(
                             "inverse edge {} has no forward counterpart",
                             edge_description(edge)
                         ));
-                        locations.extend(edge_location(&edge.site.file));
+                        locations.extend(derivation_file_location(&edge.site.file));
                     }
                     Some(counterpart) => {
                         let mismatches = edge_field_mismatches(counterpart, edge);
@@ -1836,7 +2131,7 @@ fn evaluate_edge_parity_assert<'rows>(
                                 edge_description(edge),
                                 mismatches.join(", ")
                             ));
-                            locations.extend(edge_location(&edge.site.file));
+                            locations.extend(derivation_file_location(&edge.site.file));
                         }
                     }
                 }
@@ -1878,7 +2173,7 @@ fn evaluate_edge_parity_assert<'rows>(
                             "forward edge {} has no inverse counterpart",
                             edge_description(&edge)
                         ));
-                        locations.extend(edge_location(edge.target.source()));
+                        locations.extend(derivation_file_location(edge.target.source()));
                     }
                     Some(counterpart) => {
                         let mismatches = edge_field_mismatches(&edge, counterpart);
@@ -1889,7 +2184,7 @@ fn evaluate_edge_parity_assert<'rows>(
                                 edge_description(&edge),
                                 mismatches.join(", ")
                             ));
-                            locations.extend(edge_location(edge.target.source()));
+                            locations.extend(derivation_file_location(edge.target.source()));
                         }
                     }
                 }
@@ -1907,7 +2202,7 @@ fn evaluate_edge_parity_assert<'rows>(
     );
     violation.actual_count = count;
     violation.occurrences = tokens;
-    violation.edge_locations = locations;
+    violation.derivation_locations = locations;
     Some(violation)
 }
 
@@ -1963,7 +2258,7 @@ fn evaluate_edge_class_assert<'rows>(
                 EdgeClassVerdict::Violated(reason) => {
                     count += 1;
                     offending.push(format!("edge {} {reason}", edge_description(&edge)));
-                    locations.extend(edge_location(&edge.site.file));
+                    locations.extend(derivation_file_location(&edge.site.file));
                 }
             }
         }
@@ -1979,7 +2274,7 @@ fn evaluate_edge_class_assert<'rows>(
     );
     violation.actual_count = count;
     violation.occurrences = tokens;
-    violation.edge_locations = locations;
+    violation.derivation_locations = locations;
     Some(violation)
 }
 
@@ -2041,6 +2336,365 @@ fn edge_class_verdict(
             }),
         },
     }
+}
+
+/// What one terminal rewrite outcome means for a termination assert.
+///
+/// The three outcomes are deliberately not two: a cycle is a concrete
+/// counterexample, convergence is a positive answer, and budget exhaustion is
+/// *absence of evidence*, which may never become either verdict. Budget
+/// exhaustion is structurally unreachable in the one domain declared today
+/// (every rewrite consumes one distinct binder root, so the hop count cannot
+/// pass the root count), so this mapping is pinned by a unit test rather than
+/// by a fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminationVerdict {
+    Satisfied,
+    Counterexample,
+    Inconclusive,
+}
+
+pub(super) const fn termination_verdict(outcome: &RewriteOutcome) -> TerminationVerdict {
+    match outcome {
+        RewriteOutcome::Converged { .. } => TerminationVerdict::Satisfied,
+        RewriteOutcome::Cycle { .. } => TerminationVerdict::Counterexample,
+        RewriteOutcome::ExceededBudget { .. } => TerminationVerdict::Inconclusive,
+    }
+}
+
+/// Per-run memo of bounded rewrite-path derivations for the termination
+/// family (#1480).
+///
+/// Unlike the flow-state family this needs no workspace snapshot: the domain's
+/// chase reads the file's own import binder, so it runs in every execution
+/// mode.
+struct RewriteAssertContext<'context> {
+    analyzer: &'context dyn IAnalyzer,
+    cancellation: Option<&'context CancellationToken>,
+    files: HashMap<ProjectFile, Arc<FileRewritePaths>>,
+    /// The unscoped termination assert walks every analyzed file; the listing
+    /// does not change within one run, so it is enumerated and sorted once.
+    workspace_files: Option<Arc<[ProjectFile]>>,
+}
+
+impl<'context> RewriteAssertContext<'context> {
+    fn new(
+        analyzer: &'context dyn IAnalyzer,
+        cancellation: Option<&'context CancellationToken>,
+    ) -> Self {
+        Self {
+            analyzer,
+            cancellation,
+            files: HashMap::new(),
+            workspace_files: None,
+        }
+    }
+
+    fn workspace_files(&mut self) -> Arc<[ProjectFile]> {
+        if let Some(cached) = &self.workspace_files {
+            return Arc::clone(cached);
+        }
+        let mut files = self.analyzer.analyzed_files();
+        files.sort_by_key(|file| file.rel_path().to_path_buf());
+        let files: Arc<[ProjectFile]> = files.into();
+        self.workspace_files = Some(Arc::clone(&files));
+        files
+    }
+
+    fn for_file(&mut self, file: &ProjectFile) -> Arc<FileRewritePaths> {
+        if let Some(cached) = self.files.get(file) {
+            return Arc::clone(cached);
+        }
+        let token = self.cancellation.cloned().unwrap_or_default();
+        let derived = Arc::new(rewrite_paths_for_file(
+            self.analyzer,
+            file,
+            &mut RewritePathRequest::new(&token),
+        ));
+        self.files.insert(file.clone(), Arc::clone(&derived));
+        derived
+    }
+}
+
+/// Per-run memo of flow-state derivations for the temporal assert family
+/// (#1480).
+///
+/// The derivation layer is consulted directly, exactly as the edge asserts
+/// consult theirs: the assert needs the typed per-axis completeness and the
+/// dense event identities both ends of a relation join on, and the wire rows
+/// only re-render those.
+struct FlowStateAssertContext<'context> {
+    /// The production CFG is a workspace artifact. A host that supplied no
+    /// workspace snapshot has not given this family its evidence source, and
+    /// there is no second one.
+    workspace: Option<&'context WorkspaceAnalyzer>,
+    cancellation: Option<&'context CancellationToken>,
+    files: HashMap<ProjectFile, Arc<FileFlowState>>,
+}
+
+impl<'context> FlowStateAssertContext<'context> {
+    fn new(
+        workspace: Option<&'context WorkspaceAnalyzer>,
+        cancellation: Option<&'context CancellationToken>,
+    ) -> Self {
+        Self {
+            workspace,
+            cancellation,
+            files: HashMap::new(),
+        }
+    }
+
+    /// Derive (or replay) one workspace-relative file's flow state. `None`
+    /// means the run has no workspace snapshot, which is a capability gap, not
+    /// an empty answer.
+    fn for_path(&mut self, path: &str) -> Option<Arc<FileFlowState>> {
+        let workspace = self.workspace?;
+        let file = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            path.to_string(),
+        );
+        if let Some(cached) = self.files.get(&file) {
+            return Some(Arc::clone(cached));
+        }
+        let token = self.cancellation.cloned().unwrap_or_default();
+        let derived = Arc::new(flow_state_for_file(
+            workspace,
+            &file,
+            &mut FlowStateRequest::new(&token),
+        ));
+        self.files.insert(file, Arc::clone(&derived));
+        Some(derived)
+    }
+}
+
+/// One human-readable statement of what a state event is about.
+fn flow_subject_description(subject: &FlowSubject) -> String {
+    match subject.member() {
+        Some(member) => format!("property `.{member}`"),
+        None => "binding".to_string(),
+    }
+}
+
+/// One event, named by its subject and the line that spells it.
+fn state_event_description(event: &StateEventRow) -> String {
+    format!(
+        "{} at {}:{}",
+        flow_subject_description(&event.subject),
+        workspace_relative_key(&event.site.file),
+        event.site.range.start_line,
+    )
+}
+
+/// Why one establishment does not serve one read, read off the derived
+/// relations rather than guessed.
+///
+/// Only relations the derivation actually emitted are stated: "killed" is
+/// claimed exactly when a kill of the same subject dominates the read, which
+/// is a derived fact, and never inferred from the presence of a kill event
+/// somewhere in the procedure.
+fn establishment_rejection(
+    derivation: &FlowStateDerivation,
+    establishment: &StateEventRow,
+    read: &StateEventRow,
+    require: EstablishmentRequirement,
+) -> &'static str {
+    let relates = |relation: FlowRelation| {
+        derivation.relations.iter().any(|row| {
+            row.relation == relation
+                && row.source_event == establishment.event
+                && row.target_event == read.event
+        })
+    };
+    if relates(FlowRelation::SameEvaluation) {
+        return "serves its own evaluation of the read";
+    }
+    if require == EstablishmentRequirement::Dominated && relates(FlowRelation::Reaching) {
+        return "reaches the read but does not dominate it";
+    }
+    "does not reach the read"
+}
+
+/// Whether a kill of the read's subject dominates the read, which is the one
+/// provable form of "the establishment was killed before this read".
+fn killed_before(derivation: &FlowStateDerivation, read: &StateEventRow) -> bool {
+    derivation.relations.iter().any(|row| {
+        row.relation == FlowRelation::Dominates && row.target_event == read.event && {
+            let source = derivation.event(row.source_event);
+            source.event_class == StateEventClass::Kill && source.subject == read.subject
+        }
+    })
+}
+
+/// The temporal assert: every read the capture joins must be reached by, or
+/// dominated by, an establishment of its own subject, and -- under
+/// `:forbid-same-evaluation` -- must never be served by a binder of its own
+/// evaluation.
+fn evaluate_flow_establishment_assert<'rows>(
+    assertion: &FlowEstablishmentAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    flow: &mut FlowStateAssertContext<'_>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let Some(state) = flow.for_path(subject.path.as_str()) else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+
+    let mut offending: Vec<String> = Vec::new();
+    let mut locations: Vec<PolicySourceLocation> = Vec::new();
+    let mut count = 0_u64;
+    let mut joined_any_read = false;
+
+    for derivation in &state.procedures {
+        let reads: Vec<&StateEventRow> = derivation
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_class == StateEventClass::Read
+                    && event
+                        .site
+                        .ast_id
+                        .as_deref()
+                        .is_some_and(|id| ast_ids.contains(&id))
+            })
+            .collect();
+        if reads.is_empty() {
+            continue;
+        }
+        joined_any_read = true;
+        for read in reads {
+            if assertion.forbid_same_evaluation {
+                let mut same_evaluation_found = false;
+                for row in derivation.relations.iter().filter(|row| {
+                    row.relation == FlowRelation::SameEvaluation && row.target_event == read.event
+                }) {
+                    let establishment = derivation.event(row.source_event);
+                    count += 1;
+                    offending.push(format!(
+                        "establishment of {} serves the read of {} in the same evaluation",
+                        state_event_description(establishment),
+                        state_event_description(read),
+                    ));
+                    locations.extend(derivation_file_location(&establishment.site.file));
+                    locations.extend(derivation_file_location(&read.site.file));
+                    same_evaluation_found = true;
+                }
+                // Absence is only an answer over an enumerated axis. A
+                // *present* relation, by contrast, is a proven counterexample
+                // whatever else the derivation could not enumerate, so the
+                // coverage question is asked here and not before the search.
+                if !same_evaluation_found
+                    && !derivation
+                        .completeness
+                        .covers(FlowStateAxis::SameEvaluationRelation)
+                {
+                    late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    return None;
+                }
+            }
+
+            let required = assertion.require.relation();
+            let qualifies = |event: usize| {
+                let candidate = derivation.event(event);
+                candidate.event_class == StateEventClass::Establish
+                    && candidate.subject == read.subject
+            };
+            if derivation.relations.iter().any(|row| {
+                row.relation == required
+                    && row.target_event == read.event
+                    && qualifies(row.source_event)
+            }) {
+                // Satisfied by a relation the derivation actually states; no
+                // coverage question arises, because nothing is concluded from
+                // an absence.
+                continue;
+            }
+            // The finding below rests on two absences -- no qualifying
+            // relation, and no further establishment of this subject -- so
+            // both axes must be enumerable before it can be stated.
+            if assertion
+                .consulted_axes(Some(read.subject.axis()))
+                .iter()
+                .any(|axis| !derivation.completeness.covers(*axis))
+            {
+                late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                return None;
+            }
+
+            // The ordered witness: every establishment of this subject the
+            // derivation knows, in program-point order, each with the reason it
+            // does not serve this read.
+            let mut considered: Vec<&StateEventRow> = derivation
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_class == StateEventClass::Establish && event.subject == read.subject
+                })
+                .collect();
+            considered.sort_by_key(|event| (event.point.index(), event.site.range.start_byte));
+            let witness = if considered.is_empty() {
+                "no establishment of this subject exists in the procedure".to_string()
+            } else {
+                considered
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "{} ({})",
+                            state_event_description(event),
+                            establishment_rejection(derivation, event, read, assertion.require),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            count += 1;
+            offending.push(format!(
+                "the read of {} is not {} by any establishment; considered: {witness}{}",
+                state_event_description(read),
+                assertion.require.label(),
+                if killed_before(derivation, read) {
+                    "; a kill of this subject dominates the read"
+                } else {
+                    ""
+                },
+            ));
+            locations.extend(derivation_file_location(&read.site.file));
+            for event in considered {
+                locations.extend(derivation_file_location(&event.site.file));
+            }
+        }
+    }
+
+    if !joined_any_read {
+        // "This capture reads nothing the CFG models" is a complete answer
+        // only when both event axes were enumerable across the whole file --
+        // the file-level account for a file that did not lower at all, and
+        // every procedure's own account for a procedure whose events are
+        // partial. Otherwise the absence is unknown, not proven.
+        let axes = assertion.consulted_axes(None);
+        let covered = axes.iter().all(|axis| state.completeness.covers(*axis))
+            && state.procedures.iter().all(|derivation| {
+                axes.iter()
+                    .all(|axis| derivation.completeness.covers(*axis))
+            });
+        if !covered {
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        }
+        return None;
+    }
+
+    if offending.is_empty() {
+        return None;
+    }
+    let mut violation = AssertionViolation::new(
+        "reference",
+        assertion.expectation(),
+        Some(offending.join("; ")),
+    );
+    violation.actual_count = count;
+    violation.derivation_locations = locations;
+    Some(violation)
 }
 
 fn evaluate_resolution_assert<'rows>(
@@ -2281,8 +2935,8 @@ fn ordered_candidates<'rows>(
     rows
 }
 
-fn evaluate_reaching_assert<'rows>(
-    assertion: &ReachingAssert,
+fn evaluate_binding_scope_assert<'rows>(
+    assertion: &BindingScopeAssert,
     subject: &AssertionSubject,
     ast_ids: &[&str],
     bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
@@ -2328,7 +2982,7 @@ fn evaluate_reaching_assert<'rows>(
     assert_eq!(
         binding.path.as_str(),
         subject.path.as_str(),
-        "a reaching binding must belong to the file of the occurrence it was reached from"
+        "a binding-of answer must belong to the file of the occurrence it was reached from"
     );
     assert_eq!(
         scope.path.as_str(),
@@ -2560,7 +3214,7 @@ fn assertion_related_locations(
             )?;
         }
     }
-    for location in &violation.edge_locations {
+    for location in &violation.derivation_locations {
         push(
             PolicyLocationRelationship::Evidence,
             location.clone(),
@@ -2569,7 +3223,7 @@ fn assertion_related_locations(
     }
     if let Some(binding) = violation.binding {
         push(
-            PolicyLocationRelationship::ReachingBinding,
+            PolicyLocationRelationship::BindingOf,
             binding_row_location(binding)?,
             &mut related,
         )?;

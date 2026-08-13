@@ -219,7 +219,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `scope_of` | binding, occurrence, or structural match | lexical scope | Innermost lexical scope owning the input. |
 | `scope_ancestors` | lexical scope | lexical scope | Enclosing scopes, innermost first, excluding the scope itself. |
 | `bindings_in` | lexical scope or structural match | binding | Bindings declared in the scope, or whose binder token is inside the match; accepts `kind`, `name`, and `hoisting`. |
-| `reaching_binding` | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
+| `binding_of` | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
 | `binding_occurrence` | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
 | `candidates_of` | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
 | `candidate_hierarchy` | occurrence | candidate hop | The exact hierarchy hops each traced member candidate was found through. Each row's `candidate_id` equals the `id` of the `resolution_candidate` row it belongs to, so the two domains join on that field. A depth-zero (direct) candidate emits zero hop rows, and a candidate the resolver recorded without member attribution emits none either -- zero rows is never a claim that no hierarchy was walked, and the mandatory per-occurrence outcome stays `member_selection`'s. |
@@ -231,6 +231,11 @@ Steps execute in array order and are validated before the workspace is searched:
 | `edges_of` | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
 | `edges_from` | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
 | `edge_target` | reference edge | declaration | Exact indexed target declaration of each edge. |
+| `state_events_of` | procedure or declaration | state event | Establishment, kill, and read events of bindings and properties, derived from the production CFG; accepts `event_class` and `subject`. |
+| `flow_relations_of` | state event or procedure | flow relation | Reaching-definition, dominance, and same-evaluation relations between those events, with `exact` or `may` certainty; accepts `flow_relation` and `certainty`. |
+| `flow_source` | flow relation | state event | The establishment or kill end of the relation. |
+| `flow_target` | flow relation | state event | The read end of the relation. |
+| `rewrite_paths_of` | file | rewrite path | The bounded rewrite chases the file engages in a declared finite domain, with their steps, declared bound, and terminal outcome; accepts `domain` and `rewrite_outcome`. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -392,19 +397,19 @@ The `import` object carries `local_name`, an optional `alias`, `target_segments`
 
 `scope-of` maps a binding, an occurrence or a structural match to its innermost owning scope; `scope-ancestors` walks outward from a scope, excluding the scope itself; `bindings-in` returns the bindings a scope declares. Together they answer the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body? -- as a structural query:
 
-<!-- code-query-test:json:reaching-binding -->
+<!-- code-query-test:json:binding-of -->
 ```json
 {
   "languages": ["java"],
   "occurrences": {"role": ["receiver_position"]},
   "steps": [
-    {"op": "reaching_binding"},
+    {"op": "binding_of"},
     {"op": "scope_of"}
   ]
 }
 ```
 
-`reaching_binding` returns the binding of the occurrence's name that is in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Every row it produces carries `reached_from_ast_id`, the AST identity of the occurrence the answer is about, so a caller that captured that token joins the binding back to its own capture instead of guessing; one binding reached from two occurrences is therefore two rows. When more than one binding of the name is in effect, the winner is returned alone unless `include_shadowed` is `true`, in which case the losers follow with `shadowed: true`. When no binding is in effect the answer is an empty one and complete: the name resolves to something other than a lexical binding. When the file's intervals cannot be stated the run reports `environment_derivation_incomplete` instead.
+`binding_of` returns the binding of the occurrence's name that is in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Every row it produces carries `reached_from_ast_id`, the AST identity of the occurrence the answer is about, so a caller that captured that token joins the binding back to its own capture instead of guessing; one binding reached from two occurrences is therefore two rows. When more than one binding of the name is in effect, the winner is returned alone unless `include_shadowed` is `true`, in which case the losers follow with `shadowed: true`. When no binding is in effect the answer is an empty one and complete: the name resolves to something other than a lexical binding. When the file's intervals cannot be stated the run reports `environment_derivation_incomplete` instead.
 
 `binding-occurrence` walks back from a binding to the binder-class occurrence row of its declaring token, so a binding and a capture over the same token join by `ast_id`.
 
@@ -532,6 +537,65 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
   ]
 }
 ```
+
+
+### Flow-sensitive state and flow relations
+
+`state_events_of` derives one row per establishment, kill, or read of a binding or of a property of a canonical binding base, anchored to a program point of the seed procedure's control-flow graph. `flow_relations_of` relates two of those events.
+
+<!-- code-query-test:json:state-events -->
+```json
+{
+  "languages": ["javascript"],
+  "match": {"kind": "function", "name": "handler"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "state_events_of", "event_class": ["establish", "read"], "subject": ["binding"]}
+  ]
+}
+```
+
+<!-- code-query-test:json:flow-relations -->
+```json
+{
+  "languages": ["javascript"],
+  "match": {"kind": "function", "name": "handler"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "state_events_of"},
+    {"op": "flow_relations_of", "flow_relation": ["reaching"], "certainty": ["exact"]},
+    {"op": "flow_target"}
+  ]
+}
+```
+
+`event_class` accepts `establish`, `kill`, and `read`; `subject` accepts `binding` and `property`; `flow_relation` accepts `reaching`, `dominates`, and `same_evaluation`; `certainty` accepts `exact` and `may`.
+
+The production CFG is the only evidence source. A write that appears above a read in the source but that no CFG path carries there produces no reaching row, and structural containment is never presented as any of the three relations. A reaching row is `exact` when the establishment is the only definition of its subject in the read's IN set **and** dominates the read's program point; anything else is `may`.
+
+Every row carries `completeness` (`complete` or `partial`, for that row's own axis) and, when partial, `uncovered_axes`. A partial derivation also reports `flow_state_axis_unsupported` or `flow_state_derivation_incomplete` with `incomplete` impact -- an exhausted control-flow budget emits no rows for its relation rather than a shortened set, and a file that does not lower reports the gap rather than an empty complete answer.
+
+### Bounded rewrite paths
+
+`rewrite_paths_of` enumerates the bounded chases a production analysis engaged over one file. Today one domain is declared: `rust_import_alias`, the `use <module> as <alias>` chase in the Rust resolver. Its semantic state key is the specifier's root, because the rewrite replaces only the root and the specifier grows every hop; its declared bound is the importing file's rewritable root count.
+
+<!-- code-query-test:json:rewrite-paths -->
+```json
+{
+  "languages": ["rust"],
+  "match": {"kind": "function", "name": "use_alias"},
+  "steps": [
+    {"op": "file_of"},
+    {"op": "rewrite_paths_of", "domain": ["rust_import_alias"], "rewrite_outcome": ["cycle"]}
+  ]
+}
+```
+
+`domain` accepts `rust_import_alias`; `rewrite_outcome` accepts `converged`, `cycle`, and `exceeded_budget`.
+
+Each row carries `declared_bound`, `step_count`, and the ordered `steps` (`state_key`, `input`, `output`, `rule`), so a reader can replay the chase. The outcome's own payload travels with it: `fixed_point` for `converged`, the ordered `witness` for `cycle` (its last state repeats its first and closes the loop), and `explored` for `exceeded_budget`. The three are distinct claims -- a cycle is a concrete counterexample, while budget exhaustion is absence of evidence and must never be read as either a cycle or a convergence.
+
+A file no declared domain applies to answers empty and complete. A derivation that could not run -- a cancelled query, a workspace without the domain's analyzer -- reports `rewrite_domain_unsupported` or `rewrite_path_derivation_incomplete` with `incomplete` impact instead.
 
 ### Qualified paths and their segments
 

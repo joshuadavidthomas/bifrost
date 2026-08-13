@@ -615,10 +615,10 @@ fn validate_wrapper(
             EnvironmentOptionKind::Candidate,
             analysis,
         ),
-        RqlForm::ReachingBinding => validate_environment_options(
+        RqlForm::BindingOf => validate_environment_options(
             form,
             &args[..args.len().saturating_sub(1)],
-            EnvironmentOptionKind::ReachingBinding,
+            EnvironmentOptionKind::BindingOf,
             analysis,
         ),
         RqlForm::DeclarationStateOf => validate_environment_options(
@@ -629,6 +629,9 @@ fn validate_wrapper(
         ),
         RqlForm::EdgesOf | RqlForm::EdgesFrom => {
             validate_edge_wrapper(form, args, query, analysis);
+        }
+        RqlForm::StateEventsOf | RqlForm::FlowRelationsOf | RqlForm::RewritePathsOf => {
+            validate_constrained_option_wrapper(form, args, query, analysis);
         }
         RqlForm::SegmentsOf => {
             validate_segments_of_options(&args[..args.len().saturating_sub(1)], analysis);
@@ -643,6 +646,8 @@ fn validate_wrapper(
         | RqlForm::StubsOf
         | RqlForm::ExportTarget
         | RqlForm::EdgeTarget
+        | RqlForm::FlowSource
+        | RqlForm::FlowTarget
         | RqlForm::SegmentTarget
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
@@ -1305,6 +1310,128 @@ fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
     }
 }
 
+/// Validate the option pairs of the wrappers whose options are lists of
+/// constrained labels: `(state-events-of ...)`, `(flow-relations-of ...)` and
+/// `(rewrite-paths-of ...)`.
+///
+/// Every accepted spelling, every allowed value, and every help string is read
+/// from the schema registry, so a vocabulary change cannot leave the editor
+/// surface behind. An unknown value reports the whole allowed set, on the
+/// value's own range, which is what a validation-range diagnostic is for.
+fn validate_constrained_option_wrapper(
+    form: RqlForm,
+    args: &[Expr],
+    query: &Expr,
+    analysis: &mut Analysis,
+) {
+    let op = form
+        .query_step_op()
+        .expect("constrained-option wrappers declare a query step");
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            format!(
+                "{} expects option/value pairs followed by a query",
+                form.label()
+            ),
+        );
+        return;
+    }
+
+    let accepted = op
+        .options()
+        .iter()
+        .flat_map(|option| option.rql_labels().iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let key = &pair[0];
+        let value = &pair[1];
+        let Some(label) = key.as_symbol() else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                format!("{} option names must be keywords", form.label()),
+            );
+            continue;
+        };
+        let Some(option) = op.option_for_rql_label(label) else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                format!("{} accepts only {accepted}", form.label()),
+            );
+            continue;
+        };
+        if !seen.insert(option.field()) {
+            analysis.error(
+                key.range.clone(),
+                "duplicate-property",
+                format!("duplicate {} option '{label}'", form.label()),
+            );
+            continue;
+        }
+        let allowed = constrained_step_option_labels(option.field());
+        analysis.add_help(
+            key.range.clone(),
+            option.field().signature(),
+            option.field().description(),
+        );
+        validate_constrained_label_vector(value, option.field().label(), &allowed, analysis);
+    }
+}
+
+/// Validate one vector of constrained labels, reporting the allowed set on the
+/// offending value's own range.
+fn validate_constrained_label_vector(
+    value: &Expr,
+    noun: &str,
+    allowed: &[&'static str],
+    analysis: &mut Analysis,
+) {
+    let ExprKind::Vector(items) = &value.kind else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+        return;
+    };
+    if items.is_empty() {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+    }
+    for item in items {
+        let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+            analysis.error(
+                item.range.clone(),
+                "wrong-value-shape",
+                format!("{noun} must be a symbol"),
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if !allowed.contains(&canonical.as_str()) {
+            analysis.error(
+                item.range.clone(),
+                "invalid-query-step-option",
+                format!(
+                    "unknown {noun} '{label}'; expected one of {}",
+                    allowed.join(", ")
+                ),
+            );
+        }
+    }
+}
+
 /// Validate one vector of constrained labels against a vocabulary.
 fn validate_rql_label_vector<T>(
     value: &Expr,
@@ -1785,6 +1912,12 @@ fn validate_property_value(
         | super::schema::ValueShape::UsageKindList
         | super::schema::ValueShape::OwnerRelationList
         | super::schema::ValueShape::SiteClassList
+        | super::schema::ValueShape::StateEventClassList
+        | super::schema::ValueShape::FlowSubjectKindList
+        | super::schema::ValueShape::FlowRelationList
+        | super::schema::ValueShape::FlowCertaintyList
+        | super::schema::ValueShape::RewriteDomainList
+        | super::schema::ValueShape::RewriteOutcomeList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter
         | super::schema::ValueShape::PathFilter

@@ -550,7 +550,7 @@ export interface RqlBindingResult extends RqlQueryResultBase {
   source_order: number;
   visibility: string;
   import?: RqlImportBinder;
-  /** True only for rows a `reaching-binding :include-shadowed` emitted as losers. */
+  /** True only for rows a `binding-of :include-shadowed` emitted as losers. */
   shadowed?: boolean;
 }
 

@@ -44,7 +44,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::DeclarationState { .. }
                 | CodeQueryResultValue::ReferenceEdge { .. } => None,
                 CodeQueryResultValue::QualifiedPath { .. }
-                | CodeQueryResultValue::PathSegment { .. } => None,
+                | CodeQueryResultValue::PathSegment { .. }
+                | CodeQueryResultValue::StateEvent { .. }
+                | CodeQueryResultValue::FlowRelation { .. }
+                | CodeQueryResultValue::RewritePath { .. } => None,
             })
             .collect()
     }
@@ -664,6 +667,102 @@ impl CodeQueryResult {
                             value.owner_relation,
                             value.generation,
                         ));
+                    }
+                    CodeQueryResultValue::StateEvent { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [state_event; {}; {}{}]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.event_class,
+                            value.subject,
+                            match &value.member {
+                                Some(member) => format!(".{member}"),
+                                None => String::new(),
+                            },
+                        ));
+                        out.push_str(&format!(
+                            "  point {}, value {}, {}, generation {}\n",
+                            value.program_point, value.value, value.completeness, value.generation,
+                        ));
+                        if !value.uncovered_axes.is_empty() {
+                            out.push_str(&format!(
+                                "  uncovered axes: {}\n",
+                                value.uncovered_axes.join(", ")
+                            ));
+                        }
+                    }
+                    CodeQueryResultValue::FlowRelation { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [flow_relation; {}; {}] {} -> {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.relation,
+                            value.certainty,
+                            value.source.event_class,
+                            value.target.event_class,
+                        ));
+                        out.push_str(&format!(
+                            "  source {}:{} point {}, target {}:{} point {}\n",
+                            value.source.path,
+                            value.source.range.start_line,
+                            value.source.program_point,
+                            value.target.path,
+                            value.target.range.start_line,
+                            value.target.program_point,
+                        ));
+                        out.push_str(&format!(
+                            "  {}, generation {}\n",
+                            value.completeness, value.generation
+                        ));
+                        if !value.uncovered_axes.is_empty() {
+                            out.push_str(&format!(
+                                "  uncovered axes: {}\n",
+                                value.uncovered_axes.join(", ")
+                            ));
+                        }
+                    }
+                    CodeQueryResultValue::RewritePath { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [rewrite_path; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.domain,
+                            value.outcome,
+                            value.origin_specifier,
+                        ));
+                        out.push_str(&format!(
+                            "  {} of {} steps, generation {}\n",
+                            value.step_count, value.declared_bound, value.generation,
+                        ));
+                        for step in &value.steps {
+                            out.push_str(&format!(
+                                "  [{}] {} -> {} ({})\n",
+                                step.state_key, step.input, step.output, step.rule,
+                            ));
+                        }
+                        if let Some(fixed_point) = &value.fixed_point {
+                            out.push_str(&format!("  fixed point: {fixed_point}\n"));
+                        }
+                        if !value.witness.is_empty() {
+                            out.push_str(&format!(
+                                "  cycle witness: {}\n",
+                                value.witness.join(" -> ")
+                            ));
+                        }
+                        if let Some(explored) = value.explored {
+                            out.push_str(&format!(
+                                "  explored {explored} steps before the bound\n"
+                            ));
+                        }
+                        if !value.uncovered_domains.is_empty() {
+                            out.push_str(&format!(
+                                "  uncovered domains: {}\n",
+                                value.uncovered_domains.join(", ")
+                            ));
+                        }
                     }
                     CodeQueryResultValue::QualifiedPath { value } => {
                         out.push_str(&format!(

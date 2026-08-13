@@ -297,6 +297,30 @@ pub enum CodeQueryResultRef {
         target_fq_name: String,
         provenance: &'static str,
     },
+    StateEvent {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        event_class: &'static str,
+    },
+    FlowRelation {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        procedure_id: String,
+        relation: &'static str,
+        certainty: &'static str,
+    },
+    RewritePath {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        domain: &'static str,
+        outcome: &'static str,
+    },
     QualifiedPath {
         id: String,
         ast_id: String,

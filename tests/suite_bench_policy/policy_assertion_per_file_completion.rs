@@ -9,7 +9,7 @@
 //!
 //! The rule under test is the checked-in candidate
 //! `tests/fixtures/policies/loop-invariant-receiver.rqlp`, whose
-//! `assert-reaching` exercises the occurrence, reaching-binding and
+//! `assert-binding-scope` exercises the occurrence, binding-of and
 //! lexical-scope families at once.
 
 use std::sync::Arc;
