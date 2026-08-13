@@ -14,7 +14,7 @@ The reference differential deliberately probes more syntax than the normal analy
 - [x] (2026-08-13 22:03Z) Implemented shared Rust declaration and binding-role exclusion plus canonical adjudicated diagnostics for proven lexical answers.
 - [x] (2026-08-13 22:03Z) Made Rust same-file tier evidence respect the reference namespace and the structured owner of scoped paths.
 - [x] (2026-08-13 22:03Z) Passed focused tests, all Rust crate tests, both affected crate clippy checks, dependency checks, exact replays, and the complete serde-json census comparison.
-- [ ] Commit the implementation and plan, push master without waiting for the full CI report, and close #2036 with exact evidence.
+- [x] (2026-08-13 22:09Z) Committed as `c8a8dce74`, published via merge head `b42e383df`, attached exact evidence, and closed #2036 without waiting for full CI.
 
 ## Surprises & Discoveries
 
@@ -62,7 +62,7 @@ The final featureless release replay audited all 39 serde-json Rust files with n
 - Four unit wildcard variants remain tier-2 Missing; the two tuple wildcard variants remain in the other actionable residue, preserving all six #2032 witnesses.
 - The macro-token residue remains visible for #1895. One token-tree occurrence is now inconclusive because the lexical index independently proves it is the local `ser` binding; the remaining 26 macro rows stay actionable.
 
-The release report is `/tmp/issue-2036-serde-final-2.jsonl`; the coordinate join is `/tmp/issue-2036-final-comparison-2.tsv`. Commit, push, and issue closure remain to be recorded after publication.
+The release report is `/tmp/issue-2036-serde-final-2.jsonl`; the coordinate join is `/tmp/issue-2036-final-comparison-2.tsv`. The implementation was committed as `c8a8dce74`, published via merge head `b42e383df`, documented in issue comment `#issuecomment-5286973760`, and #2036 was closed as completed.
 
 ## Context and Orientation
 
@@ -128,3 +128,5 @@ No dependency changes are required. At completion, `crates/bifrost-analysis/src/
 Plan revision note (2026-08-13): Initial self-contained plan created after issue, code, and preserved-ledger audit. The design uses existing Rust AST and reference-context facts so the fix corrects grading evidence rather than hiding unresolved sites.
 
 Plan revision note (2026-08-13 22:03Z): Updated after implementation and final corpus validation. Added the enum-variant declaration-node distinction, the macro-token preservation decision, exact test results, and the historical occurrence-key comparison required by the bounded sample heap.
+
+Plan revision note (2026-08-13 22:35Z): Recorded the earlier commit, push, evidence comment, and issue closure after noticing the publication checkbox remained stale.
