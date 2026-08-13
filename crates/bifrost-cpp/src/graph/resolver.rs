@@ -8300,6 +8300,19 @@ pub fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
+/// Whether `file` is proven to use plain-C source semantics.
+///
+/// `Language::Cpp` intentionally serves both C and C++. Headers do not carry a
+/// compilation dialect on their own, so only an exact `.c` source extension is
+/// sufficient to reinterpret C++-grammar keyword nodes such as `this` as C
+/// identifiers.
+pub fn is_c_source_file(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c")
+}
+
 pub fn is_declarator_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),

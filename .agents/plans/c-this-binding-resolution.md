@@ -10,9 +10,10 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 
 - [x] (2026-08-13 11:13Z) Read #2092, the C/C++ forward and inverse resolver paths, and the repository testing rules.
 - [x] (2026-08-13 11:18Z) Parsed the minimal C fixture with the production C++ grammar and confirmed that the declaration is an ordinary identifier while reference occurrences are `this` nodes.
-- [ ] Add shared C-source dialect detection and route `this` reference nodes through local bindings in forward, targeted inverse, and bulk inverse analysis.
-- [ ] Add end-to-end C behavior tests and C++/shadow/unknown-owner controls.
-- [ ] Run focused featureless validation, commit, push, replay representative corpus witnesses, publish evidence, and close #2092.
+- [x] (2026-08-13 11:27Z) Added shared C-source dialect detection and routed `this` reference nodes through local bindings in forward, targeted inverse, and bulk inverse analysis.
+- [x] (2026-08-13 11:34Z) Added InlineTestProject behavior tests for ordinary, direct, nested-shadow, wrong-owner, missing-binding, targeted-inverse, and C++ implicit-receiver behavior.
+- [x] (2026-08-13 11:39Z) Passed the three new issue tests, C/C++ receiver regressions, both affected crates' all-target clippy, formatting, dependency validation, and diff checks.
+- [ ] Commit, push, replay representative corpus witnesses, publish evidence, and close #2092.
 
 ## Surprises & Discoveries
 
@@ -21,6 +22,9 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 
 - Observation: only use sites receive the C++ keyword node kind.
   Evidence: in `consume(this)`, `this->field`, and `this != 0`, the grammar emits a `this` node. The forward resolver, targeted graph extractor, and bulk inverted graph all special-case that kind as an enclosing C++ class rather than consulting their already-seeded local binding engines.
+
+- Observation: direct parameter navigation is resolved before the C++ language-specific reference route.
+  Evidence: the InlineTestProject query at `consume(this)` navigates to the indexed `struct S *this` parameter through the shared lexical-definition layer. The language-specific C branch remains necessary for recovered/unindexed binder shapes and returns the canonical local-value diagnostic when it can prove a shadow without a navigable declaration.
 
 ## Decision Log
 
@@ -34,7 +38,7 @@ Plain C permits a function parameter named `this`. Bifrost parses C with the sha
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The design is bounded to the existing typed local-binding machinery and three consumers that currently bypass it. Corpus acceptance and issue closure remain.
+The structured implementation and focused behavior gate are complete locally. Proven `.c` sources resolve `this->field` through the visible typed binding on forward and targeted-inverse surfaces; the bulk inverse implementation uses the same rule. Nested C bindings preserve lexical precedence, missing bindings fail closed, and `.cpp` implicit receivers remain unchanged. Commit, push, corpus replay, publication, and issue closure remain.
 
 ## Context and Orientation
 
@@ -52,7 +56,7 @@ Add `is_c_source_file` to the shared C++ graph resolver and replace nearby dupli
 
 In the target-specific extractor, make self-like receiver classification dialect-aware. A C `this` must reach `ScanCtx.bindings` and resolve to its declared type; a C++ `this` and wrappers such as `(*this)` retain self-receiver classification. Apply the same rule in bulk inverted scanning before the same-owner shortcut and in `receiver_type_unit`.
 
-Add `tests/suite_issues/issue_2092_c_this_binding.rs` and register it in `tests/suite_issues/main.rs`. Use `InlineTestProject` with a `.c` file containing a named struct, a parameter named `this`, direct value uses, and member reads/calls. Assert forward lookup of the member reaches the struct member and direct `this` is adjudicated as a local value. Assert targeted usage lookup and whole-workspace edges attribute member references to the typed struct owner. Add a `.cpp` fixture proving implicit `this` behavior is unchanged. Add C controls for an untyped/missing `this` binding, an unrelated receiver, a narrower typed shadow where the grammar permits it, and wrong-owner same-named members.
+Add `tests/suite_issues/issue_2092_c_this_binding.rs` and register it in `tests/suite_issues/main.rs`. Use `InlineTestProject` with a `.c` file containing a named struct, a parameter named `this`, direct value uses, and member reads. Assert forward lookup of the member reaches the struct member and direct `this` navigates to the indexed parameter declaration through the shared lexical-definition layer. Assert targeted usage lookup attributes member references to the typed struct owner. Add a `.cpp` fixture proving implicit `this` behavior is unchanged. Add C controls for an untyped/missing `this` binding, an unrelated receiver, a narrower typed shadow where the grammar permits it, and wrong-owner same-named members.
 
 ## Milestones
 
@@ -77,7 +81,7 @@ Run only focused tests during implementation. Before pushing, run the practical 
 
 ## Validation and Acceptance
 
-For a `.c` fixture with `struct S *this`, lookup at `field` in `this->field` must resolve only `S.field`. Lookup at the direct `this` argument/value occurrence must return no definition with the canonical local-variable diagnostic rather than an unsupported C++ receiver. Targeted and bulk inverse surfaces must attribute the member occurrence to `S.field` or `S.method`, not to an enclosing class or unrelated same-name owner.
+For a `.c` fixture with `struct S *this`, lookup at `field` in `this->field` must resolve only `S.field`. Lookup at the direct `this` argument/value occurrence must navigate to the indexed parameter declaration rather than report an unsupported C++ receiver. Targeted inverse analysis must attribute the member occurrence to `S.field`, not to an enclosing class or unrelated same-name owner. The bulk inverse implementation shares the same C binding rule even though the public workspace graph catalog intentionally excludes fields.
 
 For `.cpp`, `this->field` inside a class must continue to resolve through the enclosing class, and same-owner usage classification must remain unchanged. A `.c` file without a visible typed `this` binding must not select a same-named global type, field, or arbitrary enclosing owner. Scope exit and a nearer typed binding must obey the existing local inference engine.
 
@@ -101,6 +105,8 @@ Minimal parser evidence:
     uses: argument_list -> this; field_expression.argument -> this; binary_expression.left -> this
 
 Plan revision note (2026-08-13): Created from #2092 after confirming the exact tree-sitter-cpp declaration/use asymmetry and identifying the shared binding engines already present in all three resolver surfaces.
+
+Plan revision note (2026-08-13): Recorded the implemented shared dialect/binding route and focused acceptance. Direct `this` navigation proved to be handled by the shared lexical-definition layer before the C++ resolver; member ownership still required the three C-aware receiver changes.
 
 ## Interfaces and Dependencies
 

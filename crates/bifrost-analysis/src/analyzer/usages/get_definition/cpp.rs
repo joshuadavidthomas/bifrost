@@ -25,7 +25,9 @@ use brokk_bifrost_cpp::call_match::{
     cpp_signature_param_types, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
     normalize_cpp_type_name,
 };
-use brokk_bifrost_cpp::graph::resolver::{cpp_alias_declaration_target_text, same_logical_symbol};
+use brokk_bifrost_cpp::graph::resolver::{
+    cpp_alias_declaration_target_text, is_c_source_file, same_logical_symbol,
+};
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 
@@ -269,6 +271,27 @@ pub(super) fn resolve_cpp<'a>(
             ),
         );
     };
+    if node.kind() == "this" && is_c_source_file(file) {
+        let support = context.bounded_support();
+        let ctx = CppLookupCtx {
+            analyzer,
+            support,
+            file,
+            visibility: visibility.as_ref(),
+            source,
+            root,
+            class_ranges: Some(class_ranges.as_ref()),
+        };
+        let bindings = cpp_local_bindings_before(ctx, node, node.start_byte());
+        return if bindings.is_shadowed("this") {
+            no_definition("local_variable_reference", "`this` is a local C value")
+        } else {
+            no_definition(
+                "no_indexed_definition",
+                "C `this` has no visible local binding",
+            )
+        };
+    }
     let reference = cpp_reference_node(node);
     if let Some(CppReferenceNode::Type(type_node)) = reference {
         if cpp_type_node_is_unqualified_name(type_node)
@@ -6430,6 +6453,26 @@ fn cpp_receiver_type_units(
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
+            let name = cpp_node_text(receiver, ctx.source);
+            if let Some(bindings) = seeded_bindings {
+                return cpp_identifier_receiver_type_units(
+                    ctx,
+                    receiver,
+                    name,
+                    bindings,
+                    unwrap_template_alias,
+                );
+            }
+            let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
+            cpp_identifier_receiver_type_units(
+                ctx,
+                receiver,
+                name,
+                &bindings,
+                unwrap_template_alias,
+            )
+        }
+        "this" if is_c_source_file(ctx.file) => {
             let name = cpp_node_text(receiver, ctx.source);
             if let Some(bindings) = seeded_bindings {
                 return cpp_identifier_receiver_type_units(

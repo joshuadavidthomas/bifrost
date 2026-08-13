@@ -5265,7 +5265,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         }
         match explicit_receiver_target_resolution(receiver, ctx) {
-            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver) => {
+            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver, ctx.file) => {
                 push_self_receiver_hit(operator, ctx);
             }
             MethodReceiverTargetResolution::Target => push_hit(operator, ctx),
@@ -5323,7 +5323,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match call_function_target_resolution(function, ctx) {
         MethodReceiverTargetResolution::Target
-            if call_function_has_direct_self_receiver(function) =>
+            if call_function_has_direct_self_receiver(function, ctx.file) =>
         {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
@@ -6322,9 +6322,15 @@ fn receiver_type_units_with_budget(
                     .into_iter()
                     .collect();
             }
-            "this" => {
-                break enclosing_context(current, ctx).owner.into_iter().collect();
+            "this" if is_c_source_file(ctx.file) => {
+                let name = node_text(current, source);
+                let local = ctx.bindings.resolve_symbol(name);
+                if let Some(bindings) = local.as_precise() {
+                    break receiver_units_from_bindings(current, bindings, ctx);
+                }
+                return Vec::new();
             }
+            "this" => break enclosing_context(current, ctx).owner.into_iter().collect(),
             "qualified_identifier" | "scoped_identifier" => {
                 let reference = node_text(current, source);
                 let fields = ctx
@@ -6770,7 +6776,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
             .is_some_and(|receiver| {
-                receiver_is_self_like(receiver) && same_owner_context(receiver, ctx)
+                receiver_is_self_like(receiver, ctx.file) && same_owner_context(receiver, ctx)
                     || receiver_type_units(receiver, ctx.source, ctx)
                         .iter()
                         .any(|target| {
@@ -6784,7 +6790,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_matches_target(child, ctx)),
-        "identifier" => ctx
+        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
@@ -6805,7 +6811,7 @@ fn declaring_owner_for_explicit_receiver(
     receiver: Node<'_>,
     ctx: &ScanCtx<'_>,
 ) -> EnclosingMemberOwnerResolution {
-    if receiver_is_self_like(receiver) {
+    if receiver_is_self_like(receiver, ctx.file) {
         return EnclosingMemberOwnerResolution::Missing;
     }
     let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
@@ -7001,24 +7007,24 @@ fn visible_target_peer_matches_owner(
             })
 }
 
-fn receiver_is_self_like(node: Node<'_>) -> bool {
+fn receiver_is_self_like(node: Node<'_>, file: &ProjectFile) -> bool {
     match node.kind() {
-        "this" => true,
+        "this" => !is_c_source_file(file),
         "pointer_expression" | "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
-            .is_some_and(receiver_is_self_like),
+            .is_some_and(|inner| receiver_is_self_like(inner, file)),
         _ => false,
     }
 }
 
-fn call_function_has_direct_self_receiver(function: Node<'_>) -> bool {
+fn call_function_has_direct_self_receiver(function: Node<'_>, file: &ProjectFile) -> bool {
     match function.kind() {
         "field_expression" => function
             .child_by_field_name("argument")
             .or_else(|| function.child_by_field_name("object"))
-            .is_some_and(receiver_is_self_like),
-        _ => receiver_is_self_like(function),
+            .is_some_and(|receiver| receiver_is_self_like(receiver, file)),
+        _ => receiver_is_self_like(function, file),
     }
 }
 
@@ -7044,7 +7050,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_has_known_non_target(child, ctx)),
-        "identifier" => ctx
+        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
