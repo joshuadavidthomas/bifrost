@@ -14,7 +14,7 @@ After this change, PHP find-references and whole-workspace usage graphs will und
 - [x] (2026-08-13 17:15Z) Added targeted and whole-workspace behavior coverage with positive free/scoped/relative calls and typed/dynamic near misses.
 - [x] (2026-08-13 17:20Z) Passed formatting, focused PHP regressions, the workspace dependency check, and PHP/PHP-analysis clippy.
 - [x] (2026-08-13 17:25Z) Rebuilt the release differential runner and replayed representative Ramsey, php-code-coverage, MathPHP, and Respect witnesses; all four are consistent exact inverse hits with zero actionable findings.
-- [ ] Commit, push, comment exact evidence on #2026, and close the issue.
+- [x] (2026-08-13 17:35Z) Committed as `f354af7e`, merged the intervening release-version correction, revalidated at the merged head, pushed `4bc3f7b5` to `master`, commented exact evidence, and closed #2026.
 
 ## Surprises & Discoveries
 
@@ -141,3 +141,5 @@ No new crate or third-party dependency is required. `brokk-bifrost-php` already 
 Revision note (2026-08-13 16:30Z): Created this self-contained plan after confirming #2026's direct-call receiver gap, the duplicated assignment-only implementations, the callable-facts precedence, and the targeted plus whole-workspace acceptance surfaces.
 
 Revision note (2026-08-13 17:25Z): Recorded the completed shared implementation, the parenthesized-assignment parity discovery, focused validation, and four exact production replay hashes.
+
+Revision note (2026-08-13 17:35Z): Recorded the pushed commit, post-merge validation, GitHub evidence comment, and issue closure.
