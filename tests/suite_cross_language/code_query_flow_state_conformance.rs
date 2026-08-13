@@ -633,78 +633,104 @@ fn flow_state_js_shadow_rebind_kills_the_outer_establishment() {
     }
 }
 
-/// Acceptance (Milestone 3), for mined commit `edb00e017` -- and an *honest
-/// negative*, not a green claim.
+/// Acceptance (Milestone 3), for mined commit `edb00e017` -- the positive
+/// assertion #2013 turned on.
 ///
 ///     (state-events-of (procedure-of (function :name "rangeSelfBinder")))
 ///
-/// The intended shape is a same-evaluation relation between the `for x := range
-/// x` binder and the iterable that names it. Milestone 2 discovered that Bifrost
-/// cannot derive it: the Go lowering introduces the `:=` range binder as a
-/// `Local` value but publishes **no assignment instruction for it**
-/// (`crates/bifrost-analysis/src/analyzer/go/semantic.rs`, `range_loop`
-/// schedules binder runtime nodes only for the `=` form). The same probe showed
-/// `total += x` publishes no assignment effect either, so a compound write is
-/// invisible to the kill set.
-///
-/// This is an adapter gap, and the derivation says so instead of fabricating
-/// the row: a `Local` with no establishment yields
-/// `FlowStateIncompleteReason::BindingWithoutEstablishment`, which uncovers the
-/// binding-events, reaching and same-evaluation axes for the procedure. This
-/// test asserts exactly that typed outcome reaches RQL. It becomes the positive
-/// same-evaluation assertion once the Go adapter publishes the binder
-/// assignment; the plan files that follow-up in Milestone 6.
+/// The Go lowering now publishes an assignment effect for the `:=` range
+/// binder and for the compound write, so the derivation carries the mined
+/// shape end to end: the binder is an establishment of a new `x` whose value
+/// depends on the iterable, so the read of the outer `x` relates to the binder
+/// as same-evaluation -- the relation that states the binder is not visible
+/// inside its own right-hand side. `total += x` is a write of `total`, so it
+/// carries an establishment, and `total`'s two establishments each carry a
+/// kill. The shadowing binder has exactly one establishment, so it must not
+/// kill anything -- the outer `x` is a different subject entirely.
 #[test]
-fn flow_state_go_range_binder_reports_the_adapter_gap_rather_than_a_relation() {
+fn flow_state_go_range_binder_establishes_and_relates_as_same_evaluation() {
     let files = go_files(GO_RANGE_SELF_BINDER);
     let value = run_rql(
         &files,
         r#"(state-events-of (procedure-of (function :name "rangeSelfBinder")))"#,
     );
     let events = rows_of(&value, "state_event");
-    assert!(
-        !events.is_empty(),
-        "the Go procedure still lowers and still yields state events; got {value}"
-    );
-    let uncovered: Vec<&str> = events
+    let establishes: Vec<&Value> = events
         .iter()
-        .filter_map(|event| event["uncovered_axes"].as_array())
-        .flatten()
-        .filter_map(Value::as_str)
+        .copied()
+        .filter(|event| event["event_class"] == "establish")
+        .collect();
+    let binder = establishes
+        .iter()
+        .find(|event| event["range"]["start_line"] == json!(5))
+        .unwrap_or_else(|| panic!("the `:=` range binder must be an establishment; got {value}"));
+    let compound = establishes
+        .iter()
+        .find(|event| event["range"]["start_line"] == json!(6))
+        .unwrap_or_else(|| panic!("`total += x` must be an establishment; got {value}"));
+    assert_eq!(binder["subject"], "binding", "{value}");
+    assert_eq!(compound["subject"], "binding", "{value}");
+    assert_ne!(
+        binder["subject_value"], compound["subject_value"],
+        "the shadowing `x` and `total` are distinct subjects; got {value}"
+    );
+    let kills: Vec<&Value> = events
+        .iter()
+        .copied()
+        .filter(|event| event["event_class"] == "kill")
         .collect();
     assert!(
-        uncovered.contains(&"same_evaluation_relation"),
-        "the Go range binder gap must uncover the same-evaluation axis rather \
-         than being reported as an absent relation; got {value}"
-    );
-    assert!(
-        events
+        kills
             .iter()
-            .any(|event| event["completeness"] == "partial"),
-        "a derivation with an unestablished local must not call itself complete; got {value}"
+            .any(|kill| kill["subject_value"] == compound["subject_value"]),
+        "`total` has two establishments, so each write must carry a kill; got {value}"
     );
-    let codes: Vec<&str> = value["diagnostics"]
-        .as_array()
-        .map(|diagnostics| {
-            diagnostics
-                .iter()
-                .filter_map(|diagnostic| diagnostic["code"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
     assert!(
-        codes.iter().any(|code| code.starts_with("flow_state_")),
-        "the gap must surface as a typed flow-state diagnostic; got {value}"
+        kills
+            .iter()
+            .all(|kill| kill["subject_value"] != binder["subject_value"]),
+        "the binder has one establishment and must not kill the outer `x`; got {value}"
     );
-    let no_same_evaluation = run_rql(
+    for event in &events {
+        assert_eq!(
+            event["completeness"], "complete",
+            "the binding-event axis is fully enumerated; got {value}"
+        );
+        let uncovered: Vec<&str> = event["uncovered_axes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !uncovered.contains(&"binding_events"),
+            "no adapter gap remains on the binding axis; got {value}"
+        );
+    }
+    let same_evaluation = run_rql(
         &files,
         r#"(flow-relations-of :relation [same-evaluation]
              (state-events-of (procedure-of (function :name "rangeSelfBinder"))))"#,
     );
+    let relations = rows_of(&same_evaluation, "flow_relation");
     assert!(
-        rows_of(&no_same_evaluation, "flow_relation").is_empty(),
-        "the relation genuinely cannot be derived today; its absence is reported, \
-         not claimed as proven; got {no_same_evaluation}"
+        relations.iter().any(|relation| {
+            relation["source"]["event_class"] == "establish"
+                && relation["source"]["range"]["start_line"] == json!(5)
+                && relation["target"]["event_class"] == "read"
+                && relation["target"]["range"]["start_line"] == json!(5)
+        }),
+        "the binder's establishment must relate to the outer `x` read of its own \
+         evaluation as same-evaluation; got {same_evaluation}"
+    );
+    assert!(
+        relations.iter().any(|relation| {
+            relation["source"]["range"]["start_line"] == json!(6)
+                && relation["target"]["event_class"] == "read"
+                && relation["target"]["range"]["start_line"] == json!(6)
+        }),
+        "the compound write's establishment must relate to its own operand reads; \
+         got {same_evaluation}"
     );
 }
 

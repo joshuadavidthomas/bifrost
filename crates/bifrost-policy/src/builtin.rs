@@ -65,6 +65,12 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
             "../policy-packs/bifrost.code-smells/policies/expensive-operation-in-nested-loop.rqlp"
         ),
     ),
+    (
+        "policies/rayon-in-blocking-lazy-init.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.code-smells/policies/rayon-in-blocking-lazy-init.rqlp"
+        ),
+    ),
 ];
 
 static BUILT_IN_CATALOG: OnceLock<BuiltInPolicyCatalog> = OnceLock::new();
@@ -405,7 +411,7 @@ mod tests {
     #[test]
     fn checked_in_catalog_is_internally_consistent() {
         let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        assert_eq!(catalog.manifest().policies.len(), 12);
+        assert_eq!(catalog.manifest().policies.len(), 13);
         assert_eq!(
             catalog
                 .select(&BuiltInPolicySelection {
@@ -414,7 +420,7 @@ mod tests {
                 })
                 .expect("select pack")
                 .len(),
-            12
+            13
         );
     }
 }

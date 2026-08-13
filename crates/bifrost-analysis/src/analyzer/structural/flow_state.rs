@@ -1594,13 +1594,15 @@ func rangeSelfBinder(x []int) int {
 }
 "#;
 
-    /// The `edb00e017` shape. The Go lowering introduces the range binder as a
-    /// local but publishes no establishment instruction for it, so this layer
-    /// reports the hole instead of inventing a relation: the binder is an
-    /// unestablished local, and the three axes that would need its
-    /// establishment are uncovered.
+    /// The `edb00e017` shape, positive since #2013. The Go lowering publishes
+    /// an establishment for the `:=` range binder whose value is derived from
+    /// the iterable, so the outer `x` read of the binder's own right-hand side
+    /// relates to it as same-evaluation, and the compound write consumes its
+    /// operand reads the same way. The binding-events axis is fully
+    /// enumerated; the same-evaluation axis stays uncovered because the range
+    /// mechanics honestly publish a `Calls` gap.
     #[test]
-    fn the_go_range_self_binder_reports_an_unestablished_binding() {
+    fn the_go_range_self_binder_establishes_and_relates_as_same_evaluation() {
         let fixture = Fixture::new(
             Language::Go,
             &[("go.mod", GO_MOD), ("app.go", GO_RANGE_SELF_BINDER)],
@@ -1610,22 +1612,30 @@ func rangeSelfBinder(x []int) int {
             spelling(GO_RANGE_SELF_BINDER, event) == "total := 0"
         });
         assert!(
-            derivation
-                .completeness
-                .reasons()
-                .iter()
-                .any(|reason| matches!(
+            !derivation.completeness.reasons().iter().any(|reason| {
+                matches!(
                     reason,
-                    FlowStateIncompleteReason::BindingWithoutEstablishment { bindings } if *bindings >= 1
-                )),
-            "the range binder has no establishment; got {:?}",
+                    FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
+                )
+            }),
+            "the range binder is established; got {:?}",
             derivation.completeness
         );
-        assert!(!derivation.completeness.covers(FlowStateAxis::BindingEvents));
+        assert!(derivation.completeness.covers(FlowStateAxis::BindingEvents));
+        let same = relation_spellings(
+            GO_RANGE_SELF_BINDER,
+            derivation,
+            FlowRelation::SameEvaluation,
+        );
         assert!(
-            !derivation
-                .completeness
-                .covers(FlowStateAxis::SameEvaluationRelation)
+            same.iter()
+                .any(|(write, _, certainty)| *write == "x" && *certainty == FlowCertainty::Exact),
+            "the binder must relate to the outer `x` read of its own iterable; got {same:?}"
+        );
+        assert!(
+            same.contains(&("total += x", "total", FlowCertainty::Exact))
+                && same.contains(&("total += x", "x", FlowCertainty::Exact)),
+            "the compound write consumes its own operand reads; got {same:?}"
         );
     }
 

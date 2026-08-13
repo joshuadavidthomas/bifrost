@@ -133,10 +133,9 @@ function partialButIrrelevant() {
 }
 "#;
 
-/// Mined commit `edb00e017`: `for x := range x`. Milestone 2 found that the Go
-/// lowering publishes no assignment instruction for the `:=` range binder, so
-/// the axes this assert reads are uncovered and the honest verdict is
-/// inconclusive -- never a pass and never a finding.
+/// Mined commit `edb00e017`: `for x := range x`. Since #2013 the Go lowering
+/// publishes the binder and compound-write establishments; the assert below
+/// stays inconclusive on the earlier occurrence-role axis (#1724).
 const GO_RANGE_SELF_BINDER: &str = r#"package app
 
 func rangeSelfBinder(x []int) int {
@@ -545,11 +544,21 @@ fn a_gap_on_an_unconsulted_axis_still_concludes() {
     assert!(run.findings().is_empty(), "{:?}", run.findings());
 }
 
-/// Mined commit `edb00e017`, as an honest negative. The Go `:=` range binder
-/// has no establishment in the production IR, which uncovers the very axes this
-/// assert reads, so the run is inconclusive -- not a pass, not a finding.
+/// Mined commit `edb00e017`, after #2013. The Go lowering now publishes an
+/// establishment for the `:=` range binder and for the compound write, so the
+/// flow-side adapter gap this test used to pin is closed -- the positive
+/// same-evaluation and kill assertions live in
+/// `code_query_flow_state_conformance.rs`
+/// (`flow_state_go_range_binder_establishes_and_relates_as_same_evaluation`).
+///
+/// The *policy* assert still cannot conclude on this file, for a reason one
+/// layer earlier: the Go structural query reports `OccurrenceRoleUnsupported`
+/// for an identifier capture (#1724), which unconcludes the file before any
+/// flow axis is consulted. The run is therefore still inconclusive -- not a
+/// pass, not a finding -- and this test turns into the positive policy verdict
+/// once Go graduates to occurrence classification.
 #[test]
-fn the_go_range_binder_gap_is_inconclusive_rather_than_a_verdict() {
+fn the_go_range_binder_assert_is_inconclusive_on_the_occurrence_role_axis() {
     let (_project, workspace) = go(GO_RANGE_SELF_BINDER);
     let run = evaluate(
         &policy(
@@ -561,7 +570,7 @@ fn the_go_range_binder_gap_is_inconclusive_rather_than_a_verdict() {
     );
     assert!(
         matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
-        "the Go adapter gap must be reported, not resolved: {:?}",
+        "the Go occurrence-role gap must be reported, not resolved: {:?}",
         run.completion()
     );
     assert!(run.findings().is_empty(), "{:?}", run.findings());

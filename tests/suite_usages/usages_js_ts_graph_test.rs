@@ -4170,9 +4170,7 @@ fn js_object_literal_key_under_variable_declarator_still_reports_its_reads() {
     let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
     let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
     let file = project.file("p8.js");
-    let target = find_js_target(&analyzer, &file, |cu| {
-        cu.is_field() && cu.fq_name() == "p8.js.viaDeclarator.key"
-    });
+    let target = find_js_definition(&analyzer, &file, "viaDeclarator.key", |cu| cu.is_field());
 
     let hits = authoritative_js_hits(&analyzer, &target, file);
 

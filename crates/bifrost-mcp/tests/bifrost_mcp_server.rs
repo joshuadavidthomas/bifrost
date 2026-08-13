@@ -1338,7 +1338,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         listed["result"]["structuredContent"]["policies"]
             .as_array()
             .map(Vec::len),
-        Some(12)
+        Some(13)
     );
 
     let run = round_trip(
@@ -1399,6 +1399,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         category_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ],
         "{category}"
@@ -1433,6 +1434,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         pack_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
             "bifrost.performance.expensive-operation-in-nested-loop",
