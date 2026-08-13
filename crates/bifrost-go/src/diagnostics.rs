@@ -773,7 +773,11 @@ fn is_keyed_element_key(node: Node<'_>) -> bool {
     false
 }
 
-fn is_predeclared_go_name(name: &str) -> bool {
+/// Whether `name` is declared by the Go language universe block.
+///
+/// Source declarations may shadow these names, so resolvers must consult this
+/// predicate only after ordinary lexical, package, and import lookup.
+pub fn is_predeclared_go_name(name: &str) -> bool {
     matches!(
         name,
         "any"

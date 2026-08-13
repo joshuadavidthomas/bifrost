@@ -472,9 +472,18 @@ pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain
 /// `val`/`def`, a parameter -- which no analyzer publishes as a CodeUnit.
 pub const LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND: &str = "local_variable_reference";
 
+/// The name resolves to a language-provided predeclared symbol, such as Go's
+/// `error`, `len`, or `append`, rather than a declaration in the workspace.
+pub const PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND: &str = "predeclared_symbol_reference";
+
 /// The site is a declaration or import occurrence, not a reference, so there is
 /// no definition for it to reach.
 pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
+
+/// A Go keyed composite-literal label whose exact owning type could not be
+/// established from indexed structure. A same-spelled declaration elsewhere
+/// in the file is not evidence that the label can bind to it.
+pub const GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND: &str = "go_literal_owner_unresolved";
 
 /// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
 /// identified what the site is and answered it, rather than failing to reach a
@@ -491,7 +500,9 @@ pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_imp
 pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
     matches!(
         kind,
-        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
+            | PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND
+            | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
     )
 }
 

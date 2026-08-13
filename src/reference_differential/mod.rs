@@ -11,8 +11,9 @@ use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
-    is_adjudicated_answer_diagnostic_kind, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND,
+    PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND, is_adjudicated_answer_diagnostic_kind,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
@@ -1939,7 +1940,12 @@ fn classify_census_gaps(
             let role = root
                 .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
                 .unwrap_or(CensusSiteRole::Other);
-            let same_file_evidence = same_file_names.contains(&name)
+            let owner_unresolved_go_label = language == Language::Go
+                && record.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND
+                });
+            let same_file_evidence = !owner_unresolved_go_label
+                && same_file_names.contains(&name)
                 && (role != CensusSiteRole::BareCall
                     || bare_call_reaches_same_file_declaration(
                         language,

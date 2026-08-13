@@ -337,7 +337,7 @@ pub(super) fn resolve_go(
                 return outcome;
             }
             return no_definition(
-                "no_indexed_definition",
+                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
                 format!("`{reference}` is shadowed by a local Go binding"),
             );
         }
@@ -492,6 +492,12 @@ pub(super) fn resolve_go(
             "`{import_path}` is outside this partial Go workspace analysis"
         ));
     }
+    if brokk_bifrost_go::diagnostics::is_predeclared_go_name(reference) {
+        return no_definition(
+            PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
+            format!("`{reference}` is a predeclared Go symbol"),
+        );
+    }
     no_definition(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Go definition"),
@@ -540,7 +546,7 @@ fn go_keyed_composite_label_outcome(
     let Some(owner_fqn) = go_composite_label_owner_fqn(analyzer, support, file, source, keyed)
     else {
         return Some(no_definition(
-            "go_literal_owner_unresolved",
+            GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND,
             format!(
                 "could not resolve the exact Go composite-literal owner for field label `{label}`"
             ),
