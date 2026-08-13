@@ -2441,7 +2441,6 @@ fn rust_current_module_candidates(
         enclosing.push(unit.clone());
         current = analyzer.parent_of(&unit);
     }
-    let reference_module = enclosing.iter().find(|unit| unit.is_module());
     let reference_syntax_module = lexical_scope::enclosing_mod_item_range_at(root, reference_start);
     let mut physical = analyzer
         .declarations(file)
@@ -2458,27 +2457,10 @@ fn rust_current_module_candidates(
         .into_iter()
         .filter(|candidate| rust_role_accepts_current_module(rust, role, candidate))
         .filter(|candidate| {
-            let mut parent = analyzer.parent_of(candidate);
-            let mut candidate_module = None;
-            while let Some(unit) = parent {
-                if unit.is_module() {
-                    candidate_module = Some(unit);
-                    break;
-                }
-                parent = analyzer.parent_of(&unit);
-            }
-            if reference_module.is_some() {
-                candidate_module.as_ref() == reference_module
-            } else {
-                analyzer
-                    .ranges(candidate)
-                    .first()
-                    .map(|range| {
-                        rust_declaration_syntax_module_range(root, range, candidate.is_module())
-                            == reference_syntax_module
-                    })
-                    .unwrap_or(reference_syntax_module.is_none())
-            }
+            analyzer.ranges(candidate).iter().any(|range| {
+                rust_declaration_syntax_module_range(root, range, candidate.is_module())
+                    == reference_syntax_module
+            })
         })
         .filter(|candidate| {
             analyzer.parent_of(candidate).is_none_or(|parent| {
