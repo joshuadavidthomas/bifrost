@@ -14,7 +14,7 @@ Large C++ files should not spend minutes rewalking the same guarded include grap
 - [x] (2026-08-13 08:49Z) Added concurrent behavior and deterministic work-count coverage: four donors, two guard paths, a cycle, and an absent donor share one six-state build.
 - [x] (2026-08-13 08:55Z) Passed focused featureless validation, formatting, targeted clippy, dependency checks, and diff checks.
 - [x] (2026-08-13 09:19Z) Committed as `545778bc`, merged current `origin/master` without rebasing as `03fbff9d`, pushed to `master`, and closed #2097 with focused validation evidence.
-- [ ] Rebuild the release runner and rerun pinned AMReX and Tink into a provenance-preserving supplement to finish the C++ ledger.
+- [x] (2026-08-13 09:25Z) Rebuilt the release runner, replayed clean pinned AMReX and Tink into a two-row supplement, and generated hashed base and supplement raw ledgers.
 
 ## Surprises & Discoveries
 
@@ -46,9 +46,11 @@ Large C++ files should not spend minutes rewalking the same guarded include grap
 
 ## Outcomes & Retrospective
 
-The implementation is pushed and #2097 is closed. One reference-file index now serves every donor query, and cold concurrent donor queries publish one build. The exact scale fixture proves one six-state traversal where the former design performed a separate graph build per queried donor. End-to-end conditional include behavior remains unchanged. Completion still requires the AMReX/Tink replay. The key lesson is that caching a whole-graph computation by its final donor query can still be effectively uncached when one reference file asks about hundreds of donors.
+The implementation is pushed, #2097 is closed, and the missing corpus rows are complete. One reference-file index now serves every donor query, and cold concurrent donor queries publish one build. The exact scale fixture proves one six-state traversal where the former design performed a separate graph build per queried donor. End-to-end conditional include behavior remains unchanged. The key lesson is that caching a whole-graph computation by its final donor query can still be effectively uncached when one reference file asks about hundreds of donors.
 
-The original C++ report already contains 18 durable clean repository rows at Bifrost `3691bb01`. The missing AMReX and Tink rows must be written to a separate supplement at the fixed pushed commit. Appending them to the old JSONL would make one artifact silently mix analyzer revisions. Final acceptance therefore combines the base 18-row report and the two-row supplement while retaining both commit identities and hashes.
+The original C++ report contains 18 durable clean repository rows at Bifrost `3691bb01`. The AMReX and Tink supplement contains two clean rows at Bifrost `0e90366e`. Keeping them separate prevents one JSONL artifact from silently mixing analyzer revisions. Final acceptance combines the base report and supplement while retaining both commit identities and hashes.
+
+AMReX completed all 622 forward files in 58.9 seconds and the full repository in 104.3 seconds. Before the fix, it reached only 612 forward files after about 21 minutes and then made no progress for more than ten minutes. Tink completed in 60.3 seconds. Both rows report `bifrost_dirty=false`, `repo_dirty=false`, `status=completed`, and zero file errors.
 
 ## Context and Orientation
 
@@ -95,7 +97,7 @@ Then run:
     node scripts/check-workspace-dependencies.mjs
     git diff --check
 
-After commit and push, rebuild the release runner and rerun only `AMReX-Codes__amrex` and `google__tink` at their pinned clean commits, using the same clone root and limits as the interrupted campaign. Write them under `/mnt/optane/tmp/bifrost-fird/final-03fbff9d/` as a two-row supplement. Expect 18 completed clean base rows at `3691bb01` plus two completed clean supplement rows at `03fbff9d`.
+After commit and push, rebuild the release runner and rerun only `AMReX-Codes__amrex` and `google__tink` at their pinned clean commits, using the same clone root and limits as the interrupted campaign. Write them under `/mnt/optane/tmp/bifrost-fird/final-0e90366e/` as a two-row supplement. Expect 18 completed clean base rows at `3691bb01` plus two completed clean supplement rows at `0e90366e`.
 
 ## Validation and Acceptance
 
@@ -110,6 +112,20 @@ The corpus acceptance is observable steady completion. Pinned AMReX must pass fi
 The code edits and tests are safe to repeat. The projection index belongs to a `VisibilityIndex`, so analyzer update naturally discards it with the query object; no persistent schema or cache migration is involved. If a test or build is interrupted, rerun it normally. If the corpus replay is interrupted, already durable JSONL rows remain valid; select only missing repositories on retry. Never append rows from a different Bifrost revision to an existing report. Do not reset or clean unrelated user changes.
 
 ## Artifacts and Notes
+
+Completed corpus evidence:
+
+    base report: /mnt/optane/tmp/bifrost-fird/final-3691bb01/cpp-ranks31-50-3691bb01.jsonl
+    base report SHA-256: 94a425ed1950d491cbfca92ba9b01b3629fdfc5cc581aacace5d9628a9d1b784
+    base raw ledger: /mnt/optane/tmp/bifrost-fird/final-3691bb01/cpp-ranks31-50-3691bb01-raw-ledger.jsonl
+    base raw ledger SHA-256: 1525d40622f2843cbc6d9291bbd837f3728fd035f00307883848357931593807
+    supplement report: /mnt/optane/tmp/bifrost-fird/final-0e90366e/cpp-amrex-tink-0e90366e.jsonl
+    supplement report SHA-256: 9121723c948dd141467d75134399755fbf54464112df1585dfda195224728e95
+    supplement raw ledger: /mnt/optane/tmp/bifrost-fird/final-0e90366e/cpp-amrex-tink-0e90366e-raw-ledger.jsonl
+    supplement raw ledger SHA-256: bd0f9e002b6743e2bb50eb5465caa5e1228da0190289abba65f260a2829dd9c9
+    release runner SHA-256: 524216b66611fe5343b4f89ff715827215da819cada241e4de95913baddc0b11
+
+The combined twenty-repository raw ledger has 3,967 unique rows: 3,510 census gaps, 234 forward/inverse gaps, and 223 inverse-precision findings.
 
 The decisive pre-fix trace was:
 
