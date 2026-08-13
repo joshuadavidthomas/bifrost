@@ -16,7 +16,7 @@ After this change, navigation and usage lookup for a field inside an elided Go s
 - [x] (2026-08-14 01:35Z) Passed focused Go definition/usage tests, the core structured-type test, formatting, dependency validation, diff hygiene, and clippy for core, Go, and analysis.
 - [x] (2026-08-14 01:42Z) Rebuilt the release differential runner and replayed the canonical family plus every baseline `go_literal_owner_unresolved` site: 23 sites are now consistent and the other 61 remain fail-closed under separate owner gaps.
 - [x] (2026-08-14 01:48Z) Created the detailed checkpoint commit for the validated implementation.
-- [ ] Push, comment, and close #2069.
+- [x] (2026-08-14 02:02Z) Merged the intervening release-metadata commit, reran the focused behavior test, pushed master, posted the full validation/corpus evidence, and closed #2069.
 
 ## Surprises & Discoveries
 
@@ -139,3 +139,5 @@ Revision note (2026-08-13): Initial plan created after reproducing the current e
 Revision note (2026-08-13): Recorded the completed declaration, forward, inverse, epoch, and behavior-test milestones and the named-map keyed-value discovery.
 
 Revision note (2026-08-14): Recorded the completed local gate and exact 23-of-84 broad corpus audit, including the ticket's stale 17-site count.
+
+Revision note (2026-08-14): Marked delivery complete after the upstream merge, post-merge regression test, master push, and issue closure.
