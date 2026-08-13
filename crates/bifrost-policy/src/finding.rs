@@ -1979,6 +1979,8 @@ pub struct PolicyFinding {
     witnesses: Vec<BoundedWitness>,
     witnesses_truncated: bool,
     omitted_witnesses_lower_bound: u64,
+    #[serde(skip)]
+    display_path: super::display_path::TaintDisplayPathCache,
     suppression: Option<PolicyFindingSuppression>,
     scope: Option<PolicyFindingScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2133,6 +2135,7 @@ impl PolicyFinding {
             witnesses,
             witnesses_truncated,
             omitted_witnesses_lower_bound,
+            display_path: super::display_path::TaintDisplayPathCache::default(),
             suppression: None,
             scope: None,
             diff: None,
@@ -2210,6 +2213,15 @@ impl PolicyFinding {
     }
     pub const fn omitted_witnesses_lower_bound(&self) -> u64 {
         self.omitted_witnesses_lower_bound
+    }
+    pub(crate) fn display_path(&self) -> Option<&super::display_path::TaintDisplayPath> {
+        self.display_path.get()
+    }
+    pub(crate) fn attach_display_path(
+        &mut self,
+        display_path: Option<super::display_path::TaintDisplayPath>,
+    ) {
+        self.display_path.attach(display_path);
     }
     pub const fn suppression(&self) -> Option<&PolicyFindingSuppression> {
         self.suppression.as_ref()
@@ -2418,7 +2430,10 @@ impl PolicyFinding {
 
 impl RetainedSize for PolicyFinding {
     fn retained_size(&self) -> usize {
+        // The optional display path is a non-canonical presentation cache. Do
+        // not let it change canonical report-retention decisions.
         size_of::<Self>()
+            .saturating_sub(size_of::<super::display_path::TaintDisplayPathCache>())
             .saturating_add(retained_extra(&self.policy_id))
             .saturating_add(self.message.capacity())
             .saturating_add(retained_extra(&self.classification))

@@ -3,6 +3,8 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::display_path::TaintDisplayPath;
+
 use super::super::{
     BoundedWitness, CategoryPredicate, CertaintyReason, ClassificationProvenance, CvssAssessment,
     CvssAssessmentProvenance, CvssAssessmentVariant, CvssComponentResult, CvssEvidenceBasis,
@@ -214,7 +216,17 @@ fn write_concise_finding<W: Write>(
     }
     writeln!(output).map_err(map_io_error)?;
     writeln!(output, "    {}", escape_terminal_text(finding.message())).map_err(map_io_error)?;
-    if let Some(witness) = finding.witnesses().first() {
+    if let Some(path) = finding.display_path() {
+        writeln!(output).map_err(map_io_error)?;
+        write_concise_display_path(output, path)?;
+
+        write_concise_alternate_paths(
+            output,
+            finding.witnesses().len().saturating_sub(1),
+            finding.witnesses_truncated(),
+            finding.omitted_witnesses_lower_bound(),
+        )?;
+    } else if let Some(witness) = finding.witnesses().first() {
         writeln!(output).map_err(map_io_error)?;
         write_concise_witness(output, finding, witness)?;
 
@@ -226,6 +238,36 @@ fn write_concise_finding<W: Write>(
         )?;
     }
     writeln!(output).map_err(map_io_error)
+}
+
+fn write_concise_display_path<W: Write>(
+    output: &mut BoundedWriter<W>,
+    path: &TaintDisplayPath,
+) -> Result<(), PolicyRenderError> {
+    writeln!(output, "    #   Kind         Location  Code / symbol").map_err(map_io_error)?;
+    for (index, step) in path.steps().iter().enumerate() {
+        write!(output, "    {:<3} {:<12} ", index + 1, step.kind().label(),)
+            .map_err(map_io_error)?;
+        write_location(output, step.location()).map_err(map_io_error)?;
+        writeln!(output, "  {}", escape_terminal_text(step.label())).map_err(map_io_error)?;
+    }
+    if path.omitted_meaningful_steps() > 0 {
+        writeln!(
+            output,
+            "    {} meaningful display stage{} omitted; use --verbose for retained evidence",
+            path.omitted_meaningful_steps(),
+            plural_suffix_u64(path.omitted_meaningful_steps()),
+        )
+        .map_err(map_io_error)?;
+    }
+    if path.canonical_incomplete() {
+        writeln!(
+            output,
+            "    canonical path is incomplete; use --verbose for retained evidence"
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 fn write_concise_alternate_paths<W: Write>(
@@ -3230,6 +3272,7 @@ const fn plural_suffix_u64(count: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display_path::{TaintDisplayPath, TaintDisplayStep, TaintDisplayStepKind};
     use crate::{
         CvssAssessmentProvenance, CvssAssessmentVariant, CvssBaseMetric, CvssEvidenceBasis,
         CvssEvidenceContentHash, CvssEvidenceSetHash, CvssMetric, CvssMetricEvidence,
@@ -3323,6 +3366,62 @@ mod tests {
         let mut bounded = BoundedWriter::new(Vec::new(), 20);
         assert!(matches!(
             write_concise_witness_rows(&mut bounded, &witness, Some((&sink, "eval"))),
+            Err(PolicyRenderError::SerializedReportLimit {
+                max_serialized_bytes: 20
+            })
+        ));
+    }
+
+    #[test]
+    fn concise_display_path_is_contiguous_terminal_safe_and_output_bounded() {
+        let location = |path: &str, line: u64| {
+            PolicySourceLocation::span(
+                WorkspaceRelativePath::new(path).unwrap(),
+                super::super::super::PolicyByteSpan::new(line, line + 1).unwrap(),
+                super::super::super::PolicyDisplayRegion::new(line, 1, line, 2).unwrap(),
+            )
+        };
+        let path = TaintDisplayPath::for_test(
+            vec![
+                TaintDisplayStep::new(
+                    TaintDisplayStepKind::Source,
+                    location("src/source.rs", 1),
+                    "source\u{001B}[31m",
+                ),
+                TaintDisplayStep::new(
+                    TaintDisplayStepKind::Call,
+                    location("src/relay.rs", 2),
+                    "relay()",
+                ),
+                TaintDisplayStep::new(
+                    TaintDisplayStepKind::Sink,
+                    location("src/sink.rs", 3),
+                    "sink()",
+                ),
+            ],
+            true,
+            2,
+        );
+
+        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
+        write_concise_display_path(&mut rendered, &path).unwrap();
+        let rendered = String::from_utf8(rendered.inner).unwrap();
+        assert_eq!(
+            rendered,
+            concat!(
+                "    #   Kind         Location  Code / symbol\n",
+                "    1   source       src/source.rs:1:1  source\\u{1B}[31m\n",
+                "    2   call         src/relay.rs:2:1  relay()\n",
+                "    3   sink         src/sink.rs:3:1  sink()\n",
+                "    2 meaningful display stages omitted; use --verbose for retained evidence\n",
+                "    canonical path is incomplete; use --verbose for retained evidence\n",
+            )
+        );
+        assert!(!rendered.contains('\u{001B}'));
+
+        let mut bounded = BoundedWriter::new(Vec::new(), 20);
+        assert!(matches!(
+            write_concise_display_path(&mut bounded, &path),
             Err(PolicyRenderError::SerializedReportLimit {
                 max_serialized_bytes: 20
             })

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::finding::{PolicyByteSpan, PolicyDisplayRegion, PolicySourceLocation};
 use brokk_bifrost_analysis::analyzer::semantic::{
-    ProcedureHandle, ProgramPointHandle, SemanticLocator,
+    CallSiteHandle, ProcedureHandle, ProgramPointHandle, SemanticLocator,
 };
 use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::text_utils::{compute_line_starts, line_column_for_offset};
@@ -63,6 +63,35 @@ pub(super) fn program_point_locator(point: &ProgramPointHandle) -> &SemanticLoca
         .source_mapping(row.source)
         .expect("validated policy witness point has a source mapping")
         .locator
+}
+
+pub(super) fn call_site_locator(call: &CallSiteHandle) -> &SemanticLocator {
+    let row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("validated policy witness call resolves");
+    &call
+        .procedure()
+        .semantics()
+        .source_mapping(row.source)
+        .expect("validated policy witness call has a source mapping")
+        .locator
+}
+
+pub(super) fn source_excerpt(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> Option<String> {
+    let span = locator.anchor().span();
+    let file = ProjectFile::new(
+        workspace.analyzer().project().root().to_path_buf(),
+        locator.path().as_path(),
+    );
+    let source = workspace.analyzer().indexed_source(&file)?;
+    source
+        .get(span.start_byte() as usize..span.end_byte() as usize)
+        .map(str::to_owned)
 }
 
 pub(super) fn semantic_root_key(root: &ProcedureHandle) -> String {

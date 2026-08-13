@@ -132,6 +132,7 @@ fn projected_report(proof_reason: ProofReason) -> ProjectedFindingReport {
         witnesses: Vec::new(),
         witnesses_truncated: false,
         omitted_witnesses_lower_bound: 0,
+        display_path: None,
     }
 }
 
