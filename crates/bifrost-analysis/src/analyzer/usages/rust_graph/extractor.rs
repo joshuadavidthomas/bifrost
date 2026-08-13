@@ -51,7 +51,8 @@ pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
 use brokk_bifrost_rust::graph_support::{
-    RustSource, is_rust_macro_export_declaration, resolve_module_package,
+    RustSource, is_rust_enum_variant_declaration, is_rust_macro_export_declaration,
+    resolve_module_package,
 };
 use brokk_bifrost_rust::imports::rust_crate_root_package;
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
@@ -2600,7 +2601,7 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
-    if !resolved_type_matches_owner(type_node, ctx) {
+    if !resolved_struct_field_owner_matches(type_node, ctx) {
         return;
     }
     for field in fields {
@@ -2624,6 +2625,17 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             ctx.hits,
         );
     }
+}
+
+fn resolved_struct_field_owner_matches(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    if !is_rust_enum_variant_declaration(ctx.rust, ctx.owner) {
+        return resolved_type_matches_owner(type_node, ctx);
+    }
+    let Some(segments) = rust_path_segments(type_node) else {
+        return false;
+    };
+    structured_owner_candidate_fqn(type_node, &segments, ctx)
+        .is_some_and(|owner| owner == ctx.owner.fq_name())
 }
 
 enum ReceiverOwnerProof {

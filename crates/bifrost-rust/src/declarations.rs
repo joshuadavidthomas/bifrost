@@ -1495,6 +1495,32 @@ fn visit_rust_field(
         .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
         .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );
+
+    // A struct-like enum variant owns its named fields just as a struct owns
+    // its fields. Keep the variant's existing value-namespace identity and
+    // publish the named children beneath it (`Enum.Variant.field`). Tuple
+    // variants have positional fields and deliberately remain fieldless here.
+    if node.kind() == "enum_variant"
+        && let Some(body) = node.child_by_field_name("body")
+        && body.kind() == "field_declaration_list"
+    {
+        for index in 0..body.named_child_count() {
+            let Some(field) = body.named_child(index) else {
+                continue;
+            };
+            if field.kind() == "field_declaration" {
+                visit_rust_field(
+                    file,
+                    source,
+                    field,
+                    Some(&code_unit),
+                    package_name,
+                    in_test_region,
+                    parsed,
+                );
+            }
+        }
+    }
     Some(code_unit)
 }
 
