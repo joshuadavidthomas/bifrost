@@ -16,6 +16,7 @@ use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm,
 };
+use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
@@ -703,8 +704,9 @@ pub enum OrdinaryTypeImportResolution {
 }
 
 type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
-type ConditionalIncludeProjectionCache =
-    HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
+type ConditionalIncludeProjectionIndex = HashMap<ProjectFile, Arc<[ConditionalIncludeProjection]>>;
+type ConditionalIncludeProjectionCell = Arc<PoolSafeMemo<ConditionalIncludeProjectionIndex>>;
+type ConditionalIncludeProjectionCache = HashMap<ProjectFile, ConditionalIncludeProjectionCell>;
 type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
 type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
@@ -735,6 +737,10 @@ pub struct VisibilityIndex<'a> {
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
+    #[cfg(any(test, feature = "test-support"))]
+    conditional_include_projection_index_build_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    conditional_include_projection_state_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     include_activation_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1027,6 +1033,8 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
+            conditional_include_projection_index_build_count: AtomicUsize::new(0),
+            conditional_include_projection_state_count: AtomicUsize::new(0),
             include_activation_build_count: AtomicUsize::new(0),
             using_donor_activation_count: AtomicUsize::new(0),
             using_namespace_lookup_count: AtomicUsize::new(0),
@@ -1152,6 +1160,10 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            conditional_include_projection_index_build_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            conditional_include_projection_state_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             include_activation_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -2300,24 +2312,38 @@ impl<'a> VisibilityIndex<'a> {
         prepared: &PreparedSyntaxTree,
         donor_source: &ProjectFile,
     ) -> Arc<[ConditionalIncludeProjection]> {
-        let key = (file.clone(), donor_source.clone());
-        if let Some(cached) = self
+        static EMPTY: OnceLock<Arc<[ConditionalIncludeProjection]>> = OnceLock::new();
+        let cell = self
             .conditional_include_projection_cells
             .lock()
             .expect("C++ conditional include projection cache poisoned")
-            .get(&key)
+            .entry(file.clone())
+            .or_insert_with(|| Arc::new(PoolSafeMemo::new()))
+            .clone();
+        let index = cell.get_or_build_pool_independent(|| {
+            #[cfg(any(test, feature = "test-support"))]
+            self.conditional_include_projection_index_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            find_conditional_include_projection_index(self.cpp, file, prepared, &|| {
+                #[cfg(any(test, feature = "test-support"))]
+                self.conditional_include_projection_state_count
+                    .fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        index
+            .get(donor_source)
             .cloned()
-        {
-            return cached;
-        }
-        let projections: Arc<[ConditionalIncludeProjection]> =
-            find_conditional_include_projections(self.cpp, file, prepared, donor_source).into();
-        self.conditional_include_projection_cells
-            .lock()
-            .expect("C++ conditional include projection cache poisoned")
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&projections))
-            .clone()
+            .unwrap_or_else(|| Arc::clone(EMPTY.get_or_init(|| Arc::from([]))))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn conditional_include_projection_work_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.conditional_include_projection_index_build_count
+                .load(Ordering::Relaxed),
+            self.conditional_include_projection_state_count
+                .load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6316,14 +6342,16 @@ fn find_include_activation(
         .map(|(activation, _)| activation)
 }
 
-fn find_conditional_include_projections(
+fn find_conditional_include_projection_index(
     cpp: &dyn CppSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
-    donor_source: &ProjectFile,
-) -> Vec<ConditionalIncludeProjection> {
+    on_state: &dyn Fn(),
+) -> ConditionalIncludeProjectionIndex {
     let include_targets = cpp.include_target_index();
-    let mut projections = Vec::new();
+    let mut projections_by_source: HashMap<ProjectFile, Vec<ConditionalIncludeProjection>> =
+        HashMap::default();
+    let mut pending = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
@@ -6340,26 +6368,7 @@ fn find_conditional_include_projections(
                 )) else {
                     continue;
                 };
-                let paths = conditional_include_requirement_paths(
-                    cpp,
-                    &target,
-                    donor_source,
-                    required_guards.clone(),
-                );
-                for required_guards in paths {
-                    if !projections
-                        .iter()
-                        .any(|projection: &ConditionalIncludeProjection| {
-                            projection.activation_byte == node.end_byte()
-                                && projection.required_guards == required_guards
-                        })
-                    {
-                        projections.push(ConditionalIncludeProjection {
-                            activation_byte: node.end_byte(),
-                            required_guards,
-                        });
-                    }
-                }
+                pending.push((target, node.end_byte(), required_guards.clone()));
             }
             continue;
         }
@@ -6369,37 +6378,43 @@ fn find_conditional_include_projections(
             }
         }
     }
-    projections.sort_by_key(|projection| projection.activation_byte);
-    projections
-}
 
-fn conditional_include_requirement_paths(
-    cpp: &dyn CppSource,
-    first: &ProjectFile,
-    donor_source: &ProjectFile,
-    required_guards: HashSet<PreprocessorGuard>,
-) -> Vec<HashSet<PreprocessorGuard>> {
-    let include_targets = cpp.include_target_index();
-    let mut paths = Vec::new();
-    let mut stack = vec![(
-        first.clone(),
-        required_guards,
-        HashSet::from_iter([first.clone()]),
-    )];
-    while let Some((file, required_guards, visited)) = stack.pop() {
-        if file == *donor_source {
-            if !paths.contains(&required_guards) {
-                paths.push(required_guards);
-            }
+    // One reached file can have several distinct compatible guard paths. A
+    // state is expanded once for each exact guard set and top-level activation
+    // byte; this preserves those paths while terminating include cycles.
+    let mut expanded: HashMap<(ProjectFile, usize), Vec<HashSet<PreprocessorGuard>>> =
+        HashMap::default();
+    while let Some((current_file, activation_byte, required_guards)) = pending.pop() {
+        let guard_sets = expanded
+            .entry((current_file.clone(), activation_byte))
+            .or_default();
+        if guard_sets.contains(&required_guards) {
             continue;
         }
-        let Some(prepared) = cpp.prepared_syntax(&file) else {
+        guard_sets.push(required_guards.clone());
+        on_state();
+
+        let projections = projections_by_source
+            .entry(current_file.clone())
+            .or_default();
+        if !projections.iter().any(|projection| {
+            projection.activation_byte == activation_byte
+                && projection.required_guards == required_guards
+        }) {
+            projections.push(ConditionalIncludeProjection {
+                activation_byte,
+                required_guards: required_guards.clone(),
+            });
+        }
+
+        let Some(current_prepared) = cpp.prepared_syntax(&current_file) else {
             continue;
         };
-        let mut nodes = vec![prepared.tree().root_node()];
+        let mut nodes = vec![current_prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                let Some(include_guards) = preprocessor_guard_environment(node, prepared.source())
+                let Some(include_guards) =
+                    preprocessor_guard_environment(node, current_prepared.source())
                 else {
                     continue;
                 };
@@ -6408,21 +6423,16 @@ fn conditional_include_requirement_paths(
                 else {
                     continue;
                 };
-                let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+                let raw = normalize_cpp_whitespace(node_text(node, current_prepared.source()));
                 for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                     let Some(target) = unique_include_target(resolve_include_targets_with_index(
-                        &file,
+                        &current_file,
                         &include,
                         include_targets,
                     )) else {
                         continue;
                     };
-                    if visited.contains(&target) {
-                        continue;
-                    }
-                    let mut next_visited = visited.clone();
-                    next_visited.insert(target.clone());
-                    stack.push((target, path_guards.clone(), next_visited));
+                    pending.push((target, activation_byte, path_guards.clone()));
                 }
                 continue;
             }
@@ -6433,7 +6443,14 @@ fn conditional_include_requirement_paths(
             }
         }
     }
-    paths
+
+    projections_by_source
+        .into_iter()
+        .map(|(source, mut projections)| {
+            projections.sort_by_key(|projection| projection.activation_byte);
+            (source, Arc::from(projections))
+        })
+        .collect()
 }
 
 fn unconditional_include_reaches(

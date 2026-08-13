@@ -1656,6 +1656,102 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    fn conditional_include_projection_index_walks_each_guard_state_once_for_all_donors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let left = ProjectFile::new(root.clone(), "left.h");
+        let right = ProjectFile::new(root.clone(), "right.h");
+        let shared = ProjectFile::new(root.clone(), "shared.h");
+        let cycle = ProjectFile::new(root.clone(), "cycle.h");
+        let absent = ProjectFile::new(root.clone(), "absent.h");
+        consumer
+            .write(
+                "#if defined(LEFT)\n#include \"left.h\"\n#endif\n\
+                 #if defined(RIGHT)\n#include \"right.h\"\n#endif\n",
+            )
+            .expect("write consumer");
+        left.write("#include \"shared.h\"\n").expect("write left");
+        right.write("#include \"shared.h\"\n").expect("write right");
+        shared
+            .write("#include \"cycle.h\"\nstruct Shared {};\n")
+            .expect("write shared");
+        cycle
+            .write("#include \"shared.h\"\nstruct Cycle {};\n")
+            .expect("write cycle");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let prepared = analyzer
+            .prepared_syntax(&consumer)
+            .expect("prepared consumer");
+
+        let [
+            left_projections,
+            right_projections,
+            shared_projections,
+            cycle_projections,
+        ] = std::thread::scope(|scope| {
+            let handles = [&left, &right, &shared, &cycle].map(|donor| {
+                scope.spawn(|| {
+                    visibility.conditional_include_projections_for_source(
+                        &consumer,
+                        prepared.as_ref(),
+                        donor,
+                    )
+                })
+            });
+            handles.map(|handle| handle.join().expect("projection query"))
+        });
+
+        assert_eq!(left_projections.len(), 1);
+        assert_eq!(right_projections.len(), 1);
+        assert_eq!(shared_projections.len(), 2);
+        assert_eq!(cycle_projections.len(), 2);
+        assert!(
+            left_projections[0]
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("LEFT".to_string()))
+        );
+        assert!(
+            right_projections[0]
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("RIGHT".to_string()))
+        );
+        assert!(shared_projections.iter().any(|projection| {
+            projection
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("LEFT".to_string()))
+        }));
+        assert!(shared_projections.iter().any(|projection| {
+            projection
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("RIGHT".to_string()))
+        }));
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 6),
+            "four concurrent donor queries must single-flight one six-state graph traversal"
+        );
+
+        assert!(
+            visibility
+                .conditional_include_projections_for_source(&consumer, prepared.as_ref(), &absent,)
+                .is_empty()
+        );
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 6),
+            "an absent donor is a map miss, not a new graph traversal"
+        );
+    }
+
+    #[test]
     fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
