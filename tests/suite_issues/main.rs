@@ -91,6 +91,7 @@ mod issue_2051_python_deferred_annotation_scope;
 mod issue_2052_python_class_body_scope;
 mod issue_2053_python_module_rebindings;
 mod issue_2058_python_literal_annotation_values;
+mod issue_2060_csharp_using_precedence;
 mod issue_2062_csharp_alias_and_anonymous_key;
 mod issue_2066_js_lexical_binding_precedence;
 mod issue_2092_c_this_binding;

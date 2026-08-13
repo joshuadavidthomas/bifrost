@@ -153,8 +153,29 @@ impl<'a> CSharpDefinitionProvider<'a> {
             self.observe_cancellation().then_some(aliases)
         };
         let mut namespace_of_file = || self.namespace_of_file(file);
-        let mut using_namespaces = || {
-            let namespaces = self.using_namespaces(file);
+        let mut file_using_namespaces = || {
+            let namespaces = match self.session {
+                Some(session) => session.query_limited_rows(|limit| {
+                    graph_support::file_using_namespaces_limited(self.csharp, file, limit)
+                }),
+                None => graph_support::file_using_namespaces(self.csharp, file),
+            };
+            self.observe_cancellation().then_some(namespaces)
+        };
+        let mut global_using_namespaces = || {
+            let mut namespaces: Vec<_> = match self.session {
+                Some(session) => session.query_limited_rows(|limit| {
+                    self.csharp
+                        .global_using_namespaces_limited(limit, || session.observe_cancellation())
+                }),
+                None => self
+                    .csharp
+                    .global_using_namespaces()
+                    .iter()
+                    .cloned()
+                    .collect(),
+            };
+            namespaces.sort();
             self.observe_cancellation().then_some(namespaces)
         };
         // Not `package_exists`: that answers `false` for a namespace the budget
@@ -177,7 +198,8 @@ impl<'a> CSharpDefinitionProvider<'a> {
             true,
             &mut using_aliases,
             &mut namespace_of_file,
-            &mut using_namespaces,
+            &mut file_using_namespaces,
+            &mut global_using_namespaces,
             &mut namespace_exists,
             &mut type_candidates_by_fqn,
         )
