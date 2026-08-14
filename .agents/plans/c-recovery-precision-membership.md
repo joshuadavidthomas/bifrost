@@ -14,6 +14,8 @@ The forward-versus-inverse differential runner checks whether every exact invers
 - [x] (2026-08-13 21:12Z) Made binding/declaration usage-hit kinds precision-ineligible and added behavior coverage for recovered type/member references, macro definition/formal exclusions, and candidate-cap failure.
 - [x] (2026-08-13 21:31Z) Ran focused validation, committed `695339c9`, rebuilt the release runner, and exact-replayed six representative corpus witnesses with zero actionable findings and zero file errors.
 - [x] (2026-08-13 21:39Z) Pushed through merge tip `2fc2d1de`, published the focused test and six-report evidence, and closed #2089 without waiting for the complete C campaign.
+- [x] (2026-08-14) Reopened #2089 after the target-bound C supplement retained one StrongSwan `asn1_wrap` precision finding; reduced the missed role, extended the structured recovery frontier, and replayed the survivor with actionable zero on the dirty candidate.
+- [ ] Publish the underdelivery correction, repeat the StrongSwan replay on the clean pushed runner, record checksummed evidence, and close #2089 again.
 
 ## Surprises & Discoveries
 
@@ -31,6 +33,9 @@ The forward-versus-inverse differential runner checks whether every exact invers
 
 - Observation: a valid macro argument can preserve an ordinary selected-member subtree even when the surrounding declaration-shaped parse is recovered as `ERROR`.
   Evidence: `DISCARD(const int = state->timestamp)` expands to a valid constant while tree-sitter-cpp retains `state->timestamp` as a `field_expression` below `ERROR`. Both authoritative inverse lookup and the recovery-membership collector identify the exact `timestamp` range.
+
+- Observation: legal C use of `explicit` as a local variable can make tree-sitter-cpp parse the following call callee as a direct child of `ERROR`, without a call-expression anchor.
+  Evidence: StrongSwan `explicit = asn1_wrap(...)` at `x509_cert.c` bytes 68347..68356 is a proven inverse reference but remains the sole precision finding in the target-bound supplement. The parser represents `explicit` as `explicit_function_specifier`, the assignment token as recovery, and `asn1_wrap` as an identifier directly beneath the same `ERROR` node.
 
 ## Decision Log
 
@@ -50,6 +55,10 @@ The forward-versus-inverse differential runner checks whether every exact invers
   Rationale: these are bindings or declaration relationships, not literal source references that the census is intended to back. `Reference` and `SelfReceiver` remain eligible because both represent source-reference occurrences.
   Date/Author: 2026-08-13 / Codex
 
+- Decision: Admit declaration-shaped recovery identifiers after an `explicit_function_specifier` only when an indexed callable with the exact identifier is visible.
+  Rationale: The C++ grammar's declaration role is specifically contradicted by legal C use of `explicit`, but arbitrary direct `ERROR` children remain too weak. The parser marker plus structured declaration visibility proves the callable-shaped exception without source-text parsing or inverse-target circularity.
+  Date/Author: 2026-08-14 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation now separates the two contracts that the old shared census range set conflated. `CandidateFrontier::Census` remains conservative and still contributes no probe below `ERROR`. During inverse comparison, the already-built C authoritative batch supplies a bounded, structured recovery-only range set backed by the same macro visibility facts used by C usage resolution. The runner merges that set only for an explicitly C corpus and treats incomplete membership as unavailable rather than complete. Definition/import/reexport/override hits are excluded before reference-precision grading.
@@ -57,6 +66,8 @@ The implementation now separates the two contracts that the old shared census ra
 The focused fixture proves the important non-vacuous case end to end: authoritative inverse analysis actually returns both a recovered type reference and a recovered selected-member reference; neither range appears among probe sites; and the differential emits no inverse-precision finding. The low-level collector test also pins macro definition/formal rejection and all-or-nothing cap behavior. Existing #1784 misparsed-region probing remains unchanged.
 
 Six exact production replays now cover the original partial ledger and the completed-ledger supplement. strongSwan validates a recovered type, libarchive and Git validate selected members under large/preprocessor recovery envelopes, pgBackRest validates a macro token whose parser role resembles a declaration, SPDK validates definition-kind ineligibility, and CycloneDDS validates a supplemental recovered member. Every run completed with one consistent site, zero inverse-precision findings, zero candidate truncation, and zero file errors. This is sufficient focused acceptance for the requested push; the full 904-key replay remains intentionally deferred to the broader campaign.
+
+The target-bound supplement later exposed one underdelivery: StrongSwan's legal C variable `explicit` caused tree-sitter-cpp to classify the following `asn1_wrap` callee as a declaration-shaped direct `ERROR` descendant. The new parser-marker plus indexed-callable proof backs that exact range while an unindexed direct-recovery identifier remains excluded. The current dirty replay `/tmp/fird-c-strongswan-asn1-2089-dirty.jsonl` is consistent and exact with `inverse_precision_unbacked_hits=0` and every completeness counter clean. Clean pushed evidence remains pending.
 
 ## Context and Orientation
 

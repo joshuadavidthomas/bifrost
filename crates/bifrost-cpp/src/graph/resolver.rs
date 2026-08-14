@@ -9085,6 +9085,9 @@ fn recovered_c_reference_node(
     if !name.is_empty() && visibility.macro_name_may_be_bound_at(file, name, node.start_byte()) {
         return true;
     }
+    if recovered_c_explicit_assignment_callee(visibility, file, node, name) {
+        return true;
+    }
     if is_declaration_name(node) {
         return false;
     }
@@ -9092,6 +9095,38 @@ fn recovered_c_reference_node(
         return true;
     }
     recovered_c_reference_anchor(node)
+}
+
+fn recovered_c_explicit_assignment_callee(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    name: &str,
+) -> bool {
+    let mut current = node;
+    let error = loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent.is_error() {
+            break parent;
+        }
+        current = parent;
+    };
+    let mut cursor = error.walk();
+    let explicit_recovery_precedes_callee = error
+        .named_children(&mut cursor)
+        .take_while(|child| child.start_byte() < node.start_byte())
+        .any(|child| child.kind() == "explicit_function_specifier");
+    if !explicit_recovery_precedes_callee {
+        return false;
+    }
+    visibility
+        .cpp
+        .declarations(file)
+        .iter()
+        .chain(visibility.visible_by_file.get(file).into_iter().flatten())
+        .any(|candidate| candidate.identifier() == name && candidate.is_function())
 }
 
 fn recovered_c_macro_binding_role(mut node: Node<'_>) -> bool {

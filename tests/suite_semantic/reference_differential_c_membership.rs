@@ -31,7 +31,8 @@ fn has_error_ancestor(source: &str, start: usize, end: usize) -> bool {
 
 #[test]
 fn recovered_c_references_back_inverse_precision_without_becoming_probes() {
-    let source = r#"typedef struct Widget Widget;
+    let source = r#"#include "target.h"
+typedef struct Widget Widget;
 struct Widget { int field; };
 #define THIS(type) type *self
 
@@ -46,12 +47,30 @@ int recovered_member(struct State *state) {
     DISCARD(const int = state->timestamp);
     return 0;
 }
+
+int recovered_call_trigger(int value) { return recovered_call_target(value); }
+#define TARGET_KIND 1
+int recovered_explicit_assignment(void) {
+    int explicit = 0;
+    if (explicit == 0) {
+        explicit = recovered_call_target(TARGET_KIND, "m",
+                                         recovered_helper("c", explicit));
+    }
+    return explicit;
+}
 "#;
     let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "int recovered_call_target(int value, ...);\nint recovered_helper(const char *kind, int value);\n",
+        )
         .file("recovered.c", source)
         .build();
     let recovered_type = source.rfind("Widget").expect("recovered Widget");
     let recovered_member = source.rfind("timestamp").expect("recovered timestamp");
+    let recovered_callee = source
+        .find("recovered_call_target(TARGET_KIND")
+        .expect("recovered call target");
     assert!(
         has_error_ancestor(source, recovered_type, recovered_type + "Widget".len()),
         "the fixture must put the recovered type beneath ERROR"
@@ -63,6 +82,14 @@ int recovered_member(struct State *state) {
             recovered_member + "timestamp".len()
         ),
         "the fixture must put the recovered member beneath ERROR"
+    );
+    assert!(
+        has_error_ancestor(
+            source,
+            recovered_callee,
+            recovered_callee + "recovered_call_target".len()
+        ),
+        "the C identifier `explicit` must put the following callable beneath ERROR"
     );
 
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
@@ -84,10 +111,11 @@ int recovered_member(struct State *state) {
     .expect("run inline C census differential");
 
     assert!(
-        report
-            .sites
-            .iter()
-            .all(|site| site.start_byte != recovered_type && site.start_byte != recovered_member),
+        report.sites.iter().all(|site| {
+            site.start_byte != recovered_type
+                && site.start_byte != recovered_member
+                && site.start_byte != recovered_callee
+        }),
         "the conservative census must not probe ERROR descendants: {:#?}",
         report.sites
     );
@@ -127,5 +155,21 @@ int recovered_member(struct State *state) {
                 && hit.end_offset == recovered_member + "timestamp".len()
         }),
         "the inverse graph must actually prove the recovered member hit: {hits:#?}"
+    );
+
+    let recovered_call_target = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_function() && unit.fq_name() == "recovered_call_target")
+        .expect("recovered_call_target target");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[recovered_call_target])
+        .all_hits();
+    assert!(
+        hits.iter().any(|hit| {
+            hit.start_offset == recovered_callee
+                && hit.end_offset == recovered_callee + "recovered_call_target".len()
+        }),
+        "the inverse graph must prove the recovered call hit: {hits:#?}"
     );
 }
