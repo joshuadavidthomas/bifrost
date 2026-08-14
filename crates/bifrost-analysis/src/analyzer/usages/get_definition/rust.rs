@@ -1212,44 +1212,49 @@ fn resolve_rust_unscoped(
                     ));
                 }
                 RustVisibleImportResolution::Unbound => {
-                    // Only an unbound name may fall back to a lexically enclosing
-                    // declaration. An explicit import is authoritative even when a
-                    // same-named type exists in the surrounding file/module.
-                    let lexical = (role == RustBareReferenceRole::Type)
-                        .then(|| {
-                            resolve_in_enclosing_scopes(
-                                analyzer,
-                                file,
-                                reference,
-                                site.focus_start_byte,
-                                CodeUnit::is_class,
-                            )
-                        })
-                        .flatten();
-                    lexical.map_or_else(
-                        || {
-                            let module = rust_current_module_candidates(
-                                analyzer,
-                                rust,
-                                support,
-                                file,
-                                tree.root_node(),
-                                site.focus_start_byte,
-                                site.focus_end_byte,
-                                reference,
-                                role,
-                            );
-                            trace_selected_units(&module, PrecedenceTier::PackageOrModule);
-                            module
-                        },
-                        |unit| {
+                    // A bare name is first resolved in its physical module. The
+                    // enclosing CodeUnit can have a different logical owner -- for
+                    // example, a child-file `impl From<Local> for parent::Local`
+                    // is stored beneath the parent type -- and must not make that
+                    // owner shadow the child module's own declaration (#2129).
+                    let module = rust_current_module_candidates(
+                        analyzer,
+                        rust,
+                        support,
+                        file,
+                        tree.root_node(),
+                        site.focus_start_byte,
+                        site.focus_end_byte,
+                        reference,
+                        role,
+                    );
+                    if !module.is_empty() {
+                        trace_selected_units(&module, PrecedenceTier::PackageOrModule);
+                        module
+                    } else {
+                        // Only an unbound name may fall back to a lexically
+                        // enclosing declaration. An explicit import is
+                        // authoritative even when a same-named type exists in
+                        // the surrounding file/module.
+                        let lexical = (role == RustBareReferenceRole::Type)
+                            .then(|| {
+                                resolve_in_enclosing_scopes(
+                                    analyzer,
+                                    file,
+                                    reference,
+                                    site.focus_start_byte,
+                                    CodeUnit::is_class,
+                                )
+                            })
+                            .flatten();
+                        lexical.map_or_else(Vec::new, |unit| {
                             trace_selected_units(
                                 std::slice::from_ref(&unit),
                                 PrecedenceTier::OwnMember,
                             );
                             vec![unit]
-                        },
-                    )
+                        })
+                    }
                 }
             }
         } else {
