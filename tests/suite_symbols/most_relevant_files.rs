@@ -5,12 +5,14 @@ use brokk_bifrost::{
     searchtools::{
         ClassifyTestFilesParams, MostRelevantFilesParams, MostRelevantFilesRankingMode,
         MostRelevantFilesResult, TestFileKind, classify_test_files, most_relevant_files,
+        most_relevant_files_history_only,
     },
 };
 use git2::{Repository, Signature};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -351,6 +353,25 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
         &["test/A.java", "test/D.java"],
         &[],
     );
+    // A second commit that edits the same pair. One commit alone shows no
+    // co-editing, so the git leg suppresses it and this test would measure only
+    // the import leg it is meant to merge with.
+    write_file(
+        root,
+        "test/A.java",
+        "package test; import test.B; public class A { int v = 2; }",
+    );
+    write_file(
+        root,
+        "test/D.java",
+        "package test; public class D { int v = 2; }",
+    );
+    commit_paths(
+        &repo,
+        "seed and git neighbor change together again",
+        &["test/A.java", "test/D.java"],
+        &[],
+    );
 
     let analyzer = java_analyzer(root);
     let results = most_relevant_files(
@@ -458,6 +479,24 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
 
     let repo = Repository::init(root).unwrap();
     commit_paths(&repo, "git edge", &["test/A.java", "test/B.java"], &[]);
+    // The git edge needs two commits to count as co-editing, so the leg has one
+    // result and the import leg has to supply the second.
+    write_file(
+        root,
+        "test/A.java",
+        "package test; import test.C; public class A { int v = 2; }",
+    );
+    write_file(
+        root,
+        "test/B.java",
+        "package test; public class B { int v = 2; }",
+    );
+    commit_paths(
+        &repo,
+        "git edge again",
+        &["test/A.java", "test/B.java"],
+        &[],
+    );
 
     let analyzer = java_analyzer(root);
     let results = most_relevant_files(
@@ -499,7 +538,38 @@ fn git_ties_are_sorted_by_normalized_path_name() {
     let repo = Repository::init(root).unwrap();
     commit_paths(
         &repo,
-        "single tied change",
+        "first tied change",
+        &[
+            "Seed.java",
+            "AnthropicAgentWithPromptCaching.java",
+            "AutoGenAnthropicSample.java",
+            "CreateAnthropicAgent.java",
+        ],
+        &[],
+    );
+    // Two commits, because one commit shows no co-editing at all. Both commits
+    // carry the same four files, so the three targets tie exactly, which is the
+    // ordering this test is about. The tie pool is three and the limit below is
+    // three, so the whole tie is returned rather than an arbitrary slice of it.
+    write_file(root, "Seed.java", "public class Seed { int v = 2; }");
+    write_file(
+        root,
+        "AnthropicAgentWithPromptCaching.java",
+        "public class AnthropicAgentWithPromptCaching { int v = 2; }",
+    );
+    write_file(
+        root,
+        "AutoGenAnthropicSample.java",
+        "public class AutoGenAnthropicSample { int v = 2; }",
+    );
+    write_file(
+        root,
+        "CreateAnthropicAgent.java",
+        "public class CreateAnthropicAgent { int v = 2; }",
+    );
+    commit_paths(
+        &repo,
+        "second tied change",
         &[
             "Seed.java",
             "AnthropicAgentWithPromptCaching.java",
@@ -528,6 +598,186 @@ fn git_ties_are_sorted_by_normalized_path_name() {
             "AutoGenAnthropicSample.java",
             "CreateAnthropicAgent.java",
         ],
+        paths(&results)
+    );
+}
+
+/// History-only ranking parameters for a single seed, so the tests below differ
+/// only in the repository they rank over.
+fn history_only_params(seed: &str, limit: usize) -> MostRelevantFilesParams {
+    MostRelevantFilesParams {
+        seed_file_paths: vec![seed.to_string()],
+        seed_weights: None,
+        recency_half_life: Some(250.0),
+        ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+        limit,
+    }
+}
+
+/// One commit carries no co-change evidence: every file in it co-occurs with
+/// every other file exactly once, so a ranking over it only restates the
+/// snapshot. A squashed mirror repository has this shape. The walk succeeds, so
+/// the answer is "no result", not "history unavailable".
+#[test]
+fn single_commit_history_ranks_nothing_and_reports_complete() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(root, "Seed.java", "public class Seed { }");
+    write_file(root, "Alpha.java", "public class Alpha { }");
+    write_file(root, "Beta.java", "public class Beta { }");
+    write_file(root, "Gamma.java", "public class Gamma { }");
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(
+        &repo,
+        "import the whole tree at once",
+        &["Seed.java", "Alpha.java", "Beta.java", "Gamma.java"],
+        &[],
+    );
+
+    let analyzer = java_analyzer(root);
+    let results =
+        most_relevant_files_history_only(&analyzer, history_only_params("Seed.java", 5)).unwrap();
+
+    assert!(results.files.is_empty(), "{:?}", paths(&results));
+    assert!(results.complete);
+    assert!(results.incomplete_reason.is_none());
+}
+
+/// Repeated snapshot commits give every file the same score. Truncating a
+/// uniform vector to the limit returns whichever paths sort first, which is an
+/// arbitrary subset rather than a ranking, so the leg reports nothing.
+#[test]
+fn snapshot_history_wider_than_the_limit_ranks_nothing_and_reports_complete() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let targets: Vec<String> = (0..15)
+        .map(|index| format!("File{index:02}.java"))
+        .collect();
+    write_file(root, "Seed.java", "public class Seed { }");
+    for target in &targets {
+        write_file(
+            root,
+            target,
+            &format!("public class {} {{ }}", target.trim_end_matches(".java")),
+        );
+    }
+    let mut committed: Vec<&str> = vec!["Seed.java"];
+    committed.extend(targets.iter().map(String::as_str));
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(&repo, "first snapshot", &committed, &[]);
+    write_file(root, "Seed.java", "public class Seed { int v = 2; }");
+    for target in &targets {
+        write_file(
+            root,
+            target,
+            &format!(
+                "public class {} {{ int v = 2; }}",
+                target.trim_end_matches(".java")
+            ),
+        );
+    }
+    commit_paths(&repo, "second snapshot", &committed, &[]);
+
+    let analyzer = java_analyzer(root);
+    let results =
+        most_relevant_files_history_only(&analyzer, history_only_params("Seed.java", 5)).unwrap();
+
+    assert!(results.files.is_empty(), "{:?}", paths(&results));
+    assert!(results.complete);
+    assert!(results.incomplete_reason.is_none());
+}
+
+/// The guards must not eat a thin but real signal. `Common.java` changes in two
+/// commits and `Focused.java` in one, so their document frequencies, and
+/// therefore their scores, differ. `Unrelated.java` never changes with the
+/// seed, so it stays out.
+#[test]
+fn sparse_cochange_evidence_still_ranks() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(root, "Seed.java", "public class Seed { }");
+    write_file(root, "Common.java", "public class Common { }");
+    write_file(root, "Focused.java", "public class Focused { }");
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(
+        &repo,
+        "seed changes with both targets",
+        &["Seed.java", "Common.java", "Focused.java"],
+        &[],
+    );
+    write_file(root, "Common.java", "public class Common { int v = 2; }");
+    commit_paths(&repo, "common changes alone", &["Common.java"], &[]);
+    write_file(root, "Unrelated.java", "public class Unrelated { }");
+    commit_paths(&repo, "unrelated work", &["Unrelated.java"], &[]);
+
+    let analyzer = java_analyzer(root);
+    let results =
+        most_relevant_files_history_only(&analyzer, history_only_params("Seed.java", 5)).unwrap();
+
+    assert!(results.complete);
+    assert_eq!(vec!["Focused.java", "Common.java"], paths(&results));
+}
+
+/// A shallow clone's oldest commit names parents that the clone does not hold.
+/// Reading that parent id without checking builds `git log <missing>..<newest>`,
+/// which git rejects, and the failure used to be swallowed into an empty
+/// result. The clone must rank over the history it does hold.
+#[test]
+fn shallow_clone_boundary_still_ranks_recent_history() {
+    let origin_temp = TempDir::new().unwrap();
+    let origin = origin_temp.path();
+    write_file(origin, "Seed.java", "public class Seed { int v = 0; }");
+    let origin_repo = Repository::init(origin).unwrap();
+    commit_paths(&origin_repo, "seed", &["Seed.java"], &[]);
+    // Each later commit pairs the seed with a distinct co-file, so the two
+    // commits the shallow clone keeps still carry co-change evidence.
+    for step in 1..=4 {
+        let co_file = format!("Co{step}.java");
+        write_file(
+            origin,
+            "Seed.java",
+            &format!("public class Seed {{ int v = {step}; }}"),
+        );
+        write_file(origin, &co_file, &format!("public class Co{step} {{ }}"));
+        commit_paths(
+            &origin_repo,
+            &format!("edit {step}"),
+            &["Seed.java", &co_file],
+            &[],
+        );
+    }
+
+    let work_temp = TempDir::new().unwrap();
+    let work = work_temp.path().join("shallow");
+    let clone = Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("2")
+        .arg(format!("file://{}", origin.display()))
+        .arg(&work)
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert!(
+        work.join(".git").join("shallow").exists(),
+        "the fixture must be a shallow clone, or it pins nothing"
+    );
+
+    let analyzer = java_analyzer(&work);
+    let results =
+        most_relevant_files_history_only(&analyzer, history_only_params("Seed.java", 5)).unwrap();
+
+    assert!(results.complete, "{:?}", results.incomplete_reason);
+    assert!(
+        paths(&results).contains(&"Co4.java".to_string()),
+        "{:?}",
         paths(&results)
     );
 }
@@ -1295,6 +1545,20 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
         &["resources/seed.txt", "resources/Imported.java"],
         &[],
     );
+    // The unmapped seed can only be ranked from history, and history needs two
+    // commits that edit the pair before it reports a co-edit.
+    write_file(project.root(), "resources/seed.txt", "seed revised");
+    write_file(
+        project.root(),
+        "resources/Imported.java",
+        "package resources; public class Imported { int v = 2; }",
+    );
+    commit_paths(
+        &repo,
+        "resource seed and fallback change together",
+        &["resources/seed.txt", "resources/Imported.java"],
+        &[],
+    );
     let analyzer = java_analyzer(project.root());
 
     let filled = most_relevant_files(
@@ -1652,6 +1916,43 @@ fn rust_sibling_test_module_repo(lexer_mod_declaration: &str) -> TempDir {
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
     );
     write_file(&root, "src/lib.rs", "pub mod lexer;\n");
+    // The first revision of the module, without the sibling test declaration,
+    // so the commit that adds `tests.rs` also edits this file. Ranking here is
+    // history-driven, and history reports a co-edit only from two commits.
+    write_file(
+        &root,
+        "src/lexer/mod.rs",
+        r#"
+pub mod cursor;
+
+pub fn tokenize(input: &str) -> usize {
+    cursor::advance(input)
+}
+"#,
+    );
+    write_file(
+        &root,
+        "src/lexer/cursor.rs",
+        r#"
+pub fn advance(input: &str) -> usize {
+    input.len()
+}
+"#,
+    );
+
+    let repo = Repository::init(&root).unwrap();
+    commit_paths(
+        &repo,
+        "lexer without its sibling test module",
+        &[
+            "Cargo.toml",
+            "src/lib.rs",
+            "src/lexer/mod.rs",
+            "src/lexer/cursor.rs",
+        ],
+        &[],
+    );
+
     write_file(
         &root,
         "src/lexer/mod.rs",
@@ -1706,12 +2007,10 @@ fn regex_literal() {
 "#,
     );
 
-    let repo = Repository::init(&root).unwrap();
     commit_paths(
         &repo,
         "lexer and its sibling test module",
         &[
-            "src/lib.rs",
             "src/lexer/mod.rs",
             "src/lexer/cursor.rs",
             "src/lexer/tests.rs",

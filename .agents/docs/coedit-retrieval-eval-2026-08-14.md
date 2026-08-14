@@ -140,8 +140,27 @@ commits in its clone, but the first-parent chain from the eval worktree reaches
 only 430, short of the 1,000-commit window. The leg returned
 `HistoryUnavailable` and an empty list for all 606 cases, and
 `semantic_search` would surface that as "no co-edit results" rather than as a
-degraded workspace. Any `--depth 1` user hits this. It argues for the history
-depth guard already recommended on bifrost#2127.
+degraded workspace. Any `--depth 1` user hits this.
+
+Update, same day: root-caused and fixed. `first_parent_oid` returned a parent
+id recorded in the boundary commit's header without checking the object
+exists, so `populate_commit_range` ran `git log <missing>..<newest>`, which
+aborts with "Invalid revision range", and the error was swallowed into an
+empty `HistoryUnavailable` result. The parent probe now requires the object to
+be present, which routes a truncated range through the existing
+`--root <newest>` form. Two degeneracy guards were added at the same time:
+fewer than two commits with tracked churn returns empty (one commit shows no
+co-editing), and a uniform score vector wider than `k` returns empty (the
+truncated output would be an arbitrary path-sorted subset, which is what the
+CodeScale mirrors produced). Suppressed results report `Complete`, not
+`HistoryUnavailable`, and carry no notes.
+
+After the fix, Dolibarr produces rankings for all 606 cases. Corpus totals
+with it included (8,346 cases, 18 repositories): cascade 39.4 percent against
+dir+popularity 24.6 percent at k=10, better in 15 of 18 repositories.
+Dolibarr itself is now one of the three losses: its truncated 430-commit
+window gives co-edit only 22 percent coverage, and its `htdocs` layout has no
+test-tree mirroring for the stem and mirror signals to use.
 
 **Co-edit coverage is the ceiling, not precision.** Across the corpus the leg
 could rank the answer at all in only 45.0% of cases. It can only score a file
