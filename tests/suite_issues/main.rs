@@ -114,5 +114,6 @@ mod issue_2135_c_conditional_attribute_guard;
 mod issue_2138_c_source_reachable_include_root;
 mod issue_2139_c_fragmented_reference_guard;
 mod issue_2142_c_composite_guard_implication;
+mod issue_2144_c_keyword_argument_arity;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

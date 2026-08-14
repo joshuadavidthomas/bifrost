@@ -1401,16 +1401,18 @@ impl<'a> VisibilityIndex<'a> {
         else {
             return CallArityEvidence::Exact(0);
         };
+        let recovered_c_keyword_arguments =
+            recovered_c_keyword_argument_count(file, call, arguments, source);
         let arguments = argument_children(arguments).collect::<Vec<_>>();
         if arguments
             .iter()
             .all(|argument| !argument_shape_may_change_arity(*argument))
         {
-            return CallArityEvidence::Exact(arguments.len());
+            return CallArityEvidence::Exact(arguments.len() + recovered_c_keyword_arguments);
         }
         let environment = self.macro_environment(file, call.start_byte());
         let mut stack = Vec::new();
-        let mut total = 0usize;
+        let mut total = recovered_c_keyword_arguments;
         for argument in arguments {
             if !macro_expansion_shape_is_safe(argument, source, &[], &environment) {
                 return CallArityEvidence::Unknown;
@@ -7978,6 +7980,82 @@ pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<
         .flatten()
 }
 
+fn recovered_c_keyword_argument_count(
+    file: &ProjectFile,
+    call: Node<'_>,
+    arguments: Node<'_>,
+    source: &str,
+) -> usize {
+    // A C identifier that is a C++ keyword can be displaced twice by the C++
+    // grammar: first into a direct parameter-list `ERROR(keyword)`, then into
+    // a direct argument-list `ERROR(',', keyword)`. Match those CST tokens in
+    // the enclosing C function before restoring the otherwise dropped slot.
+    if !is_c_source_file(file) || arguments.kind() != "argument_list" {
+        return 0;
+    }
+    let mut ancestor = Some(call);
+    let function = loop {
+        let Some(current) = ancestor else {
+            return 0;
+        };
+        if current.kind() == "function_definition" {
+            break current;
+        }
+        ancestor = current.parent();
+    };
+    let Some(parameters) = function
+        .child_by_field_name("declarator")
+        .and_then(|declarator| declarator.child_by_field_name("parameters"))
+    else {
+        return 0;
+    };
+    let displaced_parameter_keywords = (0..parameters.child_count())
+        .filter_map(|index| parameters.child(index))
+        .filter(|error| error.kind() == "ERROR")
+        .filter_map(|error| {
+            let parameter = error.prev_named_sibling()?;
+            if parameter.kind() != "parameter_declaration"
+                || parameter.end_byte() != error.start_byte()
+                || extract_variable_name(parameter, source).is_some()
+            {
+                return None;
+            }
+            let mut children = (0..error.child_count())
+                .filter_map(|index| error.child(index))
+                .filter(|child| !child.is_extra() && !child.is_missing());
+            let keyword = children.next()?;
+            (children.next().is_none() && !keyword.is_named() && keyword.child_count() == 0)
+                .then_some(keyword)
+        })
+        .collect::<Vec<_>>();
+    if displaced_parameter_keywords.is_empty() {
+        return 0;
+    }
+
+    (0..arguments.child_count())
+        .filter_map(|index| arguments.child(index))
+        .filter(|error| error.kind() == "ERROR" && error.is_extra())
+        .filter(|error| {
+            let mut children = (0..error.child_count())
+                .filter_map(|index| error.child(index))
+                .filter(|child| !child.is_extra() && !child.is_missing());
+            let Some(comma) = children.next() else {
+                return false;
+            };
+            let Some(keyword) = children.next() else {
+                return false;
+            };
+            children.next().is_none()
+                && comma.kind() == ","
+                && !keyword.is_named()
+                && keyword.child_count() == 0
+                && displaced_parameter_keywords
+                    .iter()
+                    .any(|parameter| parameter.kind_id() == keyword.kind_id())
+        })
+        .count()
+}
+
 fn recovered_block_literal_arguments<'tree>(
     arguments: Node<'tree>,
 ) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>)> {
@@ -11878,6 +11956,52 @@ mod tests {
         let fallback_declaration = BooleanGuardExpression::any([missing_a, missing_b, missing_c]);
         assert!(fallback_branch.implies(&fallback_declaration));
         assert!(!fallback_declaration.implies(&fallback_branch));
+    }
+
+    #[test]
+    fn c_keyword_argument_recovery_requires_an_enclosing_displaced_parameter() {
+        let source = "static int helper(const char *left, wchar_t *right) { return 0; }\nint caller(wchar_t *template) {\n    return helper(NULL, template); /* bound */\n}\nint unbound(void) {\n    return helper(NULL, template); /* unbound */\n}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let root = tree.root_node();
+        let call = |marker: &str| {
+            let start = source.find(marker).expect("call marker");
+            let mut node = root
+                .descendant_for_byte_range(start, start + "helper".len())
+                .expect("call name node");
+            loop {
+                if node.kind() == "call_expression" {
+                    break node;
+                }
+                node = node.parent().expect("call expression ancestor");
+            }
+        };
+        let c_file = ProjectFile::new(std::env::temp_dir(), "keyword-argument.c");
+        let cpp_file = ProjectFile::new(std::env::temp_dir(), "keyword-argument.cpp");
+        let keyword_call = call("helper(NULL, template); /* bound */");
+        let keyword_arguments = keyword_call
+            .child_by_field_name("arguments")
+            .expect("keyword argument list");
+        assert_eq!(
+            recovered_c_keyword_argument_count(&c_file, keyword_call, keyword_arguments, source),
+            1
+        );
+        assert_eq!(
+            recovered_c_keyword_argument_count(&cpp_file, keyword_call, keyword_arguments, source),
+            0
+        );
+
+        let unbound_call = call("helper(NULL, template); /* unbound */");
+        let unbound_arguments = unbound_call
+            .child_by_field_name("arguments")
+            .expect("unbound argument list");
+        assert_eq!(
+            recovered_c_keyword_argument_count(&c_file, unbound_call, unbound_arguments, source),
+            0
+        );
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
