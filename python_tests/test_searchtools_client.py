@@ -2300,6 +2300,23 @@ class SearchToolsClientTest(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
+            (root / "A.java").write_text("public class A { int revision = 2; }\n")
+            (root / "B.java").write_text("public class B { int revision = 2; }\n")
+            subprocess.run(["git", "add", "A.java", "B.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "update related files",
+                ],
+                cwd=root,
+                check=True,
+            )
 
             with SearchToolsClient(root=root) as client:
                 result = client.most_relevant_files(

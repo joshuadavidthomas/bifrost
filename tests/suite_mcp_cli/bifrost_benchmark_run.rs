@@ -14,6 +14,7 @@ fn run_subcommand_executes_all_configured_scenarios_on_local_repo() {
     let repo_root = temp.path().join("fixture-repo");
     copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
     init_git_repo(&repo_root);
+    commit_fixture_cochange(&repo_root);
 
     let manifest_dir = temp.path().join("manifest");
     fs::create_dir_all(&manifest_dir).expect("manifest dir");
@@ -749,6 +750,7 @@ fn run_subcommand_subset_mode_preserves_most_relevant_files_signal() {
     let repo_root = temp.path().join("fixture-repo");
     copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
     init_git_repo(&repo_root);
+    commit_fixture_cochange(&repo_root);
 
     let manifest_dir = temp.path().join("manifest");
     fs::create_dir_all(&manifest_dir).expect("manifest dir");
@@ -1218,6 +1220,35 @@ fn init_git_repo(root: &Path) {
     let signature = git2::Signature::now("Test User", "test@example.com").expect("signature");
     repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .expect("commit");
+}
+
+fn commit_fixture_cochange(root: &Path) {
+    for path in ["A.java", "B.java"] {
+        let path = root.join(path);
+        let mut source = fs::read_to_string(&path).expect("read fixture source");
+        source.push_str("// related-files history revision\n");
+        fs::write(path, source).expect("update fixture source");
+    }
+
+    let repo = Repository::open(root).expect("open git repo");
+    let mut index = repo.index().expect("repo index");
+    for path in ["A.java", "B.java"] {
+        index.add_path(Path::new(path)).expect("add changed path");
+    }
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let parent = repo.head().expect("head").peel_to_commit().expect("parent");
+    let signature = git2::Signature::now("Test User", "test@example.com").expect("signature");
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "update related files",
+        &tree,
+        &[&parent],
+    )
+    .expect("commit");
 }
 
 fn head_commit(root: &Path) -> String {
