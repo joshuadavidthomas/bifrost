@@ -19,7 +19,8 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 - [x] (2026-08-14 00:49Z) Pushed implementation and evidence commits through `8cbd43941` directly to `origin/master` and closed #2035 with the clean replay evidence.
 - [x] (2026-08-14 01:25Z) Reopened #2035 after the Rust target-complete run exposed an inverse regression for enum-variant constructors, restricted applicability to requested trait-implementation members, and added an enum-variant inverse near-miss.
 - [x] (2026-08-14 01:34Z) Revalidated the focused issue tests, neighboring inverse control, all 53 Rust crate tests, formatting, focused Clippy, dependency checks, and exact OpenDAL plus serde-json production witnesses; both exact replays report actionable zero.
-- [ ] Commit and publish the regression correction, rebuild from the clean head, rerun both witnesses, and close #2035 again.
+- [x] (2026-08-14 01:38Z) Committed the regression correction as `9acbb320b982810d0b3aa6d6c53a4b7e5e99d5c0`, rebuilt the release runner, and obtained clean consistent/exact replays for both OpenDAL `FileState::Writer` and serde-json `Value::from(float)`.
+- [ ] Publish the correction, close #2035 again with both clean witnesses, and record publication.
 
 ## Surprises & Discoveries
 
@@ -59,7 +60,7 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 
 ## Outcomes & Retrospective
 
-The original implementation, validation, clean-head production acceptance, and publication completed, but the target-complete audit exposed an inverse enum-variant regression and #2035 was reopened. The regression correction and dirty-head production validation are complete; clean-head publication evidence and renewed issue closure remain pending.
+The original implementation, validation, clean-head production acceptance, and publication completed, but the target-complete audit exposed an inverse enum-variant regression and #2035 was reopened. The regression correction, validation, and clean-head production evidence are complete; publication and renewed issue closure remain pending.
 
 ## Context and Orientation
 
@@ -125,3 +126,5 @@ Plan revision, 2026-08-14: Recorded clean-head replay provenance and checksums f
 Plan revision, 2026-08-14: Recorded publication through `8cbd43941` and verified GitHub issue #2035 closed at `2026-08-14T00:49:16Z`.
 
 Plan revision, 2026-08-14: Reopened #2035 after the target-complete Rust audit found the applicability hook rejecting enum-variant constructors. Recorded the trait-implementation-only correction, regression coverage, and dirty-head exact OpenDAL/serde-json acceptance; clean publication proof remains required.
+
+Regression clean-head evidence, 2026-08-14: correction commit `9acbb320b982810d0b3aa6d6c53a4b7e5e99d5c0`; runner SHA-256 `7649299ea6a87d02702869799034c69d98d48ea02c4f4cb62cc9b47343c2cccc`. OpenDAL replay `/mnt/optane/tmp/bifrost-fird/issue-2035-9acbb320b/opendal-enum-variant-exact.jsonl`, SHA-256 `fa8741818eb598eb91eca9d23a8b76b6549309b32faa9156f1a1a431c1baa544`, is clean, consistent, and exact at `bindings/python/src/file.rs` bytes `1773..1779`. Serde-json replay `/mnt/optane/tmp/bifrost-fird/issue-2035-9acbb320b/serde-from-f32-exact.jsonl`, SHA-256 `d16b87b29827f84741920ef9f6c4ca3c4885b235038d0e17146e77a9c16fe137`, remains clean, consistent, and exact at `src/value/ser.rs` bytes `4432..4436`. Both report actionable zero.
