@@ -13,7 +13,7 @@ When a C function has an attribute enabled only outside MSVC, Bifrost must still
 - [x] (2026-08-14) Passed the focused C++ crate, issue integration, callable-activation controls, formatting, Clippy, dependency-boundary, and diff checks; both dirty-runner production candidates are exact and actionable zero.
 - [x] (2026-08-14) Rebuilt at clean pushed head `71d5ed83e` and replayed both production rows into checksummed final evidence.
 - [x] (2026-08-14) Committed and pushed the implementation; recorded closure evidence.
-- [ ] Close #2135 with the clean replay evidence.
+- [x] (2026-08-14) Closed #2135 with the clean replay evidence at `https://github.com/BrokkAi/bifrost/issues/2135#issuecomment-5291226948`.
 
 ## Surprises & Discoveries
 
@@ -73,6 +73,8 @@ Plan revision note (2026-08-14): Created after the post-#2134 C audit reduced th
 Plan revision note (2026-08-14): Recorded the implemented full-containment rule, focused gate results, and successful candidate replays for Git bytes 7514..7517 and 8434..8437.
 
 Plan revision note (2026-08-14): Finalized clean-head evidence. The release runner SHA-256 is `0b91f28d0e3f4d19749841a6f2e68de320b7df309b24f569503588aff7588ef2`; raw report SHA-256 values are `a65b162d1014230d80f99ba52095e152e52e32175b07493ca3615b38f6ab8680` and `42873bc07ddb5514a3c4d7b65f51a268e72a62620b393eb8bfbab87879064f53`.
+
+Plan revision note (2026-08-14): Closed #2135 after posting the implementation, gates, and exact clean-replay evidence.
 
 ## Interfaces and Dependencies
 
