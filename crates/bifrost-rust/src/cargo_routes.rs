@@ -1,3 +1,4 @@
+use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use semver::{Version, VersionReq};
@@ -1556,6 +1557,7 @@ fn collect_module_route_facts(
             let Some(name) = source.get(name.start_byte()..name.end_byte()) else {
                 continue;
             };
+            let name = strip_raw_identifier_prefix(name);
             let inherits_macros = facts.scopes[scope].imports_macros;
             let imports_macros = inherits_macros && rust_has_macro_use_attribute(child, source);
             let path_attribute = rust_path_attribute_value(child, source);
@@ -1967,6 +1969,7 @@ fn collect_external_module_children(
             let Some(name) = source.get(name.start_byte()..name.end_byte()) else {
                 continue;
             };
+            let name = strip_raw_identifier_prefix(name);
             if let Some(body) = child.child_by_field_name("body") {
                 let imports_macros =
                     imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
@@ -4813,6 +4816,33 @@ replay! { replay! { mod doubly_replayed; } }
                 }
             }
         }
+    }
+
+    #[test]
+    fn module_route_facts_canonicalize_raw_identifiers() {
+        let source = "mod r#struct;\nmod r#type { mod r#enum; }\n";
+        let tree = parse_fixture(source);
+        let facts = extract_rust_module_route_facts(tree.root_node(), source, &[]);
+
+        assert!(
+            facts
+                .routes
+                .iter()
+                .any(|route| route.scope == 0 && route.module_name == "struct"),
+            "external raw module route: {facts:#?}"
+        );
+        let inline_scope = facts
+            .scopes
+            .iter()
+            .position(|scope| scope.parent == Some(0) && scope.module_name == "type")
+            .expect("canonical inline raw module scope");
+        assert!(
+            facts
+                .routes
+                .iter()
+                .any(|route| route.scope == inline_scope && route.module_name == "enum"),
+            "nested raw module route: {facts:#?}"
+        );
     }
 
     /// The fixture must actually exercise the shapes the pin claims to cover,

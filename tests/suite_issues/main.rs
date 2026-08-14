@@ -104,5 +104,6 @@ mod issue_2071_go_elided_map_key_owner;
 mod issue_2072_go_promoted_interface_chain;
 mod issue_2092_c_this_binding;
 mod issue_2093_c_ordinary_macro_references;
+mod issue_2128_rust_reexported_type_inverse;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;
