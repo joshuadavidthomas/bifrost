@@ -23,8 +23,11 @@
 //!     BIFROST_COEDIT_EVAL_CASES=<dir>/cases.json \
 //!       cargo test --test suite_semantic -- measure_coedit_retrieval --ignored --nocapture
 
+use brokk_bifrost::path_utils::rel_path_string;
 use brokk_bifrost::searchtools::{MostRelevantFilesParams, most_relevant_files_history_only};
-use brokk_bifrost::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+use brokk_bifrost::{
+    AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,8 +44,28 @@ const CASES_ENV: &str = "BIFROST_COEDIT_EVAL_CASES";
 #[derive(Deserialize)]
 struct CaseFile {
     repo: PathBuf,
+    lang: String,
     split_commit: String,
     cases: Vec<Case>,
+}
+
+/// The corpus tags each repo with the extension family that dominates it, so
+/// the harness has to map that back onto the analyzer language.
+fn language_for(tag: &str) -> Language {
+    match tag {
+        "java" => Language::Java,
+        "py" => Language::Python,
+        "go" => Language::Go,
+        "rs" => Language::Rust,
+        "rb" => Language::Ruby,
+        "php" => Language::Php,
+        "kt" => Language::Kotlin,
+        "scala" => Language::Scala,
+        "cs" => Language::CSharp,
+        "ts" => Language::TypeScript,
+        "cpp" => Language::Cpp,
+        other => panic!("no analyzer language for corpus tag {other}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -60,6 +83,39 @@ struct Ranking {
     ranked: Vec<String>,
     /// `false` when the leg declined to rank, which is itself a result.
     complete: bool,
+    /// Files the seeds import, and files that import the seeds. The structural
+    /// signal `semantic_search` currently declines to pay for: query.rs turns
+    /// import ranking off because the full graph can expand for minutes. This
+    /// is the depth-1 neighbourhood only, which is cheap.
+    imports: Vec<String>,
+    importers: Vec<String>,
+}
+
+/// Depth-1 import neighbourhood of the seeds, both directions.
+fn import_neighbourhood(
+    workspace: &WorkspaceAnalyzer,
+    root: &std::path::Path,
+    seeds: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let analyzer = workspace.analyzer();
+    let Some(provider) = analyzer.import_analysis_provider() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut imports = std::collections::BTreeSet::new();
+    let mut importers = std::collections::BTreeSet::new();
+    for seed in seeds {
+        let file = ProjectFile::new(root.to_path_buf(), seed.as_str());
+        for unit in provider.imported_code_units_of(&file).iter() {
+            imports.insert(rel_path_string(unit.source()));
+        }
+        for referencing in provider.referencing_files_of(&file) {
+            importers.insert(rel_path_string(&referencing));
+        }
+    }
+    (
+        imports.into_iter().collect(),
+        importers.into_iter().collect(),
+    )
 }
 
 #[test]
@@ -78,13 +134,16 @@ fn measure_coedit_retrieval_on_real_history() {
     );
 
     let started = Instant::now();
-    let project: Arc<dyn Project> =
-        Arc::new(TestProject::new(case_file.repo.clone(), Language::Go));
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(
+        case_file.repo.clone(),
+        language_for(&case_file.lang),
+    ));
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     eprintln!(
-        "analyzer built in {:.1}s over {}, split at {}",
+        "analyzer built in {:.1}s over {} ({}), split at {}",
         started.elapsed().as_secs_f64(),
         case_file.repo.display(),
+        case_file.lang,
         &case_file.split_commit[..9]
     );
 
@@ -105,12 +164,15 @@ fn measure_coedit_retrieval_on_real_history() {
             },
         )
         .expect("co-edit ranking");
+        let (imports, importers) = import_neighbourhood(&workspace, &case_file.repo, &case.seeds);
         rankings.push(Ranking {
             commit: case.commit.clone(),
             seeds: case.seeds.clone(),
             heldout: case.heldout.clone(),
             ranked: result.files.into_iter().map(|file| file.path).collect(),
             complete: result.complete,
+            imports,
+            importers,
         });
         if index.is_multiple_of(25) {
             eprintln!(
