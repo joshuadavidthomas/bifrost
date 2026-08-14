@@ -11,8 +11,9 @@ When a C function has an attribute enabled only outside MSVC, Bifrost must still
 - [x] (2026-08-14) Reduced Git `die` bytes 7514..7517 and 8434..8437 and filed #2135.
 - [x] (2026-08-14) Recovered the declaration-prefix terminator, required full containment at displaced boundaries, and added the integration regression.
 - [x] (2026-08-14) Passed the focused C++ crate, issue integration, callable-activation controls, formatting, Clippy, dependency-boundary, and diff checks; both dirty-runner production candidates are exact and actionable zero.
-- [ ] Rebuild at the clean pushed head and replay both production rows into checksummed final evidence.
-- [ ] Commit, push, record checksummed evidence, and close #2135.
+- [x] (2026-08-14) Rebuilt at clean pushed head `71d5ed83e` and replayed both production rows into checksummed final evidence.
+- [x] (2026-08-14) Committed and pushed the implementation; recorded closure evidence.
+- [ ] Close #2135 with the clean replay evidence.
 
 ## Surprises & Discoveries
 
@@ -29,7 +30,7 @@ When a C function has an attribute enabled only outside MSVC, Bifrost must still
 
 ## Outcomes & Retrospective
 
-The structured fix and regression test are implemented. Both Git rows pass the candidate replay as resolved, inverse-exact, and actionable zero; clean pushed-head evidence remains before closure.
+The structured fix and regression test landed in `71d5ed83e`. Both exact Git rows pass from that clean pushed head as resolved, consistent, inverse-exact, and actionable zero. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-71d5ed83/issue-2135-clean-replay-manifest-71d5ed83.jsonl` (SHA-256 `7ab4e9535a9095226acfce29a39b06d5fc39f956eac579966e972e061c16d512`), and its checksum inventory has SHA-256 `2d17675be0ee2da8e457a626671cad8e05234614da91d5505c26f82c513b0fc7`.
 
 ## Context and Orientation
 
@@ -70,6 +71,8 @@ The source rows originate in `/mnt/optane/tmp/bifrost-fird/final-3643963/c-targe
 Plan revision note (2026-08-14): Created after the post-#2134 C audit reduced the conditional-attribute mechanism and filed #2135.
 
 Plan revision note (2026-08-14): Recorded the implemented full-containment rule, focused gate results, and successful candidate replays for Git bytes 7514..7517 and 8434..8437.
+
+Plan revision note (2026-08-14): Finalized clean-head evidence. The release runner SHA-256 is `0b91f28d0e3f4d19749841a6f2e68de320b7df309b24f569503588aff7588ef2`; raw report SHA-256 values are `a65b162d1014230d80f99ba52095e152e52e32175b07493ca3615b38f6ab8680` and `42873bc07ddb5514a3c4d7b65f51a268e72a62620b393eb8bfbab87879064f53`.
 
 ## Interfaces and Dependencies
 
