@@ -7000,7 +7000,7 @@ fn preprocessor_conditional_contains_descendant(
     descendant: Node<'_>,
 ) -> bool {
     cpp_displaced_preprocessor_boundary(conditional)
-        .is_none_or(|boundary| descendant.start_byte() < boundary.end_byte)
+        .is_none_or(|boundary| descendant.end_byte() <= boundary.end_byte)
 }
 
 pub fn merge_preprocessor_guards(

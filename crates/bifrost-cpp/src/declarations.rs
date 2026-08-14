@@ -5268,6 +5268,12 @@ pub struct CppDisplacedPreprocessorBoundary {
 pub fn cpp_displaced_preprocessor_boundary(
     conditional: Node<'_>,
 ) -> Option<CppDisplacedPreprocessorBoundary> {
+    if let Some(terminator) = displaced_declaration_prefix_terminator(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: terminator.end_byte(),
+            end_line: terminator.end_position().row + 1,
+        });
+    }
     if let Some(declaration) = displaced_split_declaration(conditional) {
         return Some(CppDisplacedPreprocessorBoundary {
             end_byte: declaration.end_byte(),
@@ -5281,6 +5287,43 @@ pub fn cpp_displaced_preprocessor_boundary(
         });
     }
     None
+}
+
+fn displaced_declaration_prefix_terminator<'tree>(conditional: Node<'tree>) -> Option<Node<'tree>> {
+    if !conditional.has_error() || conditional.child_by_field_name("alternative").is_some() {
+        return None;
+    }
+    let mut cursor = conditional.walk();
+    let declarations = conditional
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "declaration" | "function_definition"))
+        .collect::<Vec<_>>();
+    let declaration = *declarations.first()?;
+    if declaration.end_byte() >= conditional.end_byte() || declarations.len() < 2 {
+        return None;
+    }
+    let declarator_start = declaration.child_by_field_name("declarator")?.start_byte();
+    let mut terminator = None;
+    let mut stack = (0..declaration.child_count())
+        .filter_map(|index| declaration.child(index))
+        .filter(|child| child.start_byte() < declarator_start)
+        .map(|child| (child, false))
+        .collect::<Vec<_>>();
+    while let Some((node, inside_error)) = stack.pop() {
+        let inside_error = inside_error || node.kind() == "ERROR";
+        if inside_error && node.kind() == "#endif" && !node.is_missing() {
+            terminator = Some(node);
+            continue;
+        }
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index)
+                && child.start_byte() < declarator_start
+            {
+                stack.push((child, inside_error));
+            }
+        }
+    }
+    terminator
 }
 
 fn displaced_split_declaration<'tree>(conditional: Node<'tree>) -> Option<Node<'tree>> {
