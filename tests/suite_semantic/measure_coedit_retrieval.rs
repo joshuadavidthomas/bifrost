@@ -183,7 +183,10 @@ fn measure_coedit_retrieval_on_real_history() {
         }
     }
 
-    let out = PathBuf::from(&cases_path).with_file_name("rankings.json");
+    // Derived from the input path, not a fixed name beside it. A shared
+    // `rankings.json` made two concurrent runs of this harness overwrite each
+    // other's output, which is silent and produces a plausible-looking file.
+    let out = PathBuf::from(&cases_path).with_extension("rankings.json");
     std::fs::write(
         &out,
         serde_json::to_string_pretty(&rankings).expect("encode"),
