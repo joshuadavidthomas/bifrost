@@ -1837,6 +1837,29 @@ pub fn usage_reference_at(
                     .map(|(identity, _)| identity.clone()),
             );
         }
+        if matches.is_empty()
+            && !leading_absolute
+            && let Some(resolved_fqn) = analyzer
+                .reference_context_of(file)
+                .resolve_scoped(&prefix.join("::"), terminal)
+            && let Some(identity) = unique_seed_identity_for_fqn(
+                analyzer,
+                file,
+                byte,
+                seeds,
+                &resolved_fqn,
+                &[],
+                namespace,
+            )
+        {
+            // A module-level glob can introduce the first path segment without
+            // creating a named namespace binder (`use crate::types::*;` followed
+            // by `use ast_elements::Target;`). The forward reference context
+            // already resolves that structured path. Consult it only after the
+            // authoritative binder and physical-module routes fail, and still
+            // require the resolved identity to be one of this query's seeds.
+            matches.insert(identity);
+        }
     }
 
     if segments.len() == 1 && namespace != RustReferenceNamespace::Macro {
@@ -2082,22 +2105,26 @@ fn unique_seed_identity_for_import_targets(
         .iter()
         .filter(|identity| {
             identity.namespace.accepts(namespace)
-                && seed_identity_admitted_at(
-                    analyzer,
-                    importer,
-                    byte,
-                    seeds,
-                    identity,
-                    dependency_roots,
-                )
-                && seeds.identity_domains.get(*identity).is_none_or(|domains| {
-                    domains
-                        .iter()
-                        .any(|domain| domain.contains_module(importer_module))
-                })
                 && targets
                     .iter()
                     .any(|(file, name)| identity.file == *file && identity.name == *name)
+                // The visible forward binder already returned a query root as
+                // an exact target. Auxiliary Cargo and inferred-module domains
+                // still constrain propagated aliases, but must not veto that
+                // authoritative root for workspace or custom-target layouts.
+                && (seeds.root_origins.contains(identity)
+                    || (seed_identity_admitted_at(
+                        analyzer,
+                        importer,
+                        byte,
+                        seeds,
+                        identity,
+                        dependency_roots,
+                    ) && seeds.identity_domains.get(*identity).is_none_or(|domains| {
+                        domains
+                            .iter()
+                            .any(|domain| domain.contains_module(importer_module))
+                    })))
         })
         .flat_map(|identity| {
             seeds
@@ -2149,6 +2176,9 @@ fn seed_identity_admitted_at(
         identities.contains(identity)
             && walks.declaration_visible_at(analyzer, root, importer, byte)
             && (walks.owners_intersect(importer, &identity.file)
+                || walks
+                    .cargo_routes()
+                    .file_can_reference_target_of(importer, &identity.file)
                 || walks
                     .cargo_routes()
                     .target_relation(importer, &identity.file)

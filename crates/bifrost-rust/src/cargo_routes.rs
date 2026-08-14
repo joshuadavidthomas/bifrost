@@ -739,6 +739,22 @@ impl RustCargoRouteIndex {
         files
     }
 
+    pub fn file_can_reference_target_of(
+        &self,
+        file: &ProjectFile,
+        target_file: &ProjectFile,
+    ) -> bool {
+        self.target_roots_by_file
+            .get(target_file)
+            .is_some_and(|target_roots| {
+                target_roots.iter().any(|root| {
+                    self.files_by_reachable_root
+                        .get(root)
+                        .is_some_and(|files| files.binary_search(file).is_ok())
+                })
+            })
+    }
+
     /// Every file that can name something in each target root, materialised
     /// per root.
     ///
