@@ -12,7 +12,7 @@ Inside a Rust impl method, `Self::Output` names the associated type implemented 
 - [x] (2026-08-14) Confirmed the witness still resolves to unrelated `InternalJoinDsl.Output` on clean master after the upstream impl declaration-navigation fix.
 - [x] (2026-08-14) Added a reduced forward/inverse regression with three competing `Alias<S>::Output` impl items and an unrelated trait implementation.
 - [x] (2026-08-14) Resolved the exact enclosing impl item structurally, prevented Cargo-scope FQN expansion from widening lexical `Self` results, and completed focused/broad validation.
-- [ ] Publish, replay the production witness on a clean release runner, and close #2132.
+- [x] (2026-08-14) Published `6bfbb9d27`, replayed the production witness on a clean release runner, and preserved compact checksummed closure evidence. Issue closure follows the documentation checkpoint.
 
 ## Surprises & Discoveries
 
@@ -34,7 +34,7 @@ Inside a Rust impl method, `Self::Output` names the associated type implemented 
 
 ## Outcomes & Retrospective
 
-The dirty production replay at Bifrost `ccd269e94` selected exactly one target, `impl LimitDsl for Alias<S>::type Output`, and returned a consistent exact inverse hit with no truncation, incompleteness, or actionable finding. Clean-head publication evidence remains pending.
+The clean production replay at Bifrost `6bfbb9d27dd010235e6046cdc15ecc106274b1b7` selected exactly one target, `impl LimitDsl for Alias<S>::type Output`, and returned a consistent exact inverse hit with no truncation, incompleteness, or actionable finding. The release runner SHA-256 is `511a938353bfc133409c571776d7082f31f9a6e965fa2b47dbf55d17ace173bc`. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-6bfbb9d2/issue-2132-clean-replay-manifest-6bfbb9d2.jsonl` (SHA-256 `9e87b8f228f3966fc596ee80a6f5acce647c532f42d68e157574b398e6b8c011`), with checksums at `/mnt/optane/tmp/bifrost-fird/final-6bfbb9d2/issue-2132-clean-replay-checksums-6bfbb9d2.sha256` (SHA-256 `47cdd910544a92e666cfc1dafd037b77371edda29c08012207105b5f8d68a9e0`).
 
 ## Context and Orientation
 
