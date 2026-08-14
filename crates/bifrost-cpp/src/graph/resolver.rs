@@ -809,16 +809,127 @@ pub struct VisibilityIndex<'a> {
 pub enum PreprocessorGuard {
     Defined(String),
     Undefined(String),
+    Boolean(BooleanGuardExpression),
     Expression(String),
     NegatedExpression(String),
     Constant(bool),
 }
 
-impl PreprocessorGuard {
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BooleanGuardExpression {
+    Defined(String),
+    Undefined(String),
+    Truthy(String),
+    Falsy(String),
+    Opaque(String),
+    NegatedOpaque(String),
+    All(Vec<BooleanGuardExpression>),
+    Any(Vec<BooleanGuardExpression>),
+    Constant(bool),
+}
+
+impl BooleanGuardExpression {
     fn negated(&self) -> Self {
         match self {
             Self::Defined(name) => Self::Undefined(name.clone()),
             Self::Undefined(name) => Self::Defined(name.clone()),
+            Self::Truthy(name) => Self::Falsy(name.clone()),
+            Self::Falsy(name) => Self::Truthy(name.clone()),
+            Self::Opaque(expression) => Self::NegatedOpaque(expression.clone()),
+            Self::NegatedOpaque(expression) => Self::Opaque(expression.clone()),
+            Self::All(expressions) => Self::any(expressions.iter().map(Self::negated)),
+            Self::Any(expressions) => Self::all(expressions.iter().map(Self::negated)),
+            Self::Constant(value) => Self::Constant(!value),
+        }
+    }
+
+    fn all(expressions: impl IntoIterator<Item = Self>) -> Self {
+        Self::normalized(expressions, true)
+    }
+
+    fn any(expressions: impl IntoIterator<Item = Self>) -> Self {
+        Self::normalized(expressions, false)
+    }
+
+    fn normalized(expressions: impl IntoIterator<Item = Self>, conjunction: bool) -> Self {
+        let mut normalized = Vec::new();
+        for expression in expressions {
+            match expression {
+                Self::All(nested) if conjunction => normalized.extend(nested),
+                Self::Any(nested) if !conjunction => normalized.extend(nested),
+                Self::Constant(value) if value == conjunction => {}
+                Self::Constant(value) => return Self::Constant(value),
+                expression => normalized.push(expression),
+            }
+        }
+        normalized.sort_unstable();
+        normalized.dedup();
+        match normalized.len() {
+            0 => Self::Constant(conjunction),
+            1 => normalized.pop().expect("one Boolean guard expression"),
+            _ if conjunction => Self::All(normalized),
+            _ => Self::Any(normalized),
+        }
+    }
+
+    fn implies(&self, required: &Self) -> bool {
+        if self == required
+            || matches!(self, Self::Constant(false))
+            || matches!(required, Self::Constant(true))
+        {
+            return true;
+        }
+        match self {
+            Self::Any(active) => active.iter().all(|expression| expression.implies(required)),
+            Self::All(active) => match required {
+                Self::All(required) => required.iter().all(|expression| self.implies(expression)),
+                _ => active.iter().any(|expression| expression.implies(required)),
+            },
+            _ => match required {
+                Self::Any(required) => required.iter().any(|expression| self.implies(expression)),
+                Self::All(required) => required.iter().all(|expression| self.implies(expression)),
+                _ => false,
+            },
+        }
+    }
+
+    pub fn heap_size(&self) -> usize {
+        match self {
+            Self::Defined(value)
+            | Self::Undefined(value)
+            | Self::Truthy(value)
+            | Self::Falsy(value)
+            | Self::Opaque(value)
+            | Self::NegatedOpaque(value) => value.len(),
+            Self::All(expressions) | Self::Any(expressions) => {
+                expressions
+                    .iter()
+                    .fold(std::mem::size_of::<Vec<Self>>(), |size, expression| {
+                        size.saturating_add(std::mem::size_of::<Self>())
+                            .saturating_add(expression.heap_size())
+                    })
+            }
+            Self::Constant(_) => 0,
+        }
+    }
+}
+
+impl PreprocessorGuard {
+    fn as_boolean_expression(&self) -> Option<BooleanGuardExpression> {
+        match self {
+            Self::Defined(name) => Some(BooleanGuardExpression::Defined(name.clone())),
+            Self::Undefined(name) => Some(BooleanGuardExpression::Undefined(name.clone())),
+            Self::Boolean(expression) => Some(expression.clone()),
+            Self::Constant(value) => Some(BooleanGuardExpression::Constant(*value)),
+            Self::Expression(_) | Self::NegatedExpression(_) => None,
+        }
+    }
+
+    fn negated(&self) -> Self {
+        match self {
+            Self::Defined(name) => Self::Undefined(name.clone()),
+            Self::Undefined(name) => Self::Defined(name.clone()),
+            Self::Boolean(expression) => Self::Boolean(expression.negated()),
             Self::Expression(expression) => Self::NegatedExpression(expression.clone()),
             Self::NegatedExpression(expression) => Self::Expression(expression.clone()),
             Self::Constant(value) => Self::Constant(!value),
@@ -832,7 +943,7 @@ impl PreprocessorGuard {
             // tree-sitter, but its full preprocessor semantics are outside the
             // analyzer's guard model. Any macro mutation can therefore change
             // its truth value.
-            Self::Expression(_) | Self::NegatedExpression(_) => true,
+            Self::Boolean(_) | Self::Expression(_) | Self::NegatedExpression(_) => true,
             Self::Constant(_) => false,
         }
     }
@@ -6852,7 +6963,28 @@ fn guard_requirements_hold_at_reference(
     required: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
-    reference.is_some_and(|active| required.is_subset(active))
+    reference.is_some_and(|active| {
+        required
+            .iter()
+            .all(|guard| preprocessor_guard_holds_at_reference(guard, active))
+    })
+}
+
+fn preprocessor_guard_holds_at_reference(
+    required: &PreprocessorGuard,
+    active: &HashSet<PreprocessorGuard>,
+) -> bool {
+    if active.contains(required) {
+        return true;
+    }
+    let active_expression = BooleanGuardExpression::all(
+        active
+            .iter()
+            .filter_map(PreprocessorGuard::as_boolean_expression),
+    );
+    required
+        .as_boolean_expression()
+        .is_some_and(|required| active_expression.implies(&required))
 }
 
 /// Cross-file guard rule: two guard sets are compatible when neither one
@@ -7141,7 +7273,104 @@ fn simple_preprocessor_expression_guard(
             .filter_map(|index| expression.named_child(index))
             .next()
             .and_then(|child| simple_preprocessor_expression_guard(child, source)),
+        "binary_expression" => Some(PreprocessorGuard::Boolean(boolean_preprocessor_expression(
+            expression, source,
+        ))),
         _ => None,
+    }
+}
+
+fn boolean_preprocessor_expression(expression: Node<'_>, source: &str) -> BooleanGuardExpression {
+    match expression.kind() {
+        "number_literal" => match node_text(expression, source).trim() {
+            "0" => BooleanGuardExpression::Constant(false),
+            "1" => BooleanGuardExpression::Constant(true),
+            _ => BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                expression, source,
+            ))),
+        },
+        "identifier" => BooleanGuardExpression::Truthy(node_text(expression, source).to_string()),
+        "preproc_defined" => {
+            let identifier = (0..expression.named_child_count())
+                .filter_map(|index| expression.named_child(index))
+                .find(|child| child.kind() == "identifier");
+            identifier.map_or_else(
+                || {
+                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                        expression, source,
+                    )))
+                },
+                |identifier| {
+                    BooleanGuardExpression::Defined(node_text(identifier, source).to_string())
+                },
+            )
+        }
+        "unary_expression"
+            if expression
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!") =>
+        {
+            expression.child_by_field_name("argument").map_or_else(
+                || {
+                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                        expression, source,
+                    )))
+                },
+                |argument| boolean_preprocessor_expression(argument, source).negated(),
+            )
+        }
+        "parenthesized_expression" => (0..expression.named_child_count())
+            .filter_map(|index| expression.named_child(index))
+            .next()
+            .map_or_else(
+                || {
+                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                        expression, source,
+                    )))
+                },
+                |child| boolean_preprocessor_expression(child, source),
+            ),
+        "binary_expression" => {
+            let operands = || {
+                Some((
+                    boolean_preprocessor_expression(
+                        expression.child_by_field_name("left")?,
+                        source,
+                    ),
+                    boolean_preprocessor_expression(
+                        expression.child_by_field_name("right")?,
+                        source,
+                    ),
+                ))
+            };
+            match expression
+                .child_by_field_name("operator")
+                .map(|operator| operator.kind())
+            {
+                Some("&&") => operands().map_or_else(
+                    || {
+                        BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                            expression, source,
+                        )))
+                    },
+                    |(left, right)| BooleanGuardExpression::all([left, right]),
+                ),
+                Some("||") => operands().map_or_else(
+                    || {
+                        BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                            expression, source,
+                        )))
+                    },
+                    |(left, right)| BooleanGuardExpression::any([left, right]),
+                ),
+                _ => BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
+                    expression, source,
+                ))),
+            }
+        }
+        _ => {
+            BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(expression, source)))
+        }
     }
 }
 
@@ -7317,14 +7546,13 @@ fn callable_preprocessor_context_is_visible_for_reference(
                 }
                 // The declaration stands under a guard whose value this
                 // analyzer cannot decide. It is still co-active with a
-                // reference that stands under the same guard, so accept the
-                // guard when the reference already requires it. Collecting one
-                // guard per ancestor makes the whole walk a subset test of the
-                // declaration guards against the reference guards.
+                // reference whose active guards imply it. Collecting one guard
+                // per ancestor makes the whole walk a conjunction of the
+                // declaration requirements.
                 guard => {
                     if !reference
                         .guards()
-                        .is_some_and(|active| active.contains(&guard))
+                        .is_some_and(|active| preprocessor_guard_holds_at_reference(&guard, active))
                     {
                         return false;
                     }
@@ -11625,10 +11853,31 @@ mod tests {
             .descendant_for_byte_range(start, start + "helper".len())
             .expect("reference node");
         let mut expected = HashSet::default();
-        expected.insert(PreprocessorGuard::Expression(
-            "HAVE_ONE && HAVE_TWO".to_string(),
-        ));
+        expected.insert(PreprocessorGuard::Boolean(BooleanGuardExpression::All(
+            vec![
+                BooleanGuardExpression::Truthy("HAVE_ONE".to_string()),
+                BooleanGuardExpression::Truthy("HAVE_TWO".to_string()),
+            ],
+        )));
         assert_eq!(preprocessor_guard_environment(node, source), Some(expected));
+    }
+
+    #[test]
+    fn boolean_guard_normalization_proves_equivalence_and_implication() {
+        let windows = BooleanGuardExpression::Defined("WIN32".to_string());
+        let cygwin = BooleanGuardExpression::Defined("CYGWIN".to_string());
+        let negated_windows_branch =
+            BooleanGuardExpression::all([windows.clone(), cygwin.negated()]).negated();
+        let portable = BooleanGuardExpression::any([windows.negated(), cygwin]);
+        assert_eq!(negated_windows_branch, portable);
+
+        let missing_a = BooleanGuardExpression::Undefined("A".to_string());
+        let missing_b = BooleanGuardExpression::Undefined("B".to_string());
+        let missing_c = BooleanGuardExpression::Undefined("C".to_string());
+        let fallback_branch = BooleanGuardExpression::any([missing_a.clone(), missing_b.clone()]);
+        let fallback_declaration = BooleanGuardExpression::any([missing_a, missing_b, missing_c]);
+        assert!(fallback_branch.implies(&fallback_declaration));
+        assert!(!fallback_declaration.implies(&fallback_branch));
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
