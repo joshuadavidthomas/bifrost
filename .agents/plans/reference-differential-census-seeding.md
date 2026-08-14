@@ -84,8 +84,8 @@ Wholesale re-adjudication of tier 3 across the corpus is out of scope for the in
 
 ## Progress
 
-- [ ] M1: census module, tier-1 check, `--probe-seed census --tiers 1`, tokio + fixture acceptance
-- [ ] M2: forward adjudication of census sites, tiers 2-3 classification, ledger/shrink/rerun integration
-- [ ] M3: inverse-precision check, sharded corpus runner, two-language corpus pass
+- [x] M1: census frontier, tier-1 check, `--probe-seed census --tiers 1`, tokio + fixture acceptance
+- [x] M2: forward adjudication of census sites, tiers 2-3 classification, and streaming ledger/rerun integration
+- [ ] M3: inverse-precision check and sharded corpus runner implemented and tested; two-language production acceptance remains
 - [ ] M4 (optional): offline referee wiring for tier 3
-- [ ] Campaign: per-language tier-1-first passes; rediscovery audit against #1526/#1527/#1528/#1376/#1537/#1377
+- [ ] Campaign: ranks 1-30 accepted complete for every language; run and audit the 196 selected rank-31-and-later rows

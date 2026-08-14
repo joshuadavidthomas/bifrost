@@ -19,12 +19,13 @@ use crate::usage_index::{
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
     usage_scope_facts,
 };
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use brokk_bifrost_core::analyzer::usages::model::{ImportKind, UsageHit};
 use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::compute_line_starts;
@@ -187,20 +188,20 @@ pub fn scan_files_for_seeds(
         ) {
             return;
         }
-        let module_bindings = {
+        let raw_module_bindings = {
             let _scope =
                 brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
-            let raw_module_bindings = usage_module_binding_timeline(python, file, || {
+            usage_module_binding_timeline(python, file, || {
                 collect_module_binding_timeline(tree_ref.root_node(), source_str)
-            });
-            classify_module_binding_timeline(
-                python,
-                file,
-                raw_module_bindings.as_ref(),
-                seeds,
-                &edges,
-            )
+            })
         };
+        let module_bindings = classify_module_binding_timeline(
+            python,
+            file,
+            raw_module_bindings.as_ref(),
+            seeds,
+            &edges,
+        );
         let scoped_import_bindings = parse_python_import_bindings(source_str);
         let target_self_file = *file == target.source();
         let scope_facts = {
@@ -237,6 +238,7 @@ pub fn scan_files_for_seeds(
             edges: &edges,
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
+            raw_module_bindings: raw_module_bindings.as_ref(),
             module_bindings: &module_bindings,
             scoped_import_bindings: &scoped_import_bindings,
             scope_facts: scope_facts.as_ref(),
@@ -336,6 +338,7 @@ pub struct ScanCtx<'a> {
     /// an un-inferrable `recv` unambiguously means the target). Cross-file
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
+    raw_module_bindings: &'a ModuleBindingTimeline,
     module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
     scoped_import_bindings: &'a [PythonImportBinding],
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
@@ -387,6 +390,7 @@ fn indexed_scope_entry<'entry, 'facts>(
     scope_range_index: &'entry [ScopeRangeEntry],
     scope_facts: &'facts HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     node: Node<'_>,
+    mut skip_innermost: usize,
 ) -> Option<(&'entry CodeUnit, &'facts LocalBindingsSnapshot<String>)> {
     let mut cursor =
         scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
@@ -397,6 +401,10 @@ fn indexed_scope_entry<'entry, 'facts>(
             return None;
         }
         if entry.range.end_byte >= node.end_byte() {
+            if skip_innermost > 0 {
+                skip_innermost -= 1;
+                continue;
+            }
             return scope_facts
                 .get(&entry.scope)
                 .map(|facts| (&entry.scope, facts));
@@ -429,7 +437,12 @@ impl ScanCtx<'_> {
         &self,
         node: Node<'_>,
     ) -> Option<(&CodeUnit, &LocalBindingsSnapshot<String>)> {
-        indexed_scope_entry(self.scope_range_index, self.scope_facts, node)
+        indexed_scope_entry(
+            self.scope_range_index,
+            self.scope_facts,
+            node,
+            usize::from(function_declaration_expression_is_outer_scoped(node)),
+        )
     }
 
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
@@ -513,7 +526,7 @@ impl ScanCtx<'_> {
         if enclosing.is_function() {
             return target_owner_code_unit(self.graph.index, &enclosing).as_ref()
                 == Some(target_owner)
-                && function_declaration_expression_is_class_scoped(node);
+                && function_declaration_expression_is_outer_scoped(node);
         }
         target_owner_code_unit(self.graph.index, &enclosing).as_ref() == Some(target_owner)
     }
@@ -679,15 +692,47 @@ impl ScanCtx<'_> {
     }
 }
 
-fn function_declaration_expression_is_class_scoped(node: Node<'_>) -> bool {
+pub(crate) fn function_declaration_expression_is_outer_scoped(node: Node<'_>) -> bool {
     let site_start = node.start_byte();
     let site_end = node.end_byte();
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "function_definition" {
-            return parent.child_by_field_name("body").is_none_or(|body| {
-                !(body.start_byte() <= site_start && site_end <= body.end_byte())
-            });
+            if parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+            {
+                return false;
+            }
+            if parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+            {
+                return false;
+            }
+            if let Some(parameters) = parent.child_by_field_name("parameters")
+                && parameters.start_byte() <= site_start
+                && site_end <= parameters.end_byte()
+            {
+                let mut parameter = node;
+                while parameter.parent() != Some(parameters) {
+                    let Some(next) = parameter.parent() else {
+                        return false;
+                    };
+                    parameter = next;
+                }
+                let binder = if parameter.kind() == "identifier" {
+                    Some(parameter)
+                } else {
+                    parameter.child_by_field_name("name").or_else(|| {
+                        parameter
+                            .named_child(0)
+                            .filter(|child| child.kind() == "identifier")
+                    })
+                };
+                return binder.is_none_or(|binder| binder.id() != node.id());
+            }
+            return true;
         }
         if parent.kind() == "decorated_definition" {
             return current.kind() == "decorator";
@@ -1054,19 +1099,23 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         record_hit(attribute, ctx);
     }
 
-    if let Some(namespace_target) = namespace_attribute_target_hit(node, ctx) {
-        record_hit(namespace_target, ctx);
+    if let Some(module_binding_target) = module_binding_attribute_target_hit(node, ctx) {
+        record_hit(module_binding_target, ctx);
     }
 }
 
-/// Resolve a top-level symbol written through a namespace import and any number
-/// of intermediate modules (`K.feature.DISK`, `pkg.core.ops.eye_like`).
+/// Resolve a top-level symbol written through an imported module binding and
+/// any number of intermediate modules (`K.feature.DISK`,
+/// `pkg.core.ops.eye_like`). This includes both `import pkg as K` and
+/// `from pkg import submodule`; the latter is a named import syntactically but
+/// still introduces a module binding when the structured module index proves
+/// that `pkg.submodule` is a workspace module.
 ///
 /// The written path is assembled only from tree-sitter's `attribute` fields.
 /// The analyzer's canonical export resolver then proves that the whole path
 /// names the exact physical target, so re-export aliases remain supported
 /// without comparing rendered source paths or broadening same-name candidates.
-fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
+fn module_binding_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
     if ctx.target_member.is_some() {
         return None;
     }
@@ -1082,58 +1131,58 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         return None;
     }
 
-    let root_name = slice(root, ctx.source);
-    if root_name.is_empty() || import_root_shadowed(ctx, root_name, root, node) {
-        return None;
-    }
-    let binder = ctx.python.import_binder_of(ctx.file);
-    let binding = binder.bindings.get(root_name)?;
-    if binding.kind != ImportKind::Namespace {
-        return None;
-    }
-    let mut written_module = binding.module_specifier.clone();
-    for attribute in &attributes[..attributes.len() - 1] {
-        let segment = slice(*attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
+    for binding in imported_module_bindings(ctx, root, node) {
+        let mut written_module = binding.module.clone();
+        for attribute in attributes
+            [binding.consumed_attributes.min(attributes.len() - 1)..attributes.len() - 1]
+            .iter()
+        {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            written_module.push('.');
+            written_module.push_str(segment);
         }
-        written_module.push('.');
-        written_module.push_str(segment);
-    }
-    if usage_resolve_module_files(ctx.python, ctx.file, &written_module)
-        .iter()
-        .any(|resolved| {
-            ctx.seeds
-                .contains(&(resolved.clone(), terminal_name.to_string()))
-        })
-    {
-        return Some(terminal);
-    }
+        if usage_resolve_module_files(ctx.python, ctx.file, &written_module)
+            .iter()
+            .any(|resolved| {
+                ctx.seeds
+                    .contains(&(resolved.clone(), terminal_name.to_string()))
+            })
+        {
+            return Some(terminal);
+        }
 
-    let mut written_fqn = binding.module_specifier.clone();
-    for attribute in attributes {
-        let segment = slice(attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
+        let mut written_fqn = binding.module;
+        for attribute in attributes.iter().skip(binding.consumed_attributes) {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            written_fqn.push('.');
+            written_fqn.push_str(segment);
         }
-        written_fqn.push('.');
-        written_fqn.push_str(segment);
+        if resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
+            ctx.graph.index.definitions(name).collect()
+        })
+        .into_iter()
+        .any(|candidate| &candidate == ctx.target)
+        {
+            return Some(terminal);
+        }
     }
-    resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
-        ctx.graph.index.definitions(name).collect()
-    })
-    .into_iter()
-    .any(|candidate| &candidate == ctx.target)
-    .then_some(terminal)
+    None
 }
 
 fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: Node<'_>) -> bool {
-    let Some(module_fqn) = imported_module_binding_fqn(ctx, root, reference) else {
-        return false;
-    };
-    usage_resolve_module_files(ctx.python, ctx.file, &module_fqn)
+    imported_module_bindings(ctx, root, reference)
         .into_iter()
-        .any(|resolved_file| &resolved_file == ctx.target_source)
+        .any(|binding| {
+            usage_resolve_module_files(ctx.python, ctx.file, &binding.module)
+                .into_iter()
+                .any(|resolved_file| &resolved_file == ctx.target_source)
+        })
 }
 
 fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
@@ -1141,27 +1190,29 @@ fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<
     if attributes.is_empty() {
         return None;
     }
-    let mut module_fqn = imported_module_binding_fqn(ctx, root, node)?;
-    for attribute in attributes {
-        let segment = slice(attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
-        }
-        if module_fqn.ends_with('.') {
-            module_fqn.push_str(segment);
-        } else {
-            module_fqn.push('.');
-            module_fqn.push_str(segment);
-        }
-        let resolved = usage_resolve_module_files(ctx.python, ctx.file, &module_fqn);
-        if resolved.is_empty() {
-            return None;
-        }
-        if resolved
-            .iter()
-            .any(|resolved_file| resolved_file == ctx.target_source)
-        {
-            return Some(attribute);
+    for binding in imported_module_bindings(ctx, root, node) {
+        let mut module_fqn = binding.module;
+        for attribute in attributes.iter().skip(binding.consumed_attributes) {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            if module_fqn.ends_with('.') {
+                module_fqn.push_str(segment);
+            } else {
+                module_fqn.push('.');
+                module_fqn.push_str(segment);
+            }
+            let resolved = usage_resolve_module_files(ctx.python, ctx.file, &module_fqn);
+            if resolved.is_empty() {
+                break;
+            }
+            if resolved
+                .iter()
+                .any(|resolved_file| resolved_file == ctx.target_source)
+            {
+                return Some(*attribute);
+            }
         }
     }
     None
@@ -1414,34 +1465,93 @@ fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
     }
 }
 
-fn imported_module_binding_fqn(
+struct ImportedModuleBinding {
+    module: String,
+    consumed_attributes: usize,
+}
+
+fn imported_module_bindings(
     ctx: &ScanCtx<'_>,
     root: Node<'_>,
     reference: Node<'_>,
-) -> Option<String> {
+) -> Vec<ImportedModuleBinding> {
     let root_text = slice(root, ctx.source);
-    if root_text.is_empty() {
-        return None;
+    if root_text.is_empty() || import_root_shadowed(ctx, root_text, root, reference) {
+        return Vec::new();
     }
-    if import_root_shadowed(ctx, root_text, root, reference) {
-        return None;
+
+    if let Some(binding) = ctx.scoped_import_bindings.iter().rev().find(|binding| {
+        binding.is_function_scoped()
+            && binding.start_byte <= reference.start_byte()
+            && binding.scope_start_byte <= reference.start_byte()
+            && reference.end_byte() <= binding.scope_end_byte
+            && binding.local_name == root_text
+    }) {
+        return if usage_resolve_module_files(ctx.python, ctx.file, &binding.qualified_name)
+            .is_empty()
+        {
+            Vec::new()
+        } else {
+            vec![ImportedModuleBinding {
+                module: binding.qualified_name.clone(),
+                consumed_attributes: binding.consumed_attributes,
+            }]
+        };
     }
-    let binder = ctx.python.import_binder_of(ctx.file);
-    let binding = binder.bindings.get(root_text)?;
-    match binding.kind {
-        ImportKind::Namespace => Some(binding.module_specifier.clone()),
-        ImportKind::Named => {
-            let imported = binding.imported_name.as_ref()?;
-            let candidate = if binding.module_specifier.ends_with('.') {
-                format!("{}{}", binding.module_specifier, imported)
-            } else {
-                format!("{}.{}", binding.module_specifier, imported)
-            };
-            (!usage_resolve_module_files(ctx.python, ctx.file, &candidate).is_empty())
-                .then_some(candidate)
-        }
-        _ => None,
-    }
+
+    let Some(events) = ctx.raw_module_bindings.get(root_text) else {
+        return Vec::new();
+    };
+    let cutoff = if reference_is_deferred_function_body(reference) {
+        usize::MAX
+    } else {
+        reference.start_byte()
+    };
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| event.visible_from <= cutoff)
+        .collect();
+    let start = visible
+        .iter()
+        .rposition(|event| !event.conditional)
+        .unwrap_or(0);
+    let mut modules = visible[start..]
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ModuleBindingEventKind::ImportModule {
+                module,
+                consumed_attributes,
+            } => Some(ImportedModuleBinding {
+                module: module.clone(),
+                consumed_attributes: *consumed_attributes,
+            }),
+            ModuleBindingEventKind::FromImport {
+                module,
+                imported_name,
+            } => {
+                let submodule = if module.ends_with('.') {
+                    format!("{module}{imported_name}")
+                } else {
+                    format!("{module}.{imported_name}")
+                };
+                (!usage_resolve_module_files(ctx.python, ctx.file, &submodule).is_empty())
+                    .then_some(ImportedModuleBinding {
+                        module: submodule,
+                        consumed_attributes: 0,
+                    })
+            }
+            ModuleBindingEventKind::Other => None,
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| {
+        left.module
+            .cmp(&right.module)
+            .then_with(|| left.consumed_attributes.cmp(&right.consumed_attributes))
+    });
+    modules.dedup_by(|left, right| {
+        left.module == right.module && left.consumed_attributes == right.consumed_attributes
+    });
+    modules
 }
 
 fn import_root_shadowed(
@@ -1450,9 +1560,9 @@ fn import_root_shadowed(
     root: Node<'_>,
     reference: Node<'_>,
 ) -> bool {
-    ctx.scope_facts_for_node(root)
-        .or_else(|| ctx.scope_facts_for_node(reference))
-        .is_some_and(|facts| facts.is_shadowed(root_text))
+    ctx.scope_entry_for_node(root)
+        .or_else(|| ctx.scope_entry_for_node(reference))
+        .is_some_and(|(scope, facts)| !scope.is_module() && facts.is_shadowed(root_text))
         || enclosing_parameters_shadow(root_text, reference, ctx.source)
 }
 
@@ -1548,32 +1658,26 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    let parent_kind = parent.kind();
-    if matches!(
-        parent_kind,
-        "class_definition" | "function_definition" | "parameters"
-    ) && parent
-        .child_by_field_name("name")
-        .map(|name| name.id() == node.id())
-        .unwrap_or(false)
-    {
-        return true;
+    let contains = |container: Node<'_>| {
+        container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+    };
+    match parent.kind() {
+        "class_definition" | "function_definition" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "parameters" | "lambda_parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            true
+        }
+        "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+            parent.child_by_field_name("name").is_some_and(contains)
+        }
+        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+            parent.child_by_field_name("left").is_some_and(contains)
+        }
+        "named_expression" => parent.child_by_field_name("name").is_some_and(contains),
+        "aliased_import" | "import_from_statement" | "import_statement" => true,
+        _ => false,
     }
-
-    if matches!(
-        parent_kind,
-        "aliased_import" | "import_from_statement" | "import_statement"
-    ) {
-        return true;
-    }
-
-    parent_kind == "assignment"
-        && parent
-            .child_by_field_name("left")
-            .map(|left| {
-                left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
-            })
-            .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1664,12 +1768,22 @@ fn collect_import_binding_events(
                 continue;
             };
             let module = slice(name, source).trim();
+            let consumed_attributes = if imported.child_by_field_name("alias").is_some() {
+                0
+            } else {
+                parse_symbol_path(Language::Python, module)
+                    .len()
+                    .saturating_sub(1)
+            };
             record_module_binding(
                 timeline,
                 slice(local, source),
                 node.end_byte(),
                 binding_is_conditional(node),
-                ModuleBindingEventKind::ImportModule(module.to_string()),
+                ModuleBindingEventKind::ImportModule {
+                    module: module.to_string(),
+                    consumed_attributes,
+                },
             );
         }
         return;
@@ -1727,7 +1841,7 @@ fn classify_module_binding_timeline(
             .iter()
             .map(|event| {
                 let kind = match &event.kind {
-                    ModuleBindingEventKind::ImportModule(module) => {
+                    ModuleBindingEventKind::ImportModule { module, .. } => {
                         if *module_targets
                             .entry(module.clone())
                             .or_insert_with(|| module_contains_seed(python, file, module, seeds))

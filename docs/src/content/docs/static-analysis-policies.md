@@ -34,9 +34,10 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, an initial catalog of twelve
+The installed binary embeds `bifrost.code-smells`, a catalog of thirteen
 structured match policies. It covers dynamic evaluation, unsafe Python object
-deserialization, and review prompts for sorting, regular-expression compilation,
+deserialization, rayon parallelism inside blocking Rust lazy initializers,
+and review prompts for sorting, regular-expression compilation,
 file reads, serialization, parsing, database calls, network calls, subprocesses,
 sleep, and expensive operations beneath nested loops. Every rule is an ordinary
 checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
@@ -61,6 +62,19 @@ sleep inside a condition-controlled `while` loop is usually the deliberate
 mechanism of a poll or bounded-backoff loop and no longer matches. Counting
 loops that a language cannot lexically distinguish from iteration (Go's single
 `for`, C-style `for`) stay outside the rule.
+
+Pack version 1.5 adds `bifrost.correctness.rayon-in-blocking-lazy-init`, a
+Rust-only review prompt for a blocking lazy-init call (`OnceLock::get_or_init`,
+`OnceLock::get_or_try_init`, `Once::call_once`, `LazyLock::new`) whose
+initializer closure lexically contains rayon parallelism (`par_iter`,
+`into_par_iter`, `par_bridge`, `par_chunks`). When the first initialization
+runs on a rayon worker, the initializer's parallel join steals sibling jobs; a
+stolen job that re-enters the same cell parks on it forever and can wedge the
+whole pool. The match is lexical containment, not proof of a deadlock: a rayon
+call inside a nested closure defined within the initializer also matches even
+when that closure only runs later, and bare `rayon::join`, `rayon::scope`, and
+`ThreadPool::install` are excluded because their unqualified names are too
+generic for a name-based rule.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
@@ -240,7 +254,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
+| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
 
 ### Taint: broad libraries, specific findings
 
@@ -373,7 +387,7 @@ as the named one. `:forbid-tier TIER` removes one tier from the accepted range,
 and `:require-unique true` makes ambiguity a violation rather than a silent
 pick. A combination no tier can satisfy is rejected when the document loads.
 
-`(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside
+`(assert-binding-scope :id ID :at CAPTURE :role ROLE :declared inside|outside
 :relative-to CAPTURE2)` requires the binding actually in effect at the captured
 reference to be declared inside, or outside, a second captured node. This is the
 loop-invariance predicate: capture a loop and the receiver of a call inside it,
@@ -514,7 +528,7 @@ excluded.
 
 #### A worked loop-invariance rule
 
-The rule below is the reason `assert-reaching` exists. A structural rule that
+The rule below is the reason `assert-binding-scope` exists. A structural rule that
 only asks "is this call written inside a loop" cannot tell a collection built
 inside the loop and canonicalized once from a collection built before the loop
 and re-sorted on every pass; the second is the waste worth reporting and the
@@ -542,7 +556,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
 ; was itself created inside the loop, so the work is inherent to the iteration.
 ; The condition those rules actually want is loop *invariance* of the operand:
 ; the same value, created once, re-sorted on every pass. That is a
-; reaching-binding question, and this rule asks it -- the requirement is that
+; binding-of question, and this rule asks it -- the requirement is that
 ; the sorted receiver be declared inside the loop, so the violation is the half
 ; declared outside it.
 ;
@@ -586,7 +600,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
               (inside (loop :capture "region")
                       (call :callee (name "sort") :receiver (identifier :capture "target"))))))
       :asserts [
-        (assert-reaching :id declared-inside :at "target" :role receiver_position
+        (assert-binding-scope :id declared-inside :at "target" :role receiver_position
                          :declared inside :relative-to "region")
       ]))
 ```

@@ -628,6 +628,16 @@ struct PythonApiCollector<'a, 'd> {
     /// that member's position, so a conditional import cannot mint one member
     /// identity twice and a second binding can widen the first one's guard.
     imported_names: std::collections::HashMap<String, usize>,
+    /// Source-ordered Python bindings that can name a class in a hierarchy
+    /// expression. The optional target is `None` when a binding is known but
+    /// does not identify one declared type.
+    hierarchy_bindings: std::collections::HashMap<String, HierarchyBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HierarchyBinding {
+    target: Option<String>,
+    guard: Option<usize>,
 }
 
 /// One pending subtree in the collector's iterative walk.
@@ -678,6 +688,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             members: Vec::new(),
             guards: Vec::new(),
             imported_names: std::collections::HashMap::new(),
+            hierarchy_bindings: std::collections::HashMap::new(),
         };
         collector.push_type(
             module.to_owned(),
@@ -878,7 +889,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                     named_children(bases)
                         .map(|base| HierarchyFact {
                             hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
-                            target: type_ref(base, self.source, self.limits.max_signature_depth),
+                            target: self.hierarchy_type_ref(base, &owner, guard),
                             declaration_ordinal: None,
                         })
                         .collect()
@@ -895,6 +906,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 hierarchy,
                 guard,
             );
+            self.record_hierarchy_binding(&owner, &name, Some(qualified.clone()), guard);
             if let Some(body) = definition.child_by_field_name("body") {
                 stack.push(PendingNode {
                     node: body,
@@ -920,6 +932,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             .any(|decorator| decorator == "staticmethod");
         let signature =
             function_signature(definition, self.source, self.limits.max_signature_depth);
+        self.record_hierarchy_binding(&owner, &name, None, guard);
         self.push_member(owner, name, member_kind, is_static, signature, guard);
     }
 
@@ -942,6 +955,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let Some(name) = node_identifier(Some(left), self.source) else {
             return;
         };
+        self.record_hierarchy_binding(owner, &name, None, guard);
         if assignment
             .child_by_field_name("type")
             .or_else(|| {
@@ -991,10 +1005,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         for import in
             brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
         {
+            let hierarchy_target = self.import_hierarchy_target(&import);
             let name = match import.local_name().filter(|_| !import.is_wildcard) {
                 Some(name) => name,
                 None => PYTHON_UNENUMERATED_BINDING,
             };
+            if name != PYTHON_UNENUMERATED_BINDING {
+                self.record_hierarchy_binding(owner, name, hierarchy_target, guard);
+            }
             // Two branches of a `try`/`except ImportError` pair bind the same
             // name; recording it twice would mint one identity twice and mark
             // the surface ambiguous. The surviving binding takes the union of
@@ -1019,6 +1037,107 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             if self.members.len() > index {
                 self.imported_names.insert(key, index);
             }
+        }
+    }
+
+    fn import_hierarchy_target(&self, import: &crate::analyzer::ImportInfo) -> Option<String> {
+        use brokk_bifrost_python::imports::{
+            PythonImportDetails, python_import_details, python_namespace_binding_module,
+            resolve_python_relative_module_from_package,
+        };
+
+        match python_import_details(import)? {
+            PythonImportDetails::Import { module, alias } => Some(python_namespace_binding_module(
+                import,
+                alias.as_deref(),
+                &module,
+            )),
+            PythonImportDetails::FromImport {
+                module,
+                name,
+                wildcard: false,
+                ..
+            } => {
+                let package = if self.path.file_stem().is_some_and(|stem| stem == "__init__") {
+                    self.module
+                } else {
+                    self.module
+                        .rsplit_once('.')
+                        .map_or("", |(package, _)| package)
+                };
+                let module = resolve_python_relative_module_from_package(package, &module)?;
+                Some(format!("{module}.{name}"))
+            }
+            PythonImportDetails::FromImport { wildcard: true, .. } => None,
+        }
+    }
+
+    fn record_hierarchy_binding(
+        &mut self,
+        owner: &str,
+        name: &str,
+        target: Option<String>,
+        guard: Option<usize>,
+    ) {
+        let key = format!("{owner}.{name}");
+        let next = HierarchyBinding { target, guard };
+        match self.hierarchy_bindings.get(&key) {
+            Some(previous) if guard.is_some() && previous != &next => {
+                self.hierarchy_bindings.insert(
+                    key,
+                    HierarchyBinding {
+                        target: None,
+                        guard: None,
+                    },
+                );
+            }
+            _ => {
+                self.hierarchy_bindings.insert(key, next);
+            }
+        }
+    }
+
+    fn hierarchy_type_ref(&self, node: Node<'_>, owner: &str, guard: Option<usize>) -> TypeRef {
+        let parsed = type_ref(node, self.source, self.limits.max_signature_depth);
+        let Some(segments) = type_name_segments(node, self.source) else {
+            return parsed;
+        };
+        let Some((local, suffix)) = segments.split_first() else {
+            return parsed;
+        };
+        let mut scope = Some(owner);
+        let mut target = None;
+        while let Some(current) = scope {
+            let key = format!("{current}.{local}");
+            if let Some(binding) = self.hierarchy_bindings.get(&key) {
+                if binding.guard.is_none() || binding.guard == guard {
+                    target = binding.target.clone();
+                }
+                break;
+            }
+            scope = current.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        let Some(mut target) = target else {
+            return parsed;
+        };
+        if !suffix.is_empty() {
+            target.push('.');
+            target.push_str(&suffix.join("."));
+        }
+        match parsed {
+            TypeRef::Named {
+                arguments,
+                nullable,
+                ..
+            } => TypeRef::Declared {
+                id: type_declaration_id(TypeIdentity {
+                    ecosystem: "python",
+                    name: &target,
+                }),
+                arguments,
+                nullable,
+            },
+            other => other,
         }
     }
 
@@ -1580,6 +1699,10 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
 /// The walk is iterative because an annotation nests its qualifier on the
 /// left: `a.b.c` is `member_type(member_type(a, b), c)`.
 fn type_name(node: Node<'_>, source: &str) -> Option<String> {
+    type_name_segments(node, source).map(|segments| segments.join("."))
+}
+
+fn type_name_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = node;
     loop {
@@ -1590,7 +1713,7 @@ fn type_name(node: Node<'_>, source: &str) -> Option<String> {
             }
             // One wrapper around the shape, and the generic name of a
             // subscripted annotation, are both the first named child.
-            "type" | "generic_type" => current = current.named_child(0)?,
+            "type" | "generic_type" | "subscript" => current = current.named_child(0)?,
             "attribute" => {
                 segments.push(node_identifier(
                     current.child_by_field_name("attribute"),
@@ -1610,7 +1733,7 @@ fn type_name(node: Node<'_>, source: &str) -> Option<String> {
         }
     }
     segments.reverse();
-    Some(segments.join("."))
+    Some(segments)
 }
 
 fn any_type() -> TypeRef {

@@ -8,6 +8,10 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/value_flow_conformance.rs"]
+pub mod value_flow_conformance;
+#[path = "../common/value_flow_scenarios.rs"]
+pub mod value_flow_scenarios;
 
 mod benchmark_compare;
 mod benchmark_manifest;
@@ -24,6 +28,7 @@ mod policy_assertion_per_file_completion;
 mod policy_baseline_evaluation;
 mod policy_docs;
 mod policy_edge_parity_assertions;
+mod policy_flow_state_assertions;
 mod policy_identity_assertions;
 mod policy_identity_conformance;
 mod policy_loading;
@@ -53,8 +58,11 @@ mod sanitizer_pack_shipping;
 #[cfg(feature = "release-tooling")]
 mod golden_summary_pack_shipping;
 mod issue_1917_bodied_sink;
+mod issue_1951_balanced_policy;
 mod issue_1953_ruby_call_binding;
 mod issue_1954_direct_call_witness;
+mod issue_1978_unmaterialized_external_summary;
+mod issue_1987_receiverless_call_binding;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this
@@ -68,5 +76,6 @@ mod summary_foundry_fixtures;
 #[cfg(feature = "release-tooling")]
 mod summary_foundry_demand;
 mod taint_policy_adapter;
+mod taint_regression_fixtures;
 #[cfg(unix)]
 mod temp_storage_scripts;

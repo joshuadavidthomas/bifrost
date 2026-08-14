@@ -8,7 +8,8 @@
 //! resolve consistently to the *same* declaration set.
 
 use crate::common::{
-    InlineTestProject, definition_reference_status, sorted_source_paths, symbol_sources,
+    InlineTestProject, definition_at, definition_reference_status, sorted_source_paths,
+    symbol_sources,
 };
 use brokk_bifrost::Language;
 
@@ -262,4 +263,54 @@ int HTMLLayout::getContentType() const {
         vec!["multi.cpp".to_string()],
         "{bare}"
     );
+}
+
+#[test]
+fn owner_namespace_is_selected_by_the_visible_class_not_directive_order() {
+    let header = r#"
+namespace xmlProtoFuzzer {
+class ProtoConverter {
+public:
+    void visit(int);
+    void visit(double);
+    int removeNonAscii();
+};
+}
+"#;
+    let source = r#"
+#include "converter.h"
+
+using namespace std;
+using namespace xmlProtoFuzzer;
+
+void ProtoConverter::visit(int) {
+    visit(1.0);
+    removeNonAscii();
+}
+
+void ProtoConverter::visit(double) {}
+int ProtoConverter::removeNonAscii() { return 0; }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("converter.h", header)
+        .file("converter.cpp", source)
+        .build();
+    for (needle, expected) in [
+        ("visit(1.0)", "xmlProtoFuzzer.ProtoConverter.visit"),
+        (
+            "removeNonAscii();",
+            "xmlProtoFuzzer.ProtoConverter.removeNonAscii",
+        ),
+    ] {
+        let result = definition_at(&project, "converter.cpp", source, needle);
+        assert_eq!(result["status"], "resolved", "{result:#}");
+        let definitions = result["definitions"].as_array().expect("definitions array");
+        assert!(!definitions.is_empty(), "{result:#}");
+        assert!(
+            definitions
+                .iter()
+                .all(|definition| definition["fqn"] == expected),
+            "{result:#}"
+        );
+    }
 }

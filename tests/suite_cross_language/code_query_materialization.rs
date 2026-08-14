@@ -184,11 +184,86 @@ fn python_overload_stubs_link_to_their_implementation() {
     // Both parse stubs reach the one runnable def; the orphan reaches nothing.
     assert_eq!(implementations, vec!["app.over.parse"], "{value:#}");
 
-    // The stubs are three rows; only one distinct implementation answers
-    // them, and the orphan is the stub the forward join never reaches. An
-    // inverse listing (implementation -> its stubs, or the orphans directly)
-    // is not yet composable on the query surface; the plan records that
-    // bound and its follow-up.
+    // The inverse listing (#1660): `stubs-of` walks the link rows backward,
+    // so the runnable def answers with exactly its two stub state rows.
+    let result = run(
+        files,
+        json!({
+            "match": { "kind": "callable" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "stubs_of" },
+            ],
+        }),
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_required_relational_fields_project(&result);
+    let value = serialized(&result);
+    let stubs = strings(&value, "fq_name");
+    assert_eq!(
+        stubs,
+        vec!["app.over.parse", "app.over.parse"],
+        "the implementation lists exactly its own stubs: {value:#}"
+    );
+
+    // The orphan is now a direct listing: every declaration-only stub state
+    // row, minus the ones some implementation claims through `stubs-of`.
+    let result = run(
+        files,
+        json!({
+            "except": [
+                {
+                    "match": { "kind": "callable" },
+                    "steps": [
+                        { "op": "enclosing_decl" },
+                        { "op": "declaration_state_of", "declaration_only": true },
+                    ],
+                },
+                {
+                    "match": { "kind": "callable" },
+                    "steps": [
+                        { "op": "enclosing_decl" },
+                        { "op": "stubs_of" },
+                    ],
+                },
+            ],
+        }),
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let value = serialized(&result);
+    let orphans = strings(&value, "fq_name");
+    assert_eq!(
+        orphans,
+        vec!["app.over.orphan"],
+        "the stub no implementation answers is listable directly: {value:#}"
+    );
+}
+
+/// #1658 (da26602's TypeScript spelling): overload signatures and ambient
+/// declarations are declaration-only signature rows. Unlike Python,
+/// TypeScript merges each callable's overload signatures and implementation
+/// into one unit, so an implemented overload set is a single runnable unit;
+/// only a callable with no implementation at all is declaration-only, and
+/// its implementation is an explicit absence.
+const TS_OVERLOADS: &str = "\
+export function parse(value: string): string;
+export function parse(value: number): number;
+export function parse(value: any): any {
+  return value;
+}
+declare function orphan(value: string): string;
+interface Contract {
+  parse(value: string): string;
+}
+class Widget {
+  render(value: string): void;
+  render(value: unknown): void {}
+}
+";
+
+#[test]
+fn typescript_stubs_without_an_implementation_are_declaration_only() {
+    let files = &[("src/over.ts", TS_OVERLOADS)];
     let result = run(
         files,
         json!({
@@ -199,12 +274,53 @@ fn python_overload_stubs_link_to_their_implementation() {
             ],
         }),
     );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     let value = serialized(&result);
-    let stubs = strings(&value, "fq_name");
-    assert_eq!(
-        stubs,
-        vec!["app.over.parse", "app.over.parse", "app.over.orphan"],
-        "three declaration-only stubs exist: {value:#}"
+    assert_eq!(strings(&value, "fq_name"), vec!["orphan"], "{value:#}");
+
+    // The orphan's implementation is an explicit absence: the forward join
+    // reaches nothing, and the claimed axis means no unsupported diagnostic.
+    let result = run(
+        files,
+        json!({
+            "match": { "kind": "callable" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "declaration_state_of", "declaration_only": true },
+                { "op": "implementation_of" },
+            ],
+        }),
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let value = serialized(&result);
+    assert!(rows(&value).is_empty(), "{value:#}");
+
+    // The near misses stay runnable: the implemented overload set is one
+    // runnable unit even though its stub signatures are declaration-only
+    // rows, the interface member is a contract rather than a stub, and the
+    // class overload set carries its implementation.
+    let result = run(
+        files,
+        json!({
+            "match": { "kind": "callable" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "declaration_state_of", "declaration_only": false },
+            ],
+        }),
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let value = serialized(&result);
+    let runnable = strings(&value, "fq_name");
+    for expected in ["parse", "Contract.parse", "Widget.render"] {
+        assert!(
+            runnable.iter().any(|fq_name| fq_name == expected),
+            "{expected} must be runnable: {value:#}"
+        );
+    }
+    assert!(
+        runnable.iter().all(|fq_name| fq_name != "orphan"),
+        "{value:#}"
     );
 }
 

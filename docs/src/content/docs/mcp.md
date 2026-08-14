@@ -11,6 +11,20 @@ bifrost --root /path/to/project --mcp "symbol|extended"
 
 Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code.
 
+## Tool Discovery Metadata
+
+Bifrost uses only standard MCP metadata for tool discovery. It does not provide a separate tool-search method.
+
+The initialize result contains routing instructions for the tools selected at startup. The first 512 characters contain the general routing guidance.
+
+Each tool has a specific name, description, and input schema. Server instructions and tool descriptions contain no more than 2,000 characters.
+
+The tool catalog stays fixed for the process lifetime. Therefore, Bifrost does not advertise `tools.listChanged` or send tool-list change notifications.
+
+Hosts can use this metadata in different ways. Codex and Claude Code use it for deferred discovery.
+
+Oh My Pi adds server instructions to its model prompt. The native Bifrost Pi extension forwards the same instructions itself.
+
 Root and nested `.bifrostignore` files exclude matching tracked or untracked
 files from code intelligence without hiding them from text-level tools
 (`find_files_containing`, `search_file_contents`, `get_file_contents`).
@@ -47,6 +61,20 @@ Current Codex does not advertise standard roots. For any rootless connection who
 
 Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK. It accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for.
 
+## Progress
+
+A tool call that carries a `progressToken` in its `_meta` receives `notifications/progress` on its own request as the call moves through its phases; a call without the token receives none. Progress is truthful and low volume: at most one notification per phase the call actually enters -- `waiting for workspace readiness`, `waiting for analyzer admission`, `executing <tool>`, and `cancelling <tool>` when the request budget expires -- so a call sends at most four. The token is echoed exactly as supplied, string or number, and concurrent calls with distinct tokens never share notifications.
+
+All phases are currently indeterminate: the `progress` value is a per-request monotonically increasing counter and `total` is never set, because none of the phases has a known item count -- the analyzer does not expose per-item counters at the MCP boundary, and Bifrost does not invent percentages. Workspace-mutating tools such as `activate_workspace` skip the readiness and admission phases because they take neither wait; `list_policies` reads only the built-in policy pack and reports no progress. An MRTR roots-activation round reports no progress either: it is an answer to the call, not a phase of an executing one. For work that may outlive the request or the connection, progress is the wrong tool; use the MCP Tasks support described below.
+
+## Tasks
+
+Bifrost implements the MCP Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) for explicitly batch-shaped work, and advertises it through both `initialize` and `server/discover`. Exactly one tool is eligible: `run_policy`, whose runtime scales with the whole corpus times the policy count. A `2026-07-28` request that declares the extension in its client capabilities and calls `run_policy` receives a durable task handle (`resultType: "task"`) instead of blocking on the result; the client polls `tasks/get` until the task is terminal, and the terminal response embeds exactly the `CallToolResult` a synchronous call would have produced, including the structured policy report and the `run_policy` correlation id. `tasks/cancel` requests cooperative cancellation and the task settles as `cancelled`. Clients that do not declare the extension -- and legacy `2025-11-25` clients even when they do -- keep the fully synchronous behavior and never see a task-shaped result. Navigation tools are deliberately ineligible: waiting out cold initialization is the intended readiness model, not a reason to hand back a task handle.
+
+Task execution runs under the same discipline as a synchronous call: it waits for workspace readiness, queues for a real analyzer slot, and is bound to the workspace authorization it was created under. If the client rebinds or revokes its workspace, running task work is cancelled promptly and every outstanding handle is refused from then on -- a task can never carry results across a workspace boundary. Tasks live for ten minutes by default (`BIFROST_MCP_TASK_TTL_MS` overrides this, in whole milliseconds); the TTL is also the execution deadline, so an expired task is marked `failed` at the same moment its analyzer work is cooperatively cancelled, and its terminal result stays pollable for one further TTL window before eviction. The advertised polling interval is one second, and at most eight tasks may be live at once.
+
+The durability boundary is the process. Bifrost's MCP transport is stdio, so one connection is one process: a task survives the request that created it, which is the point, but not a process restart. If a launcher restarts Bifrost, every handle is gone and polling it fails with an unknown-task error. Progress notifications (above) remain the lighter mechanism for bounded interactive requests; tasks are for work that may legitimately outlive the request.
+
 ## Request budget
 
 Analyzer-backed MCP requests have a five-second wall-clock budget by default. Set
@@ -58,6 +86,8 @@ until it stops, so repeated timeouts cannot overcommit the analyzer pool.
 A `2026-07-28` client gets three things a `2025-11-25` client does not. `server/discover` answers before any handshake, so a client can inspect Bifrost's capabilities without opening a session. Results carry the `resultType` discriminator. And `tools/list`, `resources/list`, and `resources/read` carry SEP-2549 cache hints: the tool list is `private` for five minutes because it is fixed for the life of the process but differs between servers started in different modes, and the agent-guidance resource is `public` for an hour because it is compiled into the binary. Tool results are never cacheable, because every one depends on the bound workspace and the current contents of its files. A `2025-11-25` client sees none of these fields.
 
 Rootless activation differs by revision because `2026-07-28` removed the post-initialization roots lifecycle. A client on that revision receives an `input_required` result carrying an embedded `roots/list` request, answers it with `inputResponses`, and retries the same tool call; Bifrost validates those roots exactly as it validates a `roots/list` reply, so the echoed `requestState` grants nothing on its own. Only one such round is offered per call.
+
+The two revisions also differ in where negotiation lives, and Bifrost keeps the two models separate. Legacy compatibility means the `2025-11-25` lifecycle is unchanged: a session opens with `initialize` and `notifications/initialized`, that handshake establishes the client's capabilities for the whole connection, and a rootless server acquires its workspace through the server-initiated `roots/list` exchange described above. Stateless execution means a `2026-07-28` client never sends `initialize` at all: it may probe with `server/discover`, and every request carries `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in its `_meta`. Each such request is validated on its own -- a missing or malformed negotiation key or an unsupported version is refused per request, whatever earlier requests carried -- and a rootless server binds its workspace through the `input_required` roots round above, with the same validation the legacy path applies. No connection-level handshake state is required or consulted for a stateless request. Codex sandbox-state metadata remains a legacy-lifecycle extension: it is negotiated during `initialize` and never binds a workspace for a stateless request.
 
 Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use client-provided roots or Codex sandbox-state metadata so package-local command resolution stays independent from analyzer scope.
 

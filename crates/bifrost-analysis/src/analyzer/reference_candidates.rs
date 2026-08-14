@@ -1,9 +1,16 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
-use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
+use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
+use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
+use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
+use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
+use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
+use brokk_bifrost_rust::declarations::rust_node_text;
+use brokk_bifrost_rust::graph::ast::is_rust_declaration_name;
+use brokk_bifrost_rust::lexical_scope::is_pattern_binding_identifier;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +127,61 @@ pub fn census_identifier_ranges(
         .expect("non-cancellable collection cannot be cancelled")
 }
 
+/// The identifier membership used to validate inverse hits independently of
+/// probe eligibility. It retains the census contract and additionally includes
+/// grammar nodes that are simultaneous source references and binders, such as
+/// JS/TS shorthand destructuring properties (#2037). Java membership also
+/// descends parser-recovery subtrees while excluding structured declaration and
+/// label roles: valid inverse references remain backed without proposing those
+/// recovery tokens as forward census sites (#2086).
+pub fn census_membership_identifier_ranges(
+    root: Node<'_>,
+    language: Language,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    collect_candidate_ranges(
+        root,
+        language,
+        limit,
+        CandidateFrontier::CensusMembership,
+        &|| false,
+    )
+    .expect("non-cancellable collection cannot be cancelled")
+}
+
+/// Collect structured identifier occurrences inside Python deferred
+/// annotations for inverse membership. Arbitrary strings and `Literal[...]`
+/// values remain absent, and the ordinary census probe frontier is unchanged.
+pub fn python_deferred_annotation_membership_ranges(
+    root: Node<'_>,
+    source: &str,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "string"
+            && let Some(deferred) = python_deferred_annotation_identifier_ranges(node, source, None)
+        {
+            for range in deferred {
+                if ranges.len() == limit {
+                    ranges.sort_unstable();
+                    ranges.dedup();
+                    return ReferenceCandidateRanges::LimitExceeded { limit, ranges };
+                }
+                ranges.push(range);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ReferenceCandidateRanges::Complete(ranges)
+}
+
 /// Per-file answer to "could a BARE occurrence of this name, at this byte, bind
 /// to something declared in this file?".
 ///
@@ -184,6 +246,7 @@ enum CandidateFrontier {
     References,
     SemanticTokens,
     Census,
+    CensusMembership,
 }
 
 fn collect_candidate_ranges(
@@ -194,8 +257,8 @@ fn collect_candidate_ranges(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Option<ReferenceCandidateRanges> {
     let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, false)];
+    while let Some((node, inside_error)) = stack.pop() {
         if is_cancelled() {
             return None;
         }
@@ -209,12 +272,19 @@ fn collect_candidate_ranges(
         // leaves the rest of the file proposed. The index-filtered and
         // semantic-token frontiers keep their existing reach, because the LSP
         // still colors and resolves inside a broken edit.
-        if matches!(frontier, CandidateFrontier::Census) && node.is_error() {
+        if (matches!(frontier, CandidateFrontier::Census)
+            || (matches!(frontier, CandidateFrontier::CensusMembership)
+                && !matches!(language, Language::Java | Language::Php)))
+            && node.is_error()
+        {
             continue;
         }
+        let inside_error = inside_error || node.is_error();
         let compound = matches!(
             frontier,
-            CandidateFrontier::References | CandidateFrontier::Census
+            CandidateFrontier::References
+                | CandidateFrontier::Census
+                | CandidateFrontier::CensusMembership
         ) && is_compound_reference_candidate(language, node.kind());
         let candidate = match frontier {
             CandidateFrontier::References => is_reference_candidate_node(language, node.kind()),
@@ -225,11 +295,19 @@ fn collect_candidate_ranges(
             // identifier-class leaves the semantic-token frontier keeps, unioned
             // with the receiver keywords and compound callable names the
             // reference frontier adds. No index knowledge, no exclusions.
-            CandidateFrontier::Census => {
+            CandidateFrontier::Census | CandidateFrontier::CensusMembership => {
                 is_semantic_token_identifier_node(language, node.kind())
                     || is_reference_candidate_node(language, node.kind())
+                    || (matches!(frontier, CandidateFrontier::CensusMembership)
+                        && matches!(language, Language::JavaScript | Language::TypeScript)
+                        && node.kind() == "shorthand_property_identifier_pattern")
             }
         };
+        let candidate = candidate
+            && !(inside_error
+                && language == Language::Php
+                && matches!(frontier, CandidateFrontier::CensusMembership)
+                && !php_is_recovered_membership_reference(node));
         if candidate
             && !is_excluded_reference_candidate(language, node, frontier)
             && (node.named_child_count() == 0 || compound)
@@ -250,7 +328,7 @@ fn collect_candidate_ranges(
 
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            stack.push(child);
+            stack.push((child, inside_error));
         }
     }
     ranges.sort_unstable();
@@ -274,9 +352,17 @@ fn is_excluded_reference_candidate(
     if language == Language::CSharp
         && matches!(
             frontier,
-            CandidateFrontier::References | CandidateFrontier::Census
+            CandidateFrontier::References
+                | CandidateFrontier::Census
+                | CandidateFrontier::CensusMembership
         )
         && csharp_is_statement_label(node)
+    {
+        return true;
+    }
+    if language == Language::Java
+        && matches!(frontier, CandidateFrontier::CensusMembership)
+        && (java_is_declaration_name(node) || java_is_label_name(node))
     {
         return true;
     }
@@ -289,19 +375,18 @@ fn is_excluded_reference_candidate(
         Language::Go => go_is_declaration_or_import_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
         Language::Rust => is_rust_associated_type_declaration_name(node),
-        Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
+        Language::JavaScript | Language::TypeScript => is_export_alias_identifier(node),
         _ => false,
     }
 }
 
-fn is_js_ts_export_alias(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "export_specifier"
-        && parent
-            .child_by_field_name("alias")
-            .is_some_and(|alias| alias == node)
+fn java_is_label_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "labeled_statement" | "break_statement" | "continue_statement"
+        )
+    })
 }
 
 /// Whether a Go identifier occupies a declaration or import binding role.
@@ -314,8 +399,13 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
         (matches!(
             parent.kind(),
             "field_declaration"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_elem"
                 | "type_alias"
                 | "type_spec"
+                | "var_spec"
+                | "const_spec"
                 | "import_spec"
                 | "package_clause"
                 | "parameter_declaration"
@@ -325,6 +415,36 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
             || (parent.kind() == "package_clause"
                 && matches!(node.kind(), "identifier" | "package_identifier"))
     })
+}
+
+/// Whether a PHP terminal is a namespace or constant declaration name rather
+/// than a definition probe. The language-owned helper remains the source of
+/// truth; this analysis facade keeps the root runner independent of language
+/// crate dependencies.
+pub fn php_is_declaration_name(node: Node<'_>) -> bool {
+    php_declaration_name(node)
+}
+
+/// Whether a Rust identifier is the name field of an indexed item declaration.
+///
+/// The language-owned AST helper is shared with diagnostics and usage scans;
+/// the analysis facade exposes it to the corpus runner without duplicating the
+/// Rust grammar's declaration-kind list.
+pub fn rust_is_declaration_name(node: Node<'_>) -> bool {
+    is_rust_declaration_name(node)
+}
+
+/// Whether the Rust parser reads this identifier as a local binding pattern.
+///
+/// Bare enum variants in match patterns share this syntax, so callers must
+/// retain a site when indexed enum-variant evidence exists for the spelling.
+pub fn rust_is_pattern_binding_name(node: Node<'_>) -> bool {
+    is_pattern_binding_identifier(node)
+}
+
+/// Canonical source spelling for one Rust identifier-like node.
+pub fn rust_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    rust_node_text(node, source)
 }
 
 fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
@@ -443,6 +563,20 @@ mod tests {
             .into_iter()
             .map(|range| range.start_byte)
             .collect()
+    }
+
+    fn census_membership_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, path);
+        let tree = parse_tree_for_language(&file, language, source)
+            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+        let ReferenceCandidateRanges::Complete(ranges) =
+            census_membership_identifier_ranges(tree.root_node(), language, 1000)
+        else {
+            panic!("census membership budget exceeded for {language:?}");
+        };
+        ranges.into_iter().map(|range| range.start_byte).collect()
     }
 
     fn census_texts<'a>(language: Language, path: &str, source: &'a str) -> Vec<&'a str> {
@@ -568,6 +702,166 @@ mod tests {
                 "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
             );
         }
+    }
+
+    #[test]
+    fn js_ts_census_membership_adds_only_shorthand_destructuring_properties() {
+        let source = concat!(
+            "const plain = 1;\n",
+            "const { shorthand } = owner;\n",
+            "const { renamed: local } = owner;\n",
+            "const literal = { \"quoted\": 1 };\n",
+        );
+        for (language, path) in [
+            (Language::JavaScript, "index.js"),
+            (Language::TypeScript, "index.ts"),
+        ] {
+            let census = census_offsets(language, path, source);
+            let membership = census_membership_offsets(language, path, source);
+            let shorthand = source.find("shorthand").expect("shorthand property");
+            let renamed = source.find("renamed").expect("renamed property");
+            let local = source.find("local").expect("renamed local binder");
+            let plain = source.find("plain").expect("ordinary declaration");
+            let quoted = source.find("quoted").expect("quoted key");
+
+            assert!(!census.contains(&shorthand), "{language:?}: {census:?}");
+            assert!(
+                membership.contains(&shorthand),
+                "{language:?}: {membership:?}"
+            );
+            for offset in [renamed, local, plain] {
+                assert_eq!(
+                    census.contains(&offset),
+                    membership.contains(&offset),
+                    "only the exact shorthand grammar node is added for {language:?} at {offset}"
+                );
+            }
+            assert!(
+                !membership.contains(&quoted),
+                "{language:?}: {membership:?}"
+            );
+
+            let added = membership
+                .iter()
+                .copied()
+                .filter(|offset| !census.contains(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(added, vec![shorthand], "{language:?}");
+        }
+    }
+
+    #[test]
+    fn python_deferred_annotation_membership_excludes_ordinary_and_literal_strings() {
+        let source = concat!(
+            "from typing import Literal\n",
+            "def deferred(value: \"pkg.Widget | list[Gadget]\") -> \"Result\": ...\n",
+            "def ordinary(): return \"Widget\"\n",
+            "def literal(value: Literal[\"Widget\"]): ...\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "models.py");
+        let tree = parse_tree_for_language(&file, Language::Python, source)
+            .expect("failed to parse Python");
+        let ReferenceCandidateRanges::Complete(ranges) =
+            python_deferred_annotation_membership_ranges(tree.root_node(), source, 100)
+        else {
+            panic!("deferred annotation membership budget exceeded");
+        };
+        let offsets = ranges
+            .iter()
+            .map(|range| range.start_byte)
+            .collect::<Vec<_>>();
+        for expected in ["pkg", "Widget |", "list[", "Gadget]", "Result\""] {
+            let offset = source.find(expected).expect("expected deferred token");
+            assert!(
+                offsets.contains(&offset),
+                "deferred token at {offset} is absent: {offsets:?}"
+            );
+        }
+        for excluded in [
+            source.find("return \"Widget\"").expect("ordinary string") + "return \"".len(),
+            source.find("Literal[\"Widget\"]").expect("Literal string") + "Literal[\"".len(),
+        ] {
+            assert!(
+                !offsets.contains(&excluded),
+                "non-type string at {excluded} entered membership: {offsets:?}"
+            );
+        }
+        assert!(matches!(
+            python_deferred_annotation_membership_ranges(tree.root_node(), source, 4),
+            ReferenceCandidateRanges::LimitExceeded { limit: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn java_census_membership_backs_recovered_references_without_proposing_them() {
+        let source = concat!(
+            "@interface Nullable {}\n",
+            "class Ticket {}\n",
+            "class Use {\n",
+            "  void trigger(Ticket @Nullable [] tickets) {}\n",
+            "  void recovered(Ticket @Nullable ... keys) {}\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::Java, "Use.java", source);
+        let membership = census_membership_offsets(Language::Java, "Use.java", source);
+        let recovered_type = source
+            .find("Ticket @Nullable ...")
+            .expect("recovered type reference");
+        let recovered_parameter = source.find("keys)").expect("recovered parameter");
+
+        assert!(
+            !census.contains(&recovered_type),
+            "the forward census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&recovered_type),
+            "the valid type reference must back inverse precision: {membership:?}"
+        );
+        assert!(
+            !membership.contains(&recovered_parameter),
+            "the recovered parameter declaration is not a reference: {membership:?}"
+        );
+    }
+
+    #[test]
+    fn php_census_membership_backs_only_structured_references_inside_recovery() {
+        let source = r#"<?php
+namespace App\Demo;
+
+class Id {
+    public static function make(): self { return new self(); }
+}
+
+class Result {
+    public ?Result $adjacent;
+    public function withInput(): self { return $this; }
+    public function copy(): self {
+        return clone($this, [
+            'id' => Id::make(),
+            'next' => $this->adjacent?->withInput(),
+            'noise' => unknown_token,
+        ]);
+    }
+}
+"#;
+        let census = census_offsets(Language::Php, "Use.php", source);
+        let membership = census_membership_offsets(Language::Php, "Use.php", source);
+        let static_scope = source.find("Id::make").expect("static scope");
+        let nullsafe_member = source.find("withInput(),").expect("nullsafe member call");
+        let arbitrary_recovery = source.rfind("unknown_token").expect("recovery noise");
+
+        assert!(
+            !census.contains(&static_scope) && !census.contains(&nullsafe_member),
+            "ordinary census must continue to skip ERROR subtrees: {census:?}"
+        );
+        assert!(membership.contains(&static_scope), "{membership:?}");
+        assert!(membership.contains(&nullsafe_member), "{membership:?}");
+        assert!(
+            !membership.contains(&arbitrary_recovery),
+            "arbitrary recovery leaves are not membership references: {membership:?}"
+        );
     }
 
     /// Tree-sitter error recovery destroys enclosing declaration nodes: a
@@ -949,6 +1243,53 @@ func run() {
             assert!(
                 offsets.contains(&reference),
                 "Go reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reference_frontier_excludes_interface_methods_and_value_declarations() {
+        let source = r#"package sample
+
+type Reader interface {
+    Read([]byte) (int, error)
+    Close() error
+}
+
+const Ready, Waiting = 1, 2
+
+func use(reader Reader) int {
+    _, _ = reader.Read(nil)
+    return Ready
+}
+"#;
+        let references = reference_candidate_offsets(Language::Go, "sample.go", source);
+        let census = census_offsets(Language::Go, "sample.go", source);
+        let declaration_offsets = [
+            source.find("Read([]byte)").expect("Read declaration"),
+            source.find("Close() error").expect("Close declaration"),
+            source.find("Ready, Waiting").expect("Ready declaration"),
+            source.find("Waiting =").expect("Waiting declaration"),
+        ];
+        for declaration in declaration_offsets {
+            assert!(
+                census.contains(&declaration),
+                "raw census must retain the declaration at {declaration}: {census:?}"
+            );
+            assert!(
+                !references.contains(&declaration),
+                "declaration at {declaration} entered the reference frontier: {references:?}"
+            );
+        }
+
+        for reference in [
+            source.rfind("Reader").expect("parameter type reference"),
+            source.rfind("Read").expect("method reference"),
+            source.rfind("Ready").expect("constant reference"),
+        ] {
+            assert!(
+                references.contains(&reference),
+                "reference at {reference} left the frontier: {references:?}"
             );
         }
     }

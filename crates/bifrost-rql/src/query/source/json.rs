@@ -746,6 +746,54 @@ fn validate_json_occurrence_axis(
     }
 }
 
+/// Validate one constrained-value array against its registry (#1480). A bad
+/// value reports the whole allowed set on the value's own range.
+fn validate_json_constrained_axis(
+    field: QueryStepField,
+    value: &spanned::Value,
+    analysis: &mut Analysis,
+) {
+    let accepted = constrained_step_option_labels(field);
+    let entries: Vec<&spanned::Value> = match value.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None => vec![value],
+    };
+    if entries.is_empty() {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            format!("{} must not be empty", field.label()),
+        );
+        return;
+    }
+    for entry in entries {
+        let Some(label) = entry.as_string() else {
+            require_json_string(entry, analysis);
+            continue;
+        };
+        if !accepted.contains(&label) {
+            add_spelling_error(
+                analysis,
+                entry.range(),
+                "unknown-value",
+                format!(
+                    "unknown {} value {label:?}; expected one of {}",
+                    field.label(),
+                    accepted.join(", ")
+                ),
+                label,
+                accepted
+                    .iter()
+                    .map(|candidate| ((*candidate).to_string(), (*candidate).to_string()))
+                    .collect::<Vec<_>>(),
+                |suggestion| {
+                    serde_json::to_string(suggestion).expect("suggestions are JSON strings")
+                },
+            );
+        }
+    }
+}
+
 /// Validate the `occurrences` seed object of a JSON query.
 /// Validate one lexical-environment filter object (a `scopes`/`bindings` seed
 /// body, or the option block of `bindings_in`/`candidates_of`) against the
@@ -879,7 +927,7 @@ fn validate_json_environment_filter(
         EnvironmentOptionKind::Scope => &["kind"],
         EnvironmentOptionKind::Binding => &["kind", "name", "hoisting"],
         EnvironmentOptionKind::Candidate => &["tier", "outcome", "boundary"],
-        EnvironmentOptionKind::ReachingBinding => &["include_shadowed"],
+        EnvironmentOptionKind::BindingOf => &["include_shadowed"],
         EnvironmentOptionKind::GenerationSite => &["kind", "input"],
         EnvironmentOptionKind::Export => &["form", "name"],
         EnvironmentOptionKind::DeclarationState => &["origin", "declaration_only", "config_gated"],
@@ -908,7 +956,7 @@ fn validate_json_environment_filter(
             EnvironmentOptionKind::Candidate if name == "boundary" => {
                 EnvironmentOptionField::Step(QueryStepField::CandidateBoundaries)
             }
-            EnvironmentOptionKind::ReachingBinding if name == "include_shadowed" => {
+            EnvironmentOptionKind::BindingOf if name == "include_shadowed" => {
                 EnvironmentOptionField::Step(QueryStepField::IncludeShadowed)
             }
             EnvironmentOptionKind::GenerationSite if name == "kind" => {
@@ -1149,7 +1197,10 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let occurrence_step = matches!(op_label, Some("occurrences_of" | "occurrences_in"));
         let binding_step = op_label == Some("bindings_in");
         let candidate_step = op_label == Some("candidates_of");
-        let reaching_step = op_label == Some("reaching_binding");
+        let binding_of_step = op_label == Some("binding_of");
+        let state_event_step = op_label == Some("state_events_of");
+        let flow_relation_step = op_label == Some("flow_relations_of");
+        let rewrite_path_step = op_label == Some("rewrite_paths_of");
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -1167,6 +1218,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_max_bytes = false;
         let mut seen_occurrence_axes = HashSet::new();
         let mut seen_environment_axes = HashSet::new();
+        let mut seen_flow_state_axes = HashSet::new();
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -1460,6 +1512,36 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            let constrained_field =
+                match field {
+                    Some(
+                        inner @ (QueryStepField::StateEventClasses
+                        | QueryStepField::StateEventSubjects),
+                    ) if state_event_step => Some(inner),
+                    Some(
+                        inner @ (QueryStepField::FlowRelations | QueryStepField::FlowCertainties),
+                    ) if flow_relation_step => Some(inner),
+                    Some(
+                        inner @ (QueryStepField::RewriteDomains | QueryStepField::RewriteOutcomes),
+                    ) if rewrite_path_step => Some(inner),
+                    _ => None,
+                };
+            if let Some(constrained_field) = constrained_field {
+                analysis.add_help(
+                    key.range(),
+                    constrained_field.signature(),
+                    constrained_field.description(),
+                );
+                if !seen_flow_state_axes.insert(constrained_field) {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        format!("duplicate property '{}'", constrained_field.label()),
+                    );
+                }
+                validate_json_constrained_axis(constrained_field, child, analysis);
+                continue;
+            }
             let environment_field = match field {
                 Some(
                     inner @ (QueryStepField::BindingKinds
@@ -1471,7 +1553,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                     | QueryStepField::CandidateOutcomes
                     | QueryStepField::CandidateBoundaries),
                 ) if candidate_step => Some(inner),
-                Some(inner @ QueryStepField::IncludeShadowed) if reaching_step => Some(inner),
+                Some(inner @ QueryStepField::IncludeShadowed) if binding_of_step => Some(inner),
                 _ => None,
             };
             if let Some(environment_field) = environment_field {
@@ -1575,7 +1657,24 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                         | QueryStepField::CandidateOutcomes
                                         | QueryStepField::CandidateBoundaries
                                 ))
-                            || (reaching_step && **candidate == QueryStepField::IncludeShadowed)
+                            || (binding_of_step && **candidate == QueryStepField::IncludeShadowed)
+                            || (state_event_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::StateEventClasses
+                                        | QueryStepField::StateEventSubjects
+                                ))
+                            || (flow_relation_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::FlowRelations | QueryStepField::FlowCertainties
+                                ))
+                            || (rewrite_path_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::RewriteDomains
+                                        | QueryStepField::RewriteOutcomes
+                                ))
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();

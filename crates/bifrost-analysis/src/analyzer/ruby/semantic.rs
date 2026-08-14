@@ -5,6 +5,7 @@
 //! block invocation).  This adapter lowers only tree-sitter-structured control
 //! and calls, and records the remaining decisions as exact semantic gaps.
 
+use brokk_bifrost_ruby::local_bindings::{LocalBindingBudget, LocalBindingTimeline};
 use tree_sitter::Node;
 
 use super::is_runtime_node;
@@ -19,9 +20,9 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, Range, RubyAnalyzer};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v2";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v3";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -236,63 +237,18 @@ struct ProcedureBindings {
     has_parameter_defaults: bool,
 }
 
-#[derive(Clone, Default)]
-struct LocalBindingTimeline {
-    entry_bindings: HashSet<Box<str>>,
-    activations: HashMap<Box<str>, usize>,
-}
-
-impl LocalBindingTimeline {
-    fn is_active_at(&self, name: &str, source_byte: usize) -> bool {
-        self.entry_bindings.contains(name)
-            || self
-                .activations
-                .get(name)
-                .is_some_and(|activation| *activation <= source_byte)
-    }
-
-    fn active_names_at(&self, source_byte: usize) -> Vec<&str> {
-        let mut names = self
-            .entry_bindings
-            .iter()
-            .map(Box::as_ref)
-            .chain(
-                self.activations
-                    .iter()
-                    .filter(|(_, activation)| **activation <= source_byte)
-                    .map(|(name, _)| name.as_ref()),
-            )
-            .collect::<Vec<_>>();
-        names.sort_unstable();
-        names
-    }
-}
-
-struct LocalBindingCollector<'source, 'request> {
-    source: &'source str,
-    timeline: LocalBindingTimeline,
-    has_parameter_defaults: bool,
+/// The semantic cost model for the shared local-binding walk: every traversal
+/// entry polls cancellation and charges one nested entry, every insertion
+/// point polls cancellation, and every newly owned name charges its bytes.
+/// On failure the error carries the work attempted so far, exactly as the
+/// walk did before it moved to `brokk_bifrost_ruby::local_bindings`.
+struct SemanticLocalBindingBudget<'request> {
     work: SemanticWork,
     budget: &'request SemanticBudget,
     cancellation: &'request CancellationToken,
 }
 
-impl<'source, 'request> LocalBindingCollector<'source, 'request> {
-    fn new(
-        source: &'source str,
-        budget: &'request SemanticBudget,
-        cancellation: &'request CancellationToken,
-    ) -> Self {
-        Self {
-            source,
-            timeline: LocalBindingTimeline::default(),
-            has_parameter_defaults: false,
-            work: SemanticWork::default(),
-            budget,
-            cancellation,
-        }
-    }
-
+impl SemanticLocalBindingBudget<'_> {
     fn charge(&mut self, delta: SemanticWork) -> Result<(), RubyLoweringError> {
         let candidate = self.work.conservative_add(delta);
         if let Err(exceeded) = self.budget.check(candidate) {
@@ -302,177 +258,34 @@ impl<'source, 'request> LocalBindingCollector<'source, 'request> {
         Ok(())
     }
 
-    fn visit(&mut self) -> Result<(), RubyLoweringError> {
+    fn poll_cancellation(&self) -> Result<(), RubyLoweringError> {
         if self.cancellation.is_cancelled() {
             return Err(RubyLoweringError::Cancelled(Box::new(self.work)));
         }
+        Ok(())
+    }
+}
+
+impl LocalBindingBudget for SemanticLocalBindingBudget<'_> {
+    type Error = RubyLoweringError;
+
+    fn enter_node(&mut self) -> Result<(), RubyLoweringError> {
+        self.poll_cancellation()?;
         self.charge(SemanticWork {
             nested_entries: 1,
             ..SemanticWork::default()
         })
     }
 
-    fn insert_entry_name(&mut self, name: &str) -> Result<(), RubyLoweringError> {
-        if self.cancellation.is_cancelled() {
-            return Err(RubyLoweringError::Cancelled(Box::new(self.work)));
-        }
-        if self.timeline.entry_bindings.contains(name) {
-            return Ok(());
-        }
-        if self.timeline.activations.remove(name).is_none() {
-            self.charge(SemanticWork {
-                owned_text_bytes: name.len(),
-                ..SemanticWork::default()
-            })?;
-        }
-        self.timeline.entry_bindings.insert(name.into());
-        Ok(())
+    fn before_insert(&mut self) -> Result<(), RubyLoweringError> {
+        self.poll_cancellation()
     }
 
-    fn insert_activation(
-        &mut self,
-        name: &str,
-        source_byte: usize,
-    ) -> Result<(), RubyLoweringError> {
-        if self.cancellation.is_cancelled() {
-            return Err(RubyLoweringError::Cancelled(Box::new(self.work)));
-        }
-        if self.timeline.entry_bindings.contains(name) {
-            return Ok(());
-        }
-        if let Some(activation) = self.timeline.activations.get_mut(name) {
-            *activation = (*activation).min(source_byte);
-            return Ok(());
-        }
+    fn charge_name(&mut self, name: &str) -> Result<(), RubyLoweringError> {
         self.charge(SemanticWork {
             owned_text_bytes: name.len(),
             ..SemanticWork::default()
-        })?;
-        self.timeline.activations.insert(name.into(), source_byte);
-        Ok(())
-    }
-
-    fn insert_entry_identifier(&mut self, node: Node<'_>) -> Result<(), RubyLoweringError> {
-        if node.kind() == "identifier"
-            && let Some(name) = node_text(self.source, node)
-        {
-            self.insert_entry_name(name)?;
-        }
-        Ok(())
-    }
-
-    fn insert_activation_identifier(&mut self, node: Node<'_>) -> Result<(), RubyLoweringError> {
-        if node.kind() == "identifier"
-            && let Some(name) = node_text(self.source, node)
-        {
-            self.insert_activation(name, node.start_byte())?;
-        }
-        Ok(())
-    }
-
-    fn collect_parameters(&mut self, node: Node<'_>) -> Result<(), RubyLoweringError> {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            self.visit()?;
-            match current.kind() {
-                "identifier" => self.insert_entry_identifier(current)?,
-                "optional_parameter"
-                | "keyword_parameter"
-                | "splat_parameter"
-                | "hash_splat_parameter"
-                | "block_parameter" => {
-                    self.has_parameter_defaults |= current.kind() == "optional_parameter"
-                        || (current.kind() == "keyword_parameter"
-                            && current.child_by_field_name("value").is_some());
-                    if let Some(name) = current.child_by_field_name("name") {
-                        self.insert_entry_identifier(name)?;
-                    }
-                }
-                "method_parameters"
-                | "lambda_parameters"
-                | "block_parameters"
-                | "destructured_parameter" => {
-                    stack.extend(named_children(current).into_iter().rev());
-                }
-                "forward_parameter" | "hash_splat_nil" => {}
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_assignment(&mut self, node: Node<'_>) -> Result<(), RubyLoweringError> {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            self.visit()?;
-            match current.kind() {
-                "identifier" => self.insert_activation_identifier(current)?,
-                "left_assignment_list"
-                | "right_assignment_list"
-                | "destructured_left_assignment"
-                | "rest_assignment"
-                | "exception_variable" => {
-                    stack.extend(named_children(current).into_iter().rev());
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_pattern(&mut self, node: Node<'_>) -> Result<(), RubyLoweringError> {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            self.visit()?;
-            match current.kind() {
-                "identifier" => self.insert_activation_identifier(current)?,
-                "as_pattern" => {
-                    if let Some(name) = current.child_by_field_name("name") {
-                        self.insert_activation_identifier(name)?;
-                    }
-                    stack.extend(children_by_field_name(current, "value"));
-                }
-                "keyword_pattern" => {
-                    if let Some(value) = current.child_by_field_name("value") {
-                        stack.push(value);
-                    } else if let Some(key) = current.child_by_field_name("key")
-                        && let Some(name) = node_text(self.source, key)
-                    {
-                        self.insert_activation(
-                            name.strip_suffix(':').unwrap_or(name),
-                            key.start_byte(),
-                        )?;
-                    }
-                }
-                "splat_parameter" | "hash_splat_parameter" => {
-                    if let Some(name) = current.child_by_field_name("name") {
-                        self.insert_activation_identifier(name)?;
-                    }
-                }
-                "variable_reference_pattern" | "expression_reference_pattern" => {}
-                "array_pattern" | "find_pattern" | "hash_pattern" => {
-                    let class_id = current.child_by_field_name("class").map(|class| class.id());
-                    let children = named_children(current)
-                        .into_iter()
-                        .filter(|child| Some(child.id()) != class_id)
-                        .collect::<Vec<_>>();
-                    stack.extend(children.into_iter().rev());
-                }
-                "alternative_pattern" | "parenthesized_pattern" => {
-                    stack.extend(named_children(current).into_iter().rev());
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> LocalBindingCollection {
-        LocalBindingCollection {
-            timeline: self.timeline,
-            has_parameter_defaults: self.has_parameter_defaults,
-            work: self.work,
-        }
+        })
     }
 }
 
@@ -484,80 +297,22 @@ fn collect_local_bindings(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<LocalBindingCollection, RubyLoweringError> {
-    let mut collector = LocalBindingCollector::new(source, budget, cancellation);
-    let parameters = callable_parameters(callable, body);
-    if let Some(parameters) = parameters {
-        collector.collect_parameters(parameters)?;
-    }
-    if matches!(callable.kind(), "lambda" | "block" | "do_block") && parameters.is_none() {
-        for name in ["_1", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9", "it"] {
-            collector.insert_entry_name(name)?;
-        }
-    }
-    if let Some((inherited, source_byte)) = inherited {
-        for name in inherited.active_names_at(source_byte) {
-            collector.insert_entry_name(name)?;
-        }
-    }
-
-    let mut stack = vec![body];
-    if let Some(parameters) = parameters.filter(|parameters| {
-        parameters.start_byte() < body.start_byte() || parameters.end_byte() > body.end_byte()
-    }) {
-        stack.push(parameters);
-    }
-    while let Some(node) = stack.pop() {
-        collector.visit()?;
-        match node.kind() {
-            "assignment" | "operator_assignment" => {
-                if let Some(left) = node.child_by_field_name("left") {
-                    collector.collect_assignment(left)?;
-                }
-            }
-            "for" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    collector.collect_assignment(pattern)?;
-                }
-            }
-            "rescue" => {
-                if let Some(variable) = node.child_by_field_name("variable") {
-                    collector.collect_assignment(variable)?;
-                }
-            }
-            "match_pattern" | "test_pattern" | "in_clause" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    collector.collect_pattern(pattern)?;
-                }
-            }
-            _ => {}
-        }
-        for child in named_children(node).into_iter().rev() {
-            if child.id() != body.id()
-                && matches!(
-                    child.kind(),
-                    "method"
-                        | "singleton_method"
-                        | "lambda"
-                        | "block"
-                        | "do_block"
-                        | "class"
-                        | "module"
-                        | "singleton_class"
-                )
-            {
-                continue;
-            }
-            stack.push(child);
-        }
-    }
-    Ok(collector.finish())
-}
-
-fn callable_parameters<'tree>(callable: Node<'tree>, body: Node<'tree>) -> Option<Node<'tree>> {
-    callable.child_by_field_name("parameters").or_else(|| {
-        (callable.kind() == "lambda")
-            .then(|| body.child_by_field_name("parameters"))
-            .flatten()
+    let mut adapter = SemanticLocalBindingBudget {
+        work: SemanticWork::default(),
+        budget,
+        cancellation,
+    };
+    let collection = brokk_bifrost_ruby::local_bindings::collect_local_bindings(
+        source,
+        callable,
+        body,
+        inherited,
+        &mut adapter,
+    )?;
+    Ok(LocalBindingCollection {
+        timeline: collection.timeline,
+        has_parameter_defaults: collection.has_parameter_defaults,
+        work: adapter.work,
     })
 }
 
@@ -1443,7 +1198,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let receiver = self.session.add_value_with_metadata(
             builder,
             receiver_metadata,
-            SemanticValueKind::Receiver,
+            SemanticValueKind::Receiver { dispatch: true },
         )?;
         self.receiver = Some(receiver);
         self.parameters.insert("self".into(), receiver);
@@ -1498,12 +1253,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         callable: Node<'tree>,
     ) -> Result<(), RubyLoweringError> {
-        let mut activations = self
-            .local_bindings
-            .activations
-            .iter()
-            .map(|(name, start)| (name.as_ref(), *start))
-            .collect::<Vec<_>>();
+        let mut activations = self.local_bindings.activations().collect::<Vec<_>>();
         activations.sort_by_key(|(_, start)| *start);
         for (name, start) in activations {
             if self.session.cancellation().is_cancelled() {
@@ -3822,7 +3572,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
+        // The call result is the identifier expression's value. An enclosing
+        // argument list or assignment reads the same node through
+        // `expression_value`, and a second temporary at the same anchor would
+        // collide in the value-flow plan's stable carrier keys.
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let resolution = CallableTargetResolution::Unknown;
         let metadata = self.metadata(invoke)?;

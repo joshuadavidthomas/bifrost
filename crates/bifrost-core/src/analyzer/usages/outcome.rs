@@ -1,6 +1,7 @@
 use crate::analyzer::CodeUnit;
-use crate::analyzer::usages::common::external_usage_hit_count;
-use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic, UsageHit};
+use crate::analyzer::usages::model::{
+    FuzzyResult, UsageAnalysisDiagnostic, UsageHit, UsageHitSurface,
+};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
@@ -113,7 +114,8 @@ pub struct CandidateUsageHits {
 /// proves and drops every site its siblings own -- which candidate sorts first
 /// then decides whether a real call site is reported at all.
 ///
-/// `scan` runs once per candidate. `Err` is that candidate declining to answer
+/// `scan` runs until every candidate is visited or the deduplicated external
+/// hit union proves the cap exceeded. `Err` is that candidate declining to answer
 /// (no graph seed, wrong language, no analyzer): the group's answer is a
 /// fallback-safe diagnostic only when *every* candidate declines, because one
 /// candidate's declination must not discard the sites another proved.
@@ -130,6 +132,7 @@ pub fn union_candidate_usages(
     let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
     let mut declined: Option<UsageAnalysisDiagnostic> = None;
     let mut scanned_any = false;
+    let mut external_hit_count = 0;
     for candidate in overloads {
         match scan(candidate) {
             Ok(candidate_hits) => {
@@ -138,12 +141,20 @@ pub fn union_candidate_usages(
                 // declaration -- so a site two candidates both see collapses to
                 // one entry here, carrying the classification of whichever
                 // candidate recorded it first.
-                hits.extend(candidate_hits.hits);
+                for hit in candidate_hits.hits {
+                    let external = hit.kind.included_in(UsageHitSurface::ExternalUsages);
+                    if hits.insert(hit) && external {
+                        external_hit_count += 1;
+                    }
+                }
                 unproven_hits.extend(candidate_hits.unproven_hits);
             }
             Err(diagnostic) => {
                 declined.get_or_insert(diagnostic);
             }
+        }
+        if external_hit_count > max_usages {
+            break;
         }
     }
 
@@ -159,13 +170,12 @@ pub fn union_candidate_usages(
     // the site is reported once.
     unproven_hits.retain(|hit| !hits.contains(hit));
 
-    let external_hit_count = external_usage_hit_count(&hits);
     if external_hit_count > max_usages {
         return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
             short_name: primary.short_name().to_string(),
             total_callsites: external_hit_count,
             limit: max_usages,
-            sample_hits: hits,
+            sample_hits: hits.into_iter().take(max_usages).collect(),
         });
     }
     GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
@@ -173,4 +183,78 @@ pub fn union_candidate_usages(
         hits,
         unproven_hits,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::model::CodeUnitType;
+    use crate::analyzer::usages::model::UsageHit;
+
+    fn unit(name: &str) -> CodeUnit {
+        CodeUnit::new(
+            ProjectFile::new(std::env::temp_dir(), format!("{name}.rs")),
+            CodeUnitType::Function,
+            "pkg",
+            name,
+        )
+    }
+
+    fn hit(site: usize, enclosing: &CodeUnit) -> UsageHit {
+        UsageHit::new(
+            enclosing.source().clone(),
+            1,
+            site,
+            site + 1,
+            enclosing.clone(),
+            1.0,
+            "call",
+        )
+    }
+
+    #[test]
+    fn candidate_union_stops_at_deduplicated_external_cap() {
+        let candidates = [unit("a"), unit("b"), unit("must_not_scan")];
+        let enclosing = unit("caller");
+        let mut scans = 0;
+        let outcome = union_candidate_usages(&candidates, 1, |candidate| {
+            scans += 1;
+            assert_ne!(candidate.identifier(), "must_not_scan");
+            let site = usize::from(candidate.identifier() == "b");
+            Ok(CandidateUsageHits {
+                hits: BTreeSet::from([hit(site, &enclosing)]),
+                unproven_hits: BTreeSet::new(),
+            })
+        });
+
+        assert_eq!(scans, 2);
+        let GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
+            total_callsites,
+            sample_hits,
+            ..
+        }) = outcome
+        else {
+            panic!("expected capped result");
+        };
+        assert_eq!(total_callsites, 2);
+        assert_eq!(sample_hits.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_candidate_hits_do_not_trip_the_cap() {
+        let candidates = [unit("a"), unit("b")];
+        let enclosing = unit("caller");
+        let duplicate = hit(0, &enclosing);
+        let outcome = union_candidate_usages(&candidates, 1, |_| {
+            Ok(CandidateUsageHits {
+                hits: BTreeSet::from([duplicate.clone()]),
+                unproven_hits: BTreeSet::new(),
+            })
+        });
+        assert!(matches!(
+            outcome,
+            GraphUsageOutcome::Resolved(FuzzyResult::Success { .. })
+        ));
+    }
 }

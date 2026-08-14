@@ -5,13 +5,14 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
-    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner, CppDispatch,
-    CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError,
-    CppVisibilityIndex, cpp_argument_children, cpp_constructor_type_node,
-    cpp_designated_initializer_owner, cpp_enclosing_lexical_scope_components,
-    cpp_field_declared_type_binding, cpp_first_type_child, cpp_function_return_type_text,
-    cpp_initialized_effective_using_imports, cpp_is_declaration_name, cpp_is_declarator_node,
-    cpp_name_for, cpp_reference_fqn_candidates, cpp_resolve_bare_call_target, cpp_signature_arity,
+    CallArityEvidence, CppBareCallTargetResolution, CppBlockUsingCallTargetResolution,
+    CppDesignatedInitializerOwner, CppDispatch, CppLexicalScopeResolution,
+    CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError, CppVisibilityIndex,
+    cpp_argument_children, cpp_constructor_type_node, cpp_designated_initializer_owner,
+    cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
+    cpp_function_return_type_text, cpp_initialized_effective_using_imports,
+    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
+    cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target, cpp_signature_arity,
     cpp_split_top_level_commas, cpp_template_reference_arguments, cpp_type_name_components,
     extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
@@ -102,9 +103,9 @@ use brokk_bifrost_ruby::graph::syntax::{
 };
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
-    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
-    rust_field_definition_type_candidates_cached, rust_is_type_definition,
-    rust_resolve_type_node_fqn,
+    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
+    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -471,9 +472,18 @@ pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain
 /// `val`/`def`, a parameter -- which no analyzer publishes as a CodeUnit.
 pub const LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND: &str = "local_variable_reference";
 
+/// The name resolves to a language-provided predeclared symbol, such as Go's
+/// `error`, `len`, or `append`, rather than a declaration in the workspace.
+pub const PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND: &str = "predeclared_symbol_reference";
+
 /// The site is a declaration or import occurrence, not a reference, so there is
 /// no definition for it to reach.
 pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
+
+/// A Go keyed composite-literal label whose exact owning type could not be
+/// established from indexed structure. A same-spelled declaration elsewhere
+/// in the file is not evidence that the label can bind to it.
+pub const GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND: &str = "go_literal_owner_unresolved";
 
 /// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
 /// identified what the site is and answered it, rather than failing to reach a
@@ -490,7 +500,9 @@ pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_imp
 pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
     matches!(
         kind,
-        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
+            | PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND
+            | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
     )
 }
 
@@ -1195,6 +1207,9 @@ fn resolve_one<'a>(
         Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
             js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
         }
+        Some(tree) if language == Language::Python => {
+            python::python_site_for_focus(site, tree, &source, request.start_byte, request.end_byte)
+        }
         _ => site,
     };
 
@@ -1454,14 +1469,19 @@ pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
 
 /// Parse `source` under the grammar registered for `language`.
 ///
-/// `file` selects the grammar flavor, which only TypeScript distinguishes (`.tsx`); every
-/// other language answers one grammar for both. `None` means the language has no grammar
-/// (`Language::None`) or the source did not parse.
+/// `file` selects the grammar flavor, which TypeScript distinguishes for `.tsx`.
+/// C# additionally uses its directive-aware pre-parse so every consumer sees the
+/// same selected conditional-compilation branches as declaration extraction and
+/// usage analysis. `None` means the language has no grammar (`Language::None`) or
+/// the source did not parse.
 pub fn parse_tree_for_language(
     file: &ProjectFile,
     language: Language,
     source: &str,
 ) -> Option<Tree> {
+    if language == Language::CSharp {
+        return brokk_bifrost_csharp::preprocessor::parse_csharp(source);
+    }
     let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;

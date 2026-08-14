@@ -30,8 +30,7 @@ pub const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
 #[doc(hidden)]
 pub const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
 
-pub const SEARCHTOOLS_INSTRUCTIONS: &str =
-    "Analyzer-backed search tools for source code workspaces.";
+pub const MCP_DISCOVERY_TEXT_MAX_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpRenderOptions {
@@ -48,7 +47,7 @@ impl Default for McpRenderOptions {
 
 #[derive(Debug, Clone)]
 pub struct McpServerSpec {
-    pub instructions: &'static str,
+    pub instructions: String,
     pub tool_names: HashSet<String>,
     pub tool_descriptors: Vec<Value>,
 }
@@ -92,22 +91,40 @@ pub(crate) fn request_correlation_id(id: &Value) -> String {
 }
 
 pub fn build_server_spec(
-    instructions: &'static str,
+    instructions: impl Into<String>,
     tool_descriptors: Vec<Value>,
 ) -> Result<McpServerSpec, String> {
     build_server_spec_with_hidden(instructions, tool_descriptors, Vec::new())
 }
 
 pub fn build_server_spec_with_hidden(
-    instructions: &'static str,
+    instructions: impl Into<String>,
     tool_descriptors: Vec<Value>,
     hidden_tool_names: Vec<String>,
 ) -> Result<McpServerSpec, String> {
+    let instructions = instructions.into();
+    let instruction_chars = instructions.chars().count();
+    if instruction_chars > MCP_DISCOVERY_TEXT_MAX_CHARS {
+        return Err(format!(
+            "MCP server instructions contain {instruction_chars} characters; maximum is {MCP_DISCOVERY_TEXT_MAX_CHARS}"
+        ));
+    }
     let mut tool_names = HashSet::with_capacity(tool_descriptors.len());
     for descriptor in &tool_descriptors {
         let Some(name) = descriptor.get("name").and_then(Value::as_str) else {
             return Err("tool descriptor missing string name".to_string());
         };
+        let Some(description) = descriptor.get("description").and_then(Value::as_str) else {
+            return Err(format!(
+                "tool descriptor `{name}` missing string description"
+            ));
+        };
+        let description_chars = description.chars().count();
+        if description_chars > MCP_DISCOVERY_TEXT_MAX_CHARS {
+            return Err(format!(
+                "tool descriptor `{name}` description contains {description_chars} characters; maximum is {MCP_DISCOVERY_TEXT_MAX_CHARS}"
+            ));
+        }
         tool_names.insert(name.to_string());
     }
     tool_names.extend(hidden_tool_names);
@@ -1087,5 +1104,29 @@ mod shared_tests {
                 .all(|byte| byte.is_ascii_hexdigit())
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn server_spec_rejects_oversized_discovery_metadata() {
+        let schema = json_schema_object(&[]);
+        let instruction_error = build_server_spec(
+            "x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS + 1),
+            vec![tool_descriptor("small", "Small tool.", schema.clone())],
+        )
+        .expect_err("oversized instructions must fail");
+        assert!(instruction_error.contains("server instructions"));
+        assert!(instruction_error.contains("2001"));
+
+        let description_error = build_server_spec(
+            "Small server.",
+            vec![tool_descriptor(
+                "oversized_tool",
+                &"x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS + 1),
+                schema,
+            )],
+        )
+        .expect_err("oversized tool description must fail");
+        assert!(description_error.contains("`oversized_tool`"));
+        assert!(description_error.contains("2001"));
     }
 }

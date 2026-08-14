@@ -53,7 +53,17 @@ struct GcClaim {
 /// either store: the registry tables it sweeps are reached through that path,
 /// never through the store handle, which is why neither the semantic store nor
 /// the analyzer store has to be visible from this crate.
-pub fn maybe_gc(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
+///
+/// `workspace_root` is the root of the workspace whose build scheduled this
+/// collection. Its files are live by definition, and the Git status scans that
+/// seed the live set cannot see files under Git-ignored directories (issue
+/// #1963: a workspace rooted inside an ignored subtree), so the sweep retains
+/// that workspace's ignored file blobs explicitly.
+pub fn maybe_gc(
+    db_path: &Path,
+    repo: &Repository,
+    workspace_root: &Path,
+) -> Result<GcOutcome, String> {
     // A deliberately cross-repository cache cannot be collected from the
     // reachability graph of whichever repository happens to open it first.
     // Evaluation and fleet operators that provide such a cache can disable
@@ -61,18 +71,27 @@ pub fn maybe_gc(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> 
     if !automatic_gc_enabled(std::env::var_os("BIFROST_CACHE_GC").as_deref()) {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     }
-    run_gc(db_path, repo, false)
+    run_gc(db_path, repo, workspace_root, false)
 }
 
-pub fn force_gc(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
-    run_gc(db_path, repo, true)
+pub fn force_gc(
+    db_path: &Path,
+    repo: &Repository,
+    workspace_root: &Path,
+) -> Result<GcOutcome, String> {
+    run_gc(db_path, repo, workspace_root, true)
 }
 
-fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, String> {
+fn run_gc(
+    db_path: &Path,
+    repo: &Repository,
+    workspace_root: &Path,
+    force: bool,
+) -> Result<GcOutcome, String> {
     let Some(claim) = try_claim_gc(db_path, force)? else {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     };
-    match sweep_with_claim(&claim, repo) {
+    match sweep_with_claim(&claim, repo, workspace_root) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
             clear_gc_claim(db_path)?;
@@ -88,7 +107,11 @@ fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
     )
 }
 
-fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, String> {
+fn sweep_with_claim(
+    claim: &GcClaim,
+    repo: &Repository,
+    workspace_root: &Path,
+) -> Result<GcOutcome, String> {
     // Snapshot the rows eligible for this collection before walking Git. A
     // workspace build may persist another blob while the reachability walk is
     // in flight; that new row must belong to the next collection, even when
@@ -116,7 +139,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
     )
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
-    let live = live_bloom(repo)?;
+    let live = live_bloom(repo, workspace_root)?;
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -214,7 +237,7 @@ fn delete_analyzer_candidates(
     Ok(dropped)
 }
 
-fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
+fn live_bloom(repo: &Repository, workspace_root: &Path) -> Result<GrowableBloom, String> {
     let mut live = gitblob::reachable_bloom(repo)?;
     for root in gitblob::worktree_roots(repo)? {
         if let Ok(working_tree) = gitblob::existing_working_tree_oids(&root) {
@@ -223,7 +246,47 @@ fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
             }
         }
     }
+    for oid in ignored_workspace_file_oids(repo, workspace_root)? {
+        live.insert(oid);
+    }
     Ok(live)
+}
+
+/// Blob OIDs of the scheduling workspace's files that Git ignore rules hide
+/// from the status-based working-tree scans above (issue #1963: a workspace
+/// rooted inside a Git-ignored subtree, such as an extracted archive under
+/// `target/`). The workspace enumeration already walks such a root, so its
+/// listing is the authority on which files back an active analysis. Tracked
+/// and untracked-but-not-ignored files are already live via the worktree
+/// scans, so only ignored files are hashed here.
+fn ignored_workspace_file_oids(
+    repo: &Repository,
+    workspace_root: &Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| "repository has no working directory".to_string())?
+        .canonicalize()
+        .map_err(|err| format!("canonicalizing git workdir: {err}"))?;
+    let files = crate::analyzer::project::collect_workspace_files(workspace_root)
+        .map_err(|err| format!("walking workspace {}: {err}", workspace_root.display()))?;
+    let mut out = std::collections::HashSet::new();
+    for file in files {
+        let abs = file.abs_path();
+        let Ok(rel) = abs.strip_prefix(&workdir) else {
+            continue;
+        };
+        if !repo.is_path_ignored(rel).unwrap_or(false) {
+            continue;
+        }
+        // The analyzer identifies a working file by hashing its raw bytes
+        // (`Liveness::oids_for_files`), so the retained identity must be the
+        // same raw-byte hash.
+        if let Ok(oid) = git2::Oid::hash_file(git2::ObjectType::Blob, &abs) {
+            out.insert(oid.to_string());
+        }
+    }
+    Ok(out)
 }
 
 fn try_claim_gc(db_path: &Path, force: bool) -> Result<Option<GcClaim>, String> {
@@ -404,6 +467,58 @@ mod tests {
         assert!(!automatic_gc_enabled(Some(OsStr::new("0"))));
         assert!(!automatic_gc_enabled(Some(OsStr::new("off"))));
         assert!(!automatic_gc_enabled(Some(OsStr::new("disabled"))));
+    }
+
+    /// Issue #1963: a workspace rooted inside a Git-ignored subtree. The
+    /// status-based working-tree scans cannot see its files, so the sweep must
+    /// retain their blobs through the workspace listing instead of collecting
+    /// them as unreachable.
+    #[test]
+    fn gc_keeps_analyzer_rows_for_ignored_workspace_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        std::fs::write(repo_root.join(".gitignore"), "/target/\n").unwrap();
+        gitblob::test_repo::commit_all(&repo, "ignore build output");
+
+        let workspace_root = repo_root.join("target/extracted");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let source = "package main\n\nfunc main() {}\n";
+        std::fs::write(workspace_root.join("main.go"), source).unwrap();
+        let live_oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+            .unwrap()
+            .to_string();
+        let dead_oid = "2222222222222222222222222222222222222222";
+
+        let db_path = gitblob::cache_db_path(&repo_root);
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+                [],
+            )
+            .unwrap();
+            for oid in [live_oid.as_str(), dead_oid] {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                    [oid],
+                )
+                .unwrap();
+            }
+        }
+
+        let outcome = force_gc(&db_path, &repo, &workspace_root).unwrap();
+        assert!(outcome.ran);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let remaining: Vec<String> = conn
+            .prepare("SELECT blob_oid FROM blobs ORDER BY blob_oid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![live_oid]);
     }
 
     #[test]

@@ -90,7 +90,11 @@ export function configureBifrostExtension(
     if (status.state !== "connected" || status.toolCount === 0) {
       return;
     }
-    return { systemPrompt: `${event.systemPrompt}\n\n${BIFROST_PROMPT_NOTE}` };
+    return {
+      systemPrompt: [event.systemPrompt, status.instructions, BIFROST_PROMPT_NOTE]
+        .filter((part): part is string => Boolean(part))
+        .join("\n\n"),
+    };
   });
 
   pi.registerCommand("bifrost", {

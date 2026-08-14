@@ -7,8 +7,9 @@ use crate::analyzer::structural::{
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use brokk_bifrost_rql::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
-    QueryField, QueryStepField, environment_filter_labels, occurrence_filter_labels,
-    reference_kind_label, supported_query_schema_versions,
+    QueryField, QueryStepField, environment_filter_labels, flow_state_filter_labels,
+    occurrence_filter_labels, reference_kind_label, rewrite_path_filter_labels,
+    supported_query_schema_versions,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -71,8 +72,11 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_occurrence_options()
                 && !op.allows_binding_options()
                 && !op.allows_candidate_options()
-                && !op.allows_reaching_binding_options()
+                && !op.allows_binding_of_options()
                 && !op.allows_edge_options()
+                && !op.allows_state_event_options()
+                && !op.allows_flow_relation_options()
+                && !op.allows_rewrite_path_options()
                 && !op.allows_segment_options()
                 && op.label() != "call_input"
         })
@@ -150,16 +154,34 @@ fn query_step_input_variants() -> Vec<Value> {
         .filter(|op| op.allows_candidate_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
-    let reaching_steps = ALL_QUERY_STEP_OPS
+    let binding_of_steps = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
-        .filter(|op| op.allows_reaching_binding_options())
+        .filter(|op| op.allows_binding_of_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let edge_steps = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
         .filter(|op| op.allows_edge_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let state_event_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_state_event_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let flow_relation_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_flow_relation_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let rewrite_path_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_rewrite_path_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let segment_steps = ALL_QUERY_STEP_OPS
@@ -397,7 +419,7 @@ fn query_step_input_variants() -> Vec<Value> {
         json!({
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": reaching_steps },
+                "op": { "type": "string", "enum": binding_of_steps },
                 "include_shadowed": {
                     "type": "boolean",
                     "const": true,
@@ -434,6 +456,36 @@ fn query_step_input_variants() -> Vec<Value> {
                 "usage": edge_usage_kind_array(),
                 "relation": edge_relation_array(),
                 "site_class": edge_site_class_array()
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": state_event_steps },
+                "event_class": flow_state_label_array(QueryStepField::StateEventClasses),
+                "subject": flow_state_label_array(QueryStepField::StateEventSubjects)
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": flow_relation_steps },
+                "flow_relation": flow_state_label_array(QueryStepField::FlowRelations),
+                "certainty": flow_state_label_array(QueryStepField::FlowCertainties)
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": rewrite_path_steps },
+                "domain": rewrite_path_label_array(QueryStepField::RewriteDomains),
+                "rewrite_outcome": rewrite_path_label_array(QueryStepField::RewriteOutcomes)
             },
             "required": ["op"],
             "additionalProperties": false
@@ -507,6 +559,18 @@ fn candidate_boundary_array() -> Value {
         environment_filter_labels(QueryStepField::CandidateBoundaries),
         QueryStepField::CandidateBoundaries.description(),
     )
+}
+
+/// One flow-state constrained-value axis, read from the schema registry so the
+/// MCP surface cannot drift from the parser's vocabulary (#1480).
+fn flow_state_label_array(field: QueryStepField) -> Value {
+    constrained_label_array(flow_state_filter_labels(field), field.description())
+}
+
+/// One bounded-rewrite constrained-value axis, read from the schema registry
+/// so the MCP surface cannot drift from the parser's vocabulary (#1480).
+fn rewrite_path_label_array(field: QueryStepField) -> Value {
+    constrained_label_array(rewrite_path_filter_labels(field), field.description())
 }
 
 fn edge_usage_kind_array() -> Value {
@@ -756,7 +820,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 1 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. The typestate step accepts a host-registered protocol_ref and projects retained typestate witnesses. The value_flow step accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows. The taint step accepts a host-registered taint_ref and only projects the immutable production TaintFindingReport; it never compiles policy selectors, runs propagation, or reconstructs witnesses. No policy classification is implied. Results include typed taint_finding rows with provenance alongside the earlier terminal domains. Minimal taint query: {{\"schema_version\":1,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"taint\",\"taint_ref\":\"request:http-to-database\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure with CodeQuery or RQL. Match declarations and syntax, compose compatible typed branches with union, intersect, or except, and apply typed semantic steps. Schema version 1 supports {step_vocabulary}. Set branches must produce the same terminal domain. A common steps suffix can continue from that domain. Use execution_mode explain to plan without workspace execution. Use profile for ordinary results with operator measurements. Procedure-local CFG steps return procedures, program points, and control edges. Typestate, value-flow, and taint steps use host-registered references and return retained production evidence. The taint step projects existing findings; it does not compile selectors or run propagation. It does not imply policy classification. Example: {{\"schema_version\":1,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}}}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -1050,11 +1114,14 @@ mod tests {
                 "candidate_hierarchy",
                 "candidate_target",
                 "edge_target",
+                "flow_source",
+                "flow_target",
                 "segment_target",
                 "generates",
                 "generated_by",
                 "declaration_state_of",
                 "implementation_of",
+                "stubs_of",
                 "export_target"
             ])
         );
@@ -1173,6 +1240,74 @@ mod tests {
             edge_variant["properties"]["op"]["enum"],
             json!(["edges_of", "edges_from"])
         );
+        let state_event_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "state_events_of"))
+            })
+            .expect("state-event traversal schema");
+        assert_eq!(
+            state_event_variant["properties"]["event_class"]["items"]["enum"],
+            json!(["establish", "kill", "read"])
+        );
+        assert_eq!(
+            state_event_variant["properties"]["subject"]["items"]["enum"],
+            json!(["binding", "property"])
+        );
+        assert_eq!(state_event_variant["required"], json!(["op"]));
+
+        let flow_relation_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "flow_relations_of"))
+            })
+            .expect("flow-relation traversal schema");
+        assert_eq!(
+            flow_relation_variant["properties"]["flow_relation"]["items"]["enum"],
+            json!(["reaching", "dominates", "same_evaluation"])
+        );
+        assert_eq!(
+            flow_relation_variant["properties"]["certainty"]["items"]["enum"],
+            json!(["exact", "may"])
+        );
+        // The projections take no options, so they ride in the plain variant
+        // exactly like `edge_target` does.
+        assert!(
+            steps["items"]["oneOf"][0]["properties"]["op"]["enum"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op == "flow_source")
+                    && ops.iter().any(|op| op == "flow_target")),
+            "the flow projections must be advertised as option-free steps"
+        );
+
+        let rewrite_path_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "rewrite_paths_of"))
+            })
+            .expect("rewrite-path traversal schema");
+        assert_eq!(
+            rewrite_path_variant["properties"]["domain"]["items"]["enum"],
+            json!(["rust_import_alias"])
+        );
+        assert_eq!(
+            rewrite_path_variant["properties"]["rewrite_outcome"]["items"]["enum"],
+            json!(["converged", "cycle", "exceeded_budget"])
+        );
+        assert_eq!(rewrite_path_variant["required"], json!(["op"]));
+
         // The edge filter's `surface` is optional with no default, because the
         // canonical edge answer includes editor-only rows.
         assert_eq!(edge_variant["required"], json!(["op"]));

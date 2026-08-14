@@ -116,11 +116,14 @@ void test("parses and validates SHA-256 sidecars", () => {
   );
 });
 
-void test("installs verified binary and cleans old managed versions", async () => {
+void test("installs verified binary and preserves compatible managed versions", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const oldDir = path.join(temp, "binaries", "0.6.7", "linux-x64");
   fs.mkdirSync(oldDir, { recursive: true });
   fs.writeFileSync(path.join(oldDir, "bifrost"), "old");
+  const incompatibleDir = path.join(temp, "binaries", "0.5.9", "linux-x64");
+  fs.mkdirSync(incompatibleDir, { recursive: true });
+  fs.writeFileSync(path.join(incompatibleDir, "bifrost"), "incompatible");
 
   const archiveName = "bifrost-v0.6.8-x86_64-unknown-linux-gnu.tar.gz";
   const stage = "bifrost-v0.6.8-x86_64-unknown-linux-gnu";
@@ -143,6 +146,8 @@ void test("installs verified binary and cleans old managed versions", async () =
   const installed = await provisioning.installManagedBinary({
     storageDir: temp,
     version: "0.6.8",
+    minimumBinaryVersion: "0.6.7",
+    allowPrerelease: false,
     expectedSha256: checksum,
     platform: "linux",
     arch: "x64",
@@ -151,7 +156,200 @@ void test("installs verified binary and cleans old managed versions", async () =
 
   assert.equal(installed, path.join(temp, "binaries", "0.6.8", "linux-x64", "bifrost"));
   assert.equal(fs.readFileSync(installed, "utf8"), "new-binary");
-  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.6.7")), false);
+  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.6.7")), true);
+  assert.equal(fs.existsSync(path.join(temp, "binaries", "0.5.9")), false);
+});
+
+void test("selects exact then newest compatible managed binaries", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const versions = ["0.9.1", "0.9.5", "0.9.3", "0.8.9"];
+  for (const version of versions) {
+    const binary = provisioning.managedBinaryPath(temp, version, "linux", "x64");
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, version);
+  }
+  const compatibility = {
+    binaryVersion: "0.9.3",
+    minimumBinaryVersion: "0.9.0",
+    allowPrerelease: false
+  };
+  const probe = (binary: string) =>
+    Promise.resolve({
+      version: fs.readFileSync(binary, "utf8"),
+      rawOutput: ""
+    });
+
+  const exact = await provisioning.findCompatibleManagedBinary(
+    temp,
+    compatibility,
+    "linux",
+    "x64",
+    probe
+  );
+  assert.equal(exact?.version, "0.9.3");
+  assert.equal(exact?.compatibilityMode, "exact");
+
+  fs.rmSync(path.join(temp, "binaries", "0.9.3"), { recursive: true });
+  const newest = await provisioning.findCompatibleManagedBinary(
+    temp,
+    compatibility,
+    "linux",
+    "x64",
+    probe
+  );
+  assert.equal(newest?.version, "0.9.5");
+  assert.equal(newest?.compatibilityMode, "compatible");
+});
+
+void test("starts a compatible binary while preparing and activating the preferred binary", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const fallbackPath = provisioning.managedBinaryPath(temp, "0.9.1", "linux", "x64");
+  fs.mkdirSync(path.dirname(fallbackPath), { recursive: true });
+  fs.writeFileSync(fallbackPath, "0.9.1");
+  let finishInstall: ((path: string) => void) | undefined;
+  const install = new Promise<string>((resolve) => {
+    finishInstall = resolve;
+  });
+  let installStarted = false;
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      provisioning.findCompatibleManagedBinary(
+        temp,
+        { binaryVersion: "0.9.4", minimumBinaryVersion: "0.9.0", allowPrerelease: false },
+        "linux",
+        "x64",
+        (binary) => Promise.resolve({ version: fs.readFileSync(binary, "utf8"), rawOutput: "" })
+      ),
+    () => {
+      installStarted = true;
+      return install;
+    },
+    () => undefined
+  );
+
+  assert.equal(preparation?.selected.path, fallbackPath);
+  assert.equal(preparation?.selected.version, "0.9.1");
+  assert.ok(preparation);
+  assert.equal(installStarted, true);
+
+  const activations: string[] = [];
+  const activation = provisioning.activatePreparedManagedBinary(
+    preparation,
+    (selectedPath) => selectedPath === fallbackPath,
+    (preferredPath) => {
+      activations.push(preferredPath);
+      return Promise.resolve();
+    }
+  );
+  finishInstall!("/managed/0.9.4/bifrost");
+
+  assert.equal(await activation, true);
+  assert.deepEqual(activations, ["/managed/0.9.4/bifrost"]);
+});
+
+void test("does not prepare the preferred binary when the exact binary is selected", async () => {
+  let installStarted = false;
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.4/bifrost",
+        version: "0.9.4",
+        compatibilityMode: "exact"
+      }),
+    () => {
+      installStarted = true;
+      return Promise.resolve("/managed/0.9.4/bifrost");
+    },
+    () => undefined
+  );
+
+  assert.equal(preparation?.selected.version, "0.9.4");
+  assert.equal(preparation?.preferredInstall, null);
+  assert.equal(installStarted, false);
+});
+
+void test("keeps the compatible binary active when preferred preparation fails", async () => {
+  const messages: string[] = [];
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.1/bifrost",
+        version: "0.9.1",
+        compatibilityMode: "compatible"
+      }),
+    () => Promise.reject(new Error("release unavailable")),
+    (message) => messages.push(message)
+  );
+  let activated = false;
+  assert.ok(preparation);
+
+  assert.equal(
+    await provisioning.activatePreparedManagedBinary(
+      preparation,
+      () => true,
+      () => {
+        activated = true;
+        return Promise.resolve();
+      }
+    ),
+    false
+  );
+  assert.equal(activated, false);
+  assert.deepEqual(messages, ["Preferred managed Bifrost preparation failed: release unavailable"]);
+});
+
+void test("does not replace a server that moved on before preferred preparation completed", async () => {
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.1/bifrost",
+        version: "0.9.1",
+        compatibilityMode: "compatible"
+      }),
+    () => Promise.resolve("/managed/0.9.4/bifrost"),
+    () => undefined
+  );
+  let activated = false;
+  assert.ok(preparation);
+
+  assert.equal(
+    await provisioning.activatePreparedManagedBinary(
+      preparation,
+      () => false,
+      () => {
+        activated = true;
+        return Promise.resolve();
+      }
+    ),
+    false
+  );
+  assert.equal(activated, false);
+});
+
+void test("skips mislabeled, prerelease, and cross-minor managed binaries", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const reported = new Map([
+    ["0.9.4", "0.9.2"],
+    ["0.9.3-rc.1", "0.9.3-rc.1"],
+    ["0.8.9", "0.8.9"]
+  ]);
+  for (const version of reported.keys()) {
+    const binary = provisioning.managedBinaryPath(temp, version, "linux", "x64");
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, version);
+  }
+
+  const selected = await provisioning.findCompatibleManagedBinary(
+    temp,
+    { binaryVersion: "0.9.5", minimumBinaryVersion: "0.9.0", allowPrerelease: false },
+    "linux",
+    "x64",
+    (binary) => {
+      const directoryVersion = path.basename(path.dirname(path.dirname(binary)));
+      return Promise.resolve({ version: reported.get(directoryVersion) ?? null, rawOutput: "" });
+    }
+  );
+  assert.equal(selected, null);
 });
 
 void test("rejects checksum mismatch during install", async () => {
@@ -510,50 +708,36 @@ void test("requires restart only for process launch settings", () => {
   }
 });
 
-void test("detects existing bifrost gitignore entries", () => {
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost/cache\n"), true);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("/.bifrost/cache/\n"), true);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("!/.bifrost/cache/\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("# .bifrost/cache\nnode_modules\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost-cache\n"), false);
+void test("detects legacy bifrost gitignore entries", () => {
   assert.equal(lifecycle.gitignoreIncludesLegacyBifrostEntry("/.bifrost/\n"), true);
   assert.equal(lifecycle.gitignoreIncludesLegacyBifrostEntry(".bifrost/**\n"), false);
 });
 
 void test("distinguishes accepting, declining, and deferring the bifrost gitignore prompt", () => {
-  assert.equal(lifecycle.decideBifrostGitignorePrompt("Add", "Add"), "accept");
-  assert.equal(lifecycle.decideBifrostGitignorePrompt("Replace", "Replace"), "accept");
+  assert.equal(lifecycle.decideBifrostGitignorePrompt("Replace"), "accept");
   assert.equal(
-    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_DONT_ASK_AGAIN, "Add"),
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_DONT_ASK_AGAIN),
     "decline"
   );
   assert.equal(
-    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_ASK_AGAIN_LATER, "Replace"),
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_ASK_AGAIN_LATER),
     "defer"
   );
-  assert.equal(lifecycle.decideBifrostGitignorePrompt(undefined, "Add"), "defer");
+  assert.equal(lifecycle.decideBifrostGitignorePrompt(undefined), "defer");
 });
 
-void test("appends bifrost gitignore entry when missing", async () => {
+void test("does not request migration when the gitignore has no legacy entry", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const gitignorePath = path.join(temp, ".gitignore");
-  fs.writeFileSync(gitignorePath, "target");
+  fs.writeFileSync(gitignorePath, "target\n.bifrost/cache/\n");
 
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
-  await lifecycle.appendBifrostGitignoreEntry(temp);
-
-  assert.equal(fs.readFileSync(gitignorePath, "utf8"), "target\n.bifrost/cache/\n");
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), false);
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
-void test("creates gitignore with bifrost entry when missing", async () => {
+void test("does not request migration when gitignore is missing", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
 
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
-  await lifecycle.appendBifrostGitignoreEntry(temp);
-
-  assert.equal(fs.readFileSync(path.join(temp, ".gitignore"), "utf8"), ".bifrost/cache/\n");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
 void test("classifies and replaces only exact legacy bifrost ignore entries", async () => {
@@ -561,21 +745,21 @@ void test("classifies and replaces only exact legacy bifrost ignore entries", as
   const gitignorePath = path.join(temp, ".gitignore");
   fs.writeFileSync(gitignorePath, "target\r\n /.bifrost/  \r\n!.bifrost/keep\r\n.bifrost/**\r\n");
 
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "legacy-whole-directory");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), true);
   await lifecycle.replaceLegacyBifrostGitignoreEntry(temp);
 
   assert.equal(
     fs.readFileSync(gitignorePath, "utf8"),
     "target\r\n .bifrost/cache/  \r\n!.bifrost/keep\r\n.bifrost/**\r\n"
   );
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "configured");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
 void test("legacy bifrost ignore takes priority over a cache-only entry", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   fs.writeFileSync(path.join(temp, ".gitignore"), ".bifrost/cache/\n.bifrost/\n");
 
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "legacy-whole-directory");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), true);
 });
 
 void test("parses bifrost --version output", () => {
@@ -583,4 +767,14 @@ void test("parses bifrost --version output", () => {
   assert.equal(provisioning.parseBifrostVersion("bifrost v0.6.8\n"), "0.6.8");
   assert.equal(provisioning.parseBifrostVersion("not bifrost\n"), null);
   assert.equal(provisioning.isVersionCompatible("0.6.8", "v0.6.8"), true);
+  const compatibility = {
+    binaryVersion: "0.6.8",
+    minimumBinaryVersion: "0.6.3",
+    allowPrerelease: false
+  };
+  assert.equal(provisioning.isVersionCompatible("0.6.3", compatibility), true);
+  assert.equal(provisioning.isVersionCompatible("0.6.9", compatibility), true);
+  assert.equal(provisioning.isVersionCompatible("0.6.2", compatibility), false);
+  assert.equal(provisioning.isVersionCompatible("0.7.0", compatibility), false);
+  assert.equal(provisioning.isVersionCompatible("0.6.9-rc.1", compatibility), false);
 });

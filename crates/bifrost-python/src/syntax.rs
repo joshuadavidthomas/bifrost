@@ -1,7 +1,7 @@
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Default)]
 pub struct PythonOverloadDecoratorBindings {
@@ -191,11 +191,45 @@ pub fn python_deferred_annotation_identifier_ranges(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Vec<Range>> {
+    let tree = python_deferred_annotation_tree(string, source, cancellation)?;
+
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(current) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        if current.kind() == "identifier" {
+            ranges.push(Range {
+                start_byte: current.start_byte(),
+                end_byte: current.end_byte(),
+                start_line: current.start_position().row + 1,
+                end_line: current.end_position().row + 1,
+            });
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(ranges)
+}
+
+/// Parse one quoted annotation expression while preserving its original source
+/// byte coordinates. Literal string values and arbitrary strings are rejected
+/// by the same structured gate used by inverse membership.
+pub fn python_deferred_annotation_tree(
+    string: Node<'_>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Tree> {
     if string.kind() != "string"
         || string
             .parent()
             .is_some_and(|parent| parent.kind() == "concatenated_string")
         || !python_node_is_in_annotation(string)
+        || python_string_is_literal_value(string, source)
     {
         return None;
     }
@@ -220,26 +254,73 @@ pub fn python_deferred_annotation_identifier_ranges(
     if tree.root_node().has_error() {
         return None;
     }
+    Some(tree)
+}
 
-    let mut ranges = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(current) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return None;
-        }
-        if current.kind() == "identifier" {
-            ranges.push(Range {
-                start_byte: current.start_byte(),
-                end_byte: current.end_byte(),
-                start_line: current.start_position().row + 1,
-                end_line: current.end_position().row + 1,
-            });
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
+/// Whether `string` is a value argument of `Literal[...]`, rather than a
+/// deferred type expression merely because the whole subscript is an
+/// annotation.
+fn python_string_is_literal_value(string: Node<'_>, source: &str) -> bool {
+    let start = string.start_byte();
+    let end = string.end_byte();
+    let mut current = string;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "subscript" => {
+                let Some(value) = parent.child_by_field_name("value") else {
+                    return false;
+                };
+                if value.start_byte() <= start && end <= value.end_byte() {
+                    return false;
+                }
+                return python_literal_annotation_base(value, source);
             }
+            "generic_type" => {
+                let Some(value) = parent.named_child(0) else {
+                    return false;
+                };
+                return python_literal_annotation_base(value, source);
+            }
+            _ => current = parent,
         }
     }
-    Some(ranges)
+    false
+}
+
+fn python_literal_annotation_base(value: Node<'_>, source: &str) -> bool {
+    match value.kind() {
+        "identifier" => node_text(value, source) == "Literal",
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                value.child_by_field_name("object"),
+                value.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            object.kind() == "identifier"
+                && matches!(node_text(object, source), "typing" | "typing_extensions")
+                && attribute.kind() == "identifier"
+                && node_text(attribute, source) == "Literal"
+        }
+        "member_type" => {
+            let mut identifiers = Vec::new();
+            let mut stack = vec![value];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "identifier" {
+                    identifiers.push(node_text(node, source));
+                    continue;
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            matches!(
+                identifiers.as_slice(),
+                ["typing", "Literal"] | ["typing_extensions", "Literal"]
+            )
+        }
+        _ => false,
+    }
 }

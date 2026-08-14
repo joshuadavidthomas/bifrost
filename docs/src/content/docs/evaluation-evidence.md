@@ -58,4 +58,12 @@ A structurally guaranteed match means the parsed normalized node satisfied the q
 
 ## Publishing A Result
 
+Extension manifests distinguish three evidence purposes. `conformance`
+requires expectation and comparison artifacts. `development_experiment`
+records exploratory work and may remain incomplete without claiming
+conformance. `confirmatory_result` requires a locked protocol artifact and
+retains every deviation; a completeness-affecting deviation prevents a
+complete aggregate. These labels validate evidence structure, not study design
+or runtime causality.
+
 Use [Reproduce an Analysis](/reproduce-analysis/) for the run manifest and artifact layout, and [Cite Bifrost](/cite-bifrost/) for software attribution. A useful report should let a reader rerun the exact revision and distinguish engine evidence from the evaluator's interpretation.

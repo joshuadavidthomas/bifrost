@@ -18,6 +18,7 @@ import {
   buildBifrostArgs,
   buildBifrostLspArgs,
   cacheRootFor,
+  cleanupStaleInstallArtifacts,
   findOnPath,
   formatLauncherStatus,
   installManagedBinary,
@@ -27,6 +28,7 @@ import {
   managedBinaryPath,
   parseLauncherArgs,
   prepareBifrostInstallation,
+  preparePreferredBifrostInstallation,
   readReleaseMetadata,
   releaseAssetFor,
   releaseTargetFor,
@@ -34,6 +36,7 @@ import {
   resolveBifrostLaunch,
   resolveBifrostLspLaunch,
   resolveWorkspaceRoot,
+  schedulePreferredBifrostPreparation,
   sha256
 } from "../bin/bifrost-launcher.mjs";
 
@@ -157,7 +160,8 @@ test("finds compatible bifrost on PATH", async () => {
     env: { PATH: temp, BIFROST_LAUNCHER_ALLOW_PATH: "1", BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
     cacheRoot: path.join(temp, "cache"),
     metadata: {
-      binaryVersion: "0.7.2",
+      binaryVersion: "0.7.3",
+      minimumBinaryVersion: "0.7.0",
       archiveSha256: { [releaseTargetFor()]: "a".repeat(64) }
     },
     execFileImpl: async () => ({ stdout: "bifrost 0.7.2\n", stderr: "" })
@@ -165,6 +169,8 @@ test("finds compatible bifrost on PATH", async () => {
 
   assert.equal(resolved.path, binaryPath);
   assert.equal(resolved.source, "path");
+  assert.equal(resolved.selectedVersion, "0.7.2");
+  assert.equal(resolved.compatibilityMode, "compatible");
 });
 
 test("does not use PATH unless explicitly allowed", async () => {
@@ -235,6 +241,67 @@ test("uses compatible managed cache entry before PATH", async () => {
 
   assert.equal(resolved.path, managed);
   assert.equal(resolved.source, "managed");
+});
+
+test("selects the newest compatible cached patch independent of directory order", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const cacheRoot = path.join(temp, "cache");
+  const older = managedBinaryPath(cacheRoot, "0.7.1");
+  const newest = managedBinaryPath(cacheRoot, "0.7.4");
+  const otherMinor = managedBinaryPath(cacheRoot, "0.8.9");
+  for (const binary of [older, otherMinor, newest]) {
+    await writeExecutableFixture(binary, "#!/bin/sh\nexit 0\n");
+  }
+
+  const versions = new Map([
+    [older, "0.7.1"],
+    [newest, "0.7.4"],
+    [otherMinor, "0.8.9"]
+  ]);
+  const resolved = await resolveBifrostBinary({
+    env: { PATH: "", BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
+    cacheRoot,
+    metadata: {
+      binaryVersion: "0.7.5",
+      minimumBinaryVersion: "0.7.0",
+      allowPrerelease: false,
+      archiveSha256: {}
+    },
+    execFileImpl: async (binary) => ({ stdout: `bifrost ${versions.get(binary)}\n`, stderr: "" })
+  });
+
+  assert.equal(resolved.path, newest);
+  assert.equal(resolved.preferredVersion, "0.7.5");
+  assert.equal(resolved.selectedVersion, "0.7.4");
+  assert.equal(resolved.compatibilityMode, "compatible");
+});
+
+test("prefers the exact managed binary over newer-compatible and PATH candidates", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const cacheRoot = path.join(temp, "cache");
+  const exact = managedBinaryPath(cacheRoot, "0.7.3");
+  const newer = managedBinaryPath(cacheRoot, "0.7.4");
+  const pathBinary = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  for (const binary of [exact, newer, pathBinary]) {
+    await writeExecutableFixture(binary, "#!/bin/sh\nexit 0\n");
+  }
+
+  const resolved = await resolveBifrostBinary({
+    env: { PATH: temp, BIFROST_LAUNCHER_ALLOW_PATH: "1", BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
+    cacheRoot,
+    metadata: {
+      binaryVersion: "0.7.3",
+      minimumBinaryVersion: "0.7.0",
+      archiveSha256: {}
+    },
+    execFileImpl: async (binary) => ({
+      stdout: `bifrost ${binary === exact ? "0.7.3" : "0.7.4"}\n`,
+      stderr: ""
+    })
+  });
+
+  assert.equal(resolved.path, exact);
+  assert.equal(resolved.compatibilityMode, "exact");
 });
 
 test("reports no binary when auto install is disabled", async () => {
@@ -358,6 +425,55 @@ test("installs verified managed binary", async () => {
   assert.equal(fs.existsSync(installed), true);
 });
 
+test("cleans only stale launcher install artifacts", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const tempRoot = path.join(temp, "os-tmp");
+  const destinationDir = path.join(temp, "managed");
+  await fsp.mkdir(tempRoot);
+  await fsp.mkdir(destinationDir);
+
+  const staleTemp = path.join(tempRoot, "bifrost-agent-ABC123");
+  const recentTemp = path.join(tempRoot, "bifrost-agent-DEF456");
+  const unrelatedTemp = path.join(tempRoot, "bifrost-agent-packed-install-ABC123");
+  const staleDownload = path.join(destinationDir, "bifrost.123.456.123e4567-e89b-12d3-a456-426614174000.download");
+  const recentDownload = path.join(destinationDir, "bifrost.789.012.123e4567-e89b-12d3-a456-426614174001.download");
+  await Promise.all([
+    fsp.mkdir(staleTemp),
+    fsp.mkdir(recentTemp),
+    fsp.mkdir(unrelatedTemp),
+    fsp.writeFile(staleDownload, "stale"),
+    fsp.writeFile(recentDownload, "recent")
+  ]);
+  const now = Date.now();
+  const staleTime = new Date(now - 2_000);
+  const recentTime = new Date(now - 500);
+  await Promise.all([
+    fsp.utimes(staleTemp, staleTime, staleTime),
+    fsp.utimes(recentTemp, recentTime, recentTime),
+    fsp.utimes(staleDownload, staleTime, staleTime),
+    fsp.utimes(recentDownload, recentTime, recentTime)
+  ]);
+
+  await cleanupStaleInstallArtifacts({ tempRoot, destinationDir, now, maxAgeMs: 1_000 });
+
+  assert.equal(fs.existsSync(staleTemp), false);
+  assert.equal(fs.existsSync(staleDownload), false);
+  assert.equal(fs.existsSync(recentTemp), true);
+  assert.equal(fs.existsSync(recentDownload), true);
+  assert.equal(fs.existsSync(unrelatedTemp), true);
+});
+
+test("ignores stale install cleanup failures", async () => {
+  const fsImpl = {
+    ...fsp,
+    readdir: async () => {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    }
+  };
+
+  await cleanupStaleInstallArtifacts({ fsImpl, tempRoot: "/unreadable" });
+});
+
 test("uses unique managed install temp destinations", async () => {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const release = createFakeManagedRelease();
@@ -389,7 +505,7 @@ test("uses unique managed install temp destinations", async () => {
   assert.notEqual(copiedDestinations[0], copiedDestinations[1]);
 });
 
-test("shared MCP manifest launches package-local executable without treating package cwd as workspace", async () => {
+test("portable MCP manifest launches package-local executable without treating package cwd as workspace", async () => {
   if (process.platform === "win32") {
     return;
   }
@@ -405,7 +521,7 @@ fi
 printf '%s\\n' "$@" > "${recordPath}"
 `);
 
-  const mcpConfig = JSON.parse(await fsp.readFile(path.join(packageDir, ".mcp.json"), "utf8"));
+  const mcpConfig = JSON.parse(await fsp.readFile(path.join(packageDir, "mcp.json"), "utf8"));
   const server = mcpConfig.mcpServers.bifrost;
   const command = path.resolve(packageDir, server.command);
   await execFileAsync(command, server.args, {
@@ -642,6 +758,21 @@ test("exposes cache root override and version compatibility helper", async () =>
   const cacheOverride = "/tmp/bifrost-cache";
   assert.equal(cacheRootFor({ BIFROST_LAUNCHER_CACHE_DIR: cacheOverride }), path.resolve(cacheOverride));
   assert.equal(isVersionCompatible("0.7.2", "v0.7.2"), true);
+  const range = {
+    binaryVersion: "0.7.5",
+    minimumBinaryVersion: "0.7.1",
+    allowPrerelease: false
+  };
+  assert.equal(isVersionCompatible("0.7.1", range), true, "minimum is inclusive");
+  assert.equal(isVersionCompatible("0.7.9", range), true, "later patches in the series are compatible");
+  assert.equal(isVersionCompatible("0.7.0", range), false, "versions below the minimum are rejected");
+  assert.equal(isVersionCompatible("0.8.0", range), false, "a different minor is rejected");
+  assert.equal(isVersionCompatible("0.7.6-rc.1", range), false, "prereleases are rejected by default");
+  assert.equal(
+    isVersionCompatible("0.7.6-rc.1", { ...range, allowPrerelease: true }),
+    true,
+    "metadata can explicitly permit prereleases"
+  );
   assert.equal(await findOnPath("definitely-not-bifrost", "", undefined, process.cwd()), null);
 });
 
@@ -667,12 +798,14 @@ test("doctor reports a compatible managed binary without creating cache director
   });
   assert.deepEqual(ready, {
     status: "ready",
-    requiredVersion: "0.7.2",
+    preferredVersion: "0.7.2",
+    selectedVersion: "0.7.2",
     source: "managed",
+    compatibilityMode: "exact",
     binaryPath: managed,
     cachePath: managed,
     autoInstall: true,
-    message: "Bifrost 0.7.2 is ready from managed."
+    message: "Bifrost 0.7.2 is ready from managed in exact mode."
   });
 
   const absentCache = path.join(temp, "absent-cache");
@@ -789,6 +922,113 @@ test("prepare installs and then reuses a verified managed binary", async () => {
   assert.equal(reused.source, "managed");
 });
 
+test("preferred preparation installs exact pinned binary despite a compatible cache entry", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const compatible = managedBinaryPath(temp, "0.7.1", "linux", "x64");
+  await writeExecutableFixture(compatible);
+  const release = createFakeManagedRelease("0.7.2");
+
+  const prepared = await preparePreferredBifrostInstallation({
+    ...release,
+    cacheRoot: temp,
+    execFileImpl: async (binary) => ({
+      stdout: `bifrost ${binary.includes("0.7.2") ? "0.7.2" : "0.7.1"}\n`,
+      stderr: ""
+    })
+  });
+
+  assert.equal(prepared.status, "ready");
+  assert.equal(prepared.selectedVersion, "0.7.2");
+  assert.equal(prepared.compatibilityMode, "exact");
+  assert.equal(prepared.source, "installed");
+  assert.equal(release.state.fetchCount, 2);
+});
+
+test("preferred preparation honors disabled automatic installation", async () => {
+  const result = await preparePreferredBifrostInstallation({
+    env: { BIFROST_LAUNCHER_AUTO_INSTALL: "0" },
+    metadata: { binaryVersion: "0.7.2", archiveSha256: {} },
+    cacheRoot: path.join(os.tmpdir(), "unused-bifrost-cache")
+  });
+  assert.equal(result.status, "missing");
+  assert.equal(result.autoInstall, false);
+});
+
+test("compatible launch schedules detached preferred preparation without waiting", () => {
+  const calls = [];
+  let unrefCalled = false;
+  let errorHandlerAttached = false;
+  const helper = schedulePreferredBifrostPreparation(
+    {
+      compatibilityMode: "compatible",
+      env: { BIFROST_LAUNCHER_AUTO_INSTALL: "1", CUSTOM: "value" }
+    },
+    {
+      spawnImpl: (...args) => {
+        calls.push(args);
+        return {
+          once: (event) => { errorHandlerAttached = event === "error"; },
+          unref: () => { unrefCalled = true; }
+        };
+      }
+    }
+  );
+  assert.ok(helper);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], process.execPath);
+  assert.match(calls[0][1][0], /bifrost-launcher\.mjs$/);
+  assert.equal(calls[0][1][1], "prepare-preferred");
+  assert.equal(calls[0][2].detached, true);
+  assert.equal(calls[0][2].stdio, "ignore");
+  assert.equal(calls[0][2].env.CUSTOM, "value");
+  assert.equal(errorHandlerAttached, true);
+  assert.equal(unrefCalled, true);
+});
+
+test("reusable launch API schedules preferred preparation for Pi and future adapters", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const binary = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  await writeExecutableFixture(binary);
+  const calls = [];
+
+  const launch = await resolveBifrostLaunch({
+    root: temp,
+    env: { BIFROST_BINARY_PATH: binary, BIFROST_LAUNCHER_AUTO_INSTALL: "1" },
+    metadata: {
+      binaryVersion: "0.7.2",
+      minimumBinaryVersion: "0.7.0",
+      archiveSha256: {}
+    },
+    execFileImpl: async () => ({ stdout: "bifrost 0.7.1\n", stderr: "" }),
+    spawnImpl: (...args) => {
+      calls.push(args);
+      return { once: () => {}, unref: () => {} };
+    }
+  });
+
+  assert.equal(launch.selectedVersion, "0.7.1");
+  assert.equal(launch.compatibilityMode, "compatible");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1][1], "prepare-preferred");
+});
+
+test("exact launches and disabled auto-install do not schedule preparation", () => {
+  const spawnImpl = () => {
+    throw new Error("must not spawn");
+  };
+  assert.equal(
+    schedulePreferredBifrostPreparation({ compatibilityMode: "exact", env: {} }, { spawnImpl }),
+    null
+  );
+  assert.equal(
+    schedulePreferredBifrostPreparation(
+      { compatibilityMode: "compatible", env: { BIFROST_LAUNCHER_AUTO_INSTALL: "0" } },
+      { spawnImpl }
+    ),
+    null
+  );
+});
+
 test("prepare reports missing when automatic installation is disabled", async () => {
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const result = await prepareBifrostInstallation({
@@ -798,7 +1038,7 @@ test("prepare reports missing when automatic installation is disabled", async ()
   });
   assert.equal(result.status, "missing");
   assert.equal(result.autoInstall, false);
-  assert.match(result.message, /No compatible Bifrost 0\.7\.2 binary was found/);
+  assert.match(result.message, /No compatible Bifrost binary was found for preferred 0\.7\.2/);
   assert.match(result.message, /doctor, then prepare/);
   assert.match(result.message, /fresh host task/);
 });
@@ -827,8 +1067,10 @@ test("doctor CLI emits the stable JSON status shape on every platform", async ()
   const status = JSON.parse(stdout);
   assert.deepEqual(Object.keys(status), [
     "status",
-    "requiredVersion",
+    "preferredVersion",
+    "selectedVersion",
     "source",
+    "compatibilityMode",
     "binaryPath",
     "cachePath",
     "autoInstall",
@@ -836,7 +1078,9 @@ test("doctor CLI emits the stable JSON status shape on every platform", async ()
   ]);
   assert.equal(status.status, "missing");
   assert.equal(status.source, null);
-  assert.equal(status.cachePath, managedBinaryPath(cacheRoot, status.requiredVersion));
+  assert.equal(status.selectedVersion, null);
+  assert.equal(status.compatibilityMode, null);
+  assert.equal(status.cachePath, managedBinaryPath(cacheRoot, status.preferredVersion));
   assert.match(formatLauncherStatus(status), /^status=missing /);
 });
 
@@ -870,6 +1114,39 @@ test("server setup failures keep stdout clean and explain protocol-neutral recov
       }
     );
   }
+});
+
+test("server startup logs preferred and selected versions for a compatible fallback", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const binary = path.join(temp, "bifrost");
+  const release = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
+  const [major, minor] = release.binaryVersion.split(".");
+  const selected = `${major}.${minor}.0`;
+  await writeExecutableFixture(binary, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bifrost ${selected}"
+  exit 0
+fi
+exit 0
+`);
+
+  const result = await execFileAsync(
+    process.execPath,
+    [path.join(packageDir, "bin", "bifrost-launcher.mjs"), "--root", temp, "--mcp", "symbol"],
+    {
+      env: {
+        ...process.env,
+        BIFROST_BINARY_PATH: binary,
+        BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+      }
+    }
+  );
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, new RegExp(`preferred ${release.binaryVersion}`));
+  assert.match(result.stderr, new RegExp(`selected compatible ${selected}`));
 });
 
 test(

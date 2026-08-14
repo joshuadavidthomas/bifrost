@@ -15,11 +15,12 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::graph::ast::{
-    NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_type_for_key,
-    field_owner_token, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, is_method_receiver_type_name, lhs_identifier_slots,
-    parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
-    type_ref_from_node, var_spec_name_slots, var_spec_names,
+    NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_path_for_key,
+    composite_literal_owner_type_for_key, field_owner_token, for_each_var_spec,
+    is_definition_identifier, is_identifier_node, is_method_receiver_parameter,
+    is_method_receiver_type_name, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_name_slots, var_spec_names,
 };
 use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
 use crate::graph::reference::go_is_top_level_decl;
@@ -66,6 +67,7 @@ pub fn scan_files_for_target(
         let scan_bindings = ScanBindings::new(graph, file, spec);
         let file_package = graph.package_name_of(file).unwrap_or_default();
         let (alias_packages, dot_packages) = graph.namespace_packages(file);
+        let import_binding_names = graph.edge_index.import_binding_names(file);
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
@@ -79,6 +81,7 @@ pub fn scan_files_for_target(
             file_package,
             alias_packages,
             dot_packages,
+            import_binding_names,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -121,6 +124,7 @@ pub struct ScanCtx<'a> {
     file_package: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
     pub(crate) hits: &'a mut BTreeSet<UsageHit>,
     pub(crate) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -168,10 +172,13 @@ impl ScanCtx<'_> {
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
     match node.kind() {
         "import_declaration" => return,
-        "function_declaration" | "method_declaration" => {
+        "func_literal" | "function_declaration" | "method_declaration" => {
             locals.enter_scope();
+            scan_callable_header(node, ctx, locals);
             seed_parameters(node, ctx, locals);
-            scan_children(node, ctx, locals);
+            if let Some(body) = node.child_by_field_name("body") {
+                scan_node(body, ctx, locals);
+            }
             locals.exit_scope();
             return;
         }
@@ -182,14 +189,29 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             return;
         }
         "parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                scan_node(type_node, ctx, locals);
+            }
             seed_parameter_declaration(node, ctx, locals, is_method_receiver_parameter(node));
+            return;
         }
         "var_declaration" | "short_var_declaration" => {
             // A package-level `var` is not a local binding: seeding it (as a shadow
             // or a typed symbol) would hide references to the package variable.
             // Only function/block-scoped `var`/`:=` are locals.
             if !go_is_top_level_decl(node) {
-                seed_local_bindings(node, ctx, locals);
+                if node.kind() == "short_var_declaration" {
+                    for value in rhs_expressions(node) {
+                        scan_node(value, ctx, locals);
+                    }
+                    seed_assignment_like(node, ctx, locals, true);
+                } else {
+                    for_each_var_spec(node, &mut |spec| {
+                        scan_var_spec_before_binding(spec, ctx, locals);
+                        seed_var_spec(spec, ctx, locals);
+                    });
+                }
+                return;
             }
         }
         "assignment_statement" => {
@@ -198,13 +220,55 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
         "selector_expression" | "qualified_type" => {
             scan_selector_like(node, ctx, locals);
         }
-        "identifier" | "type_identifier" if !scan_composite_literal_field_label(node, ctx) => {
+        "identifier" | "type_identifier" | "package_identifier"
+            if !scan_composite_literal_field_label(node, ctx) =>
+        {
             scan_direct_identifier(node, ctx, locals);
         }
         _ => {}
     }
 
     scan_children(node, ctx, locals);
+}
+
+fn scan_var_spec_before_binding(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        scan_node(type_node, ctx, locals);
+    }
+    for value in rhs_expressions(node) {
+        scan_node(value, ctx, locals);
+    }
+}
+
+fn scan_callable_header(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if node.child_by_field_name("body") == Some(child) {
+            continue;
+        }
+        if child.kind() == "parameter_list" {
+            let mut params = child.walk();
+            for parameter in child.named_children(&mut params) {
+                if matches!(
+                    parameter.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                ) && let Some(type_node) = parameter.child_by_field_name("type")
+                {
+                    scan_node(type_node, ctx, locals);
+                }
+            }
+        } else {
+            scan_node(child, ctx, locals);
+        }
+    }
 }
 
 fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
@@ -223,7 +287,7 @@ fn seed_parameters(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenc
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "parameter_list" {
+        if child.kind() == "parameter_list" && node.child_by_field_name("receiver") != Some(child) {
             seed_parameter_list(child, ctx, locals, false);
         }
     }
@@ -237,7 +301,10 @@ fn seed_parameter_list(
 ) {
     let mut params = node.walk();
     for param in node.named_children(&mut params) {
-        if param.kind() == "parameter_declaration" {
+        if matches!(
+            param.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
             seed_parameter_declaration(param, ctx, locals, is_method_receiver);
         }
     }
@@ -557,6 +624,9 @@ fn scan_direct_identifier(
         return;
     }
     let text = node_text(node, ctx.source);
+    if ctx.import_binding_names.contains(text) {
+        return;
+    }
     if !ctx.bindings.matches_direct_target(text) {
         return;
     }
@@ -577,22 +647,34 @@ fn scan_direct_identifier(
 /// distinguishes `Owner{Field: value}` from `map[string]T{Field: value}` and
 /// from another struct with a same-named field.
 fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
-    let Some(type_node) = composite_literal_owner_type_for_key(node) else {
+    let Some(path) = composite_literal_owner_path_for_key(node) else {
         return false;
     };
+    let direct_owner = composite_literal_owner_type_for_key(node);
     // A keyed element in a map, array, or slice literal is an ordinary key or
     // index expression, not a struct-field label. Let the normal identifier or
     // selector scanners resolve it. The explicit composite-literal type is the
     // structured distinction; guessing from the key spelling would conflate
     // same-named fields and constants.
-    if matches!(type_node.kind(), "map_type" | "array_type" | "slice_type") {
+    if direct_owner.is_some_and(|type_node| {
+        matches!(type_node.kind(), "map_type" | "array_type" | "slice_type")
+    }) {
         return false;
     }
-    if node_text(node, ctx.source) == ctx.spec.identifier
-        && type_ref_from_node(type_node, ctx.source)
-            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
-    {
-        record_hit(node, ctx);
+    if node_text(node, ctx.source) == ctx.spec.identifier {
+        let direct_match = direct_owner
+            .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty));
+        let indexed_match = type_ref_from_node(path.type_node, ctx.source).is_some_and(|outer| {
+            ctx.graph
+                .edge_index
+                .composite_literal_owner_fqns(ctx.file, &outer, &path.steps)
+                .into_iter()
+                .any(|owner| ctx.spec.matches_receiver_fqn(&owner))
+        });
+        if direct_match || indexed_match {
+            record_hit(node, ctx);
+        }
     }
     true
 }

@@ -16,9 +16,9 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const releaseVersionScript = path.resolve(testDir, "../../../scripts/release-version.mjs");
 
 const jsonProjections = [
-  "plugins/bifrost-agent/.codex-plugin/plugin.json",
   "plugins/bifrost-agent/.claude-plugin/plugin.json",
   "plugins/bifrost-agent/.cursor-plugin/plugin.json",
+  "plugins/bifrost-agent/plugin.json",
   ".cursor-plugin/marketplace.json",
   "plugins/bifrost-agent/bifrost-release.json",
   "plugins/bifrost-agent/package.json",
@@ -95,6 +95,36 @@ test("release version update includes the current version in release bundle comp
       const spec = JSON.parse(await readFile(path.join(root, relativePath), "utf8"));
       assert.equal(spec.compatibility.bifrost, ">=0.8.0, <2.0.0");
     }
+    const release = JSON.parse(
+      await readFile(path.join(root, "plugins/bifrost-agent/bifrost-release.json"), "utf8"),
+    );
+    assert.equal(release.binaryVersion, "1.2.4");
+    assert.equal(release.minimumBinaryVersion, "1.2.3");
+    assert.equal(release.allowPrerelease, false);
+    const vscode = JSON.parse(
+      await readFile(path.join(root, "editors/vscode/package.json"), "utf8"),
+    );
+    assert.equal(vscode.bifrost.binaryVersion, "1.2.4");
+    assert.equal(vscode.bifrost.minimumBinaryVersion, "1.2.3");
+    assert.equal(vscode.bifrost.allowPrerelease, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release version update resets launcher compatibility on a new minor series", async () => {
+  const root = await createFixture("1.3.0", "1.2.9", "\n");
+  try {
+    await execFileAsync(process.execPath, [releaseVersionScript, "sync"], { cwd: root });
+    const release = JSON.parse(
+      await readFile(path.join(root, "plugins/bifrost-agent/bifrost-release.json"), "utf8"),
+    );
+    assert.equal(release.binaryVersion, "1.3.0");
+    assert.equal(release.minimumBinaryVersion, "1.3.0");
+    const vscode = JSON.parse(
+      await readFile(path.join(root, "editors/vscode/package.json"), "utf8"),
+    );
+    assert.equal(vscode.bifrost.minimumBinaryVersion, "1.3.0");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -166,6 +196,8 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
   };
   const release = {
     binaryVersion: projectionVersion,
+    minimumBinaryVersion: projectionVersion,
+    allowPrerelease: false,
     archiveSha256: { test: "checksum" },
   };
   const packageLock = {
@@ -176,14 +208,16 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     version: projectionVersion,
     bifrost: {
       binaryVersion: projectionVersion,
+      minimumBinaryVersion: projectionVersion,
+      allowPrerelease: false,
       archiveSha256: { test: "checksum" },
     },
   };
 
   const values = new Map([
-    ["plugins/bifrost-agent/.codex-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.claude-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.cursor-plugin/plugin.json", basicPlugin],
+    ["plugins/bifrost-agent/plugin.json", basicPlugin],
     [".cursor-plugin/marketplace.json", marketplace],
     ["plugins/bifrost-agent/bifrost-release.json", release],
     ["plugins/bifrost-agent/package.json", basicPlugin],

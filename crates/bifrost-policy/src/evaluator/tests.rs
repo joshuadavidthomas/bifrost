@@ -132,6 +132,7 @@ fn projected_report(proof_reason: ProofReason) -> ProjectedFindingReport {
         witnesses: Vec::new(),
         witnesses_truncated: false,
         omitted_witnesses_lower_bound: 0,
+        display_path: None,
     }
 }
 
@@ -1645,4 +1646,37 @@ fn file_anchor_never_uses_a_span() {
     let anchor = MatchFindingAnchor::strong(MatchResultDomain::File, path, None, None, 0)
         .expect("file anchor");
     assert_eq!(anchor.result_domain(), MatchResultDomain::File);
+}
+
+/// The termination mapping, pinned where a fixture cannot reach it.
+///
+/// Milestone 4 established that `exceeded-budget` is structurally unreachable
+/// in the one declared domain: every rewrite consumes one distinct binder root
+/// and inserts it into the visited set, so the hop count can never pass the
+/// binder's root count. The guard stays in the production loop because the
+/// contract needs the terminal and a second domain may well reach it -- so the
+/// verdict it maps to is pinned here rather than left to a fixture that cannot
+/// exist.
+#[test]
+fn budget_exhaustion_is_inconclusive_and_only_a_cycle_is_a_counterexample() {
+    use super::assertion::{TerminationVerdict, termination_verdict};
+    use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteOutcome;
+
+    assert_eq!(
+        termination_verdict(&RewriteOutcome::Converged {
+            fixed_point: "c".to_string()
+        }),
+        TerminationVerdict::Satisfied
+    );
+    assert_eq!(
+        termination_verdict(&RewriteOutcome::Cycle {
+            witness: vec!["c".to_string(), "a".to_string(), "c".to_string()]
+        }),
+        TerminationVerdict::Counterexample
+    );
+    assert_eq!(
+        termination_verdict(&RewriteOutcome::ExceededBudget { explored: 4 }),
+        TerminationVerdict::Inconclusive,
+        "budget exhaustion is absence of evidence: never a finding, never a pass"
+    );
 }

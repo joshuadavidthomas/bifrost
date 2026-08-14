@@ -71,6 +71,8 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         max_symbols: 5_000,
         max_service_symbols: 1_000,
         max_scan_probes: 100,
+        symbol_time_budget_ms: 0,
+        anomaly_percent: 0,
         symbol_filter: None,
         path_filter: None,
         shard: None,
@@ -1161,6 +1163,70 @@ fn i5_silent_when_failures_carry_hints() {
     let mut summary = ProbeSummary::default();
     check_i5(&refs(&records), "scala", &mut sink, &mut summary);
     assert!(sink.into_sorted_vec().is_empty());
+}
+
+// #2111: a selector the resolver skipped for naming more declarations than
+// its cap answers through `too_broad` and nothing else -- `sources`,
+// `not_found` and `ambiguous` are all empty. Reading only those three fields
+// scored every over-cap reply as an empty refusal.
+#[test]
+fn i5_accepts_a_too_broad_reply_that_carries_its_remedy() {
+    let records = vec![record(
+        "i5:too-broad",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "name".to_string(),
+        },
+        json!({
+            "sources": [],
+            "not_found": [],
+            "ambiguous": [],
+            "too_broad": [{
+                "target": "name",
+                "matched": 601,
+                "cap": 200,
+                "matched_kind": "declarations",
+                "sample": [],
+                "note": "Qualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call.",
+            }],
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i5(&refs(&records), "ts", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(summary.i5_hint_checks, 1);
+}
+
+#[test]
+fn i5_fires_when_a_too_broad_reply_states_no_remedy() {
+    let records = vec![record(
+        "i5:too-broad",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "name".to_string(),
+        },
+        json!({
+            "sources": [],
+            "not_found": [],
+            "ambiguous": [],
+            "too_broad": [{
+                "target": "name",
+                "matched": 601,
+                "cap": 200,
+                "matched_kind": "declarations",
+                "sample": [],
+            }],
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i5(&refs(&records), "ts", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "empty-failure-hint");
 }
 
 #[test]

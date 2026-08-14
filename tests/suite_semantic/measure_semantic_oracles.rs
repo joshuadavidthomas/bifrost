@@ -488,7 +488,7 @@ fn measure_oracles(
                 if !matches!(
                     value.kind,
                     SemanticValueKind::Local
-                        | SemanticValueKind::Receiver
+                        | SemanticValueKind::Receiver { .. }
                         | SemanticValueKind::Return
                         | SemanticValueKind::Temporary
                 ) {

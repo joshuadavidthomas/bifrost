@@ -1083,6 +1083,50 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    fn precise_parent_forward_owner_deduplicates_one_logical_class() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = CodeUnit::new(
+            ProjectFile::new(root.clone(), "first.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let second = CodeUnit::new(
+            ProjectFile::new(root.clone(), "second.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let other = CodeUnit::new(
+            ProjectFile::new(root, "other.h"),
+            CodeUnitType::Class,
+            "other",
+            "encoder",
+        );
+
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first.clone(), second.clone()]),
+            Some(second.clone())
+        );
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first, other]),
+            None
+        );
+
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (second.clone(), CppClassDeclarationStrength::Forward),
+                    (second, CppClassDeclarationStrength::Forward),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::ForwardsOnly(forwards) if forwards.len() == 2
+        ));
+    }
+
+    #[test]
     fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
         const SIBLING_COUNT: usize = 113;
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1612,6 +1656,102 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    fn conditional_include_projection_index_walks_each_guard_state_once_for_all_donors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let left = ProjectFile::new(root.clone(), "left.h");
+        let right = ProjectFile::new(root.clone(), "right.h");
+        let shared = ProjectFile::new(root.clone(), "shared.h");
+        let cycle = ProjectFile::new(root.clone(), "cycle.h");
+        let absent = ProjectFile::new(root.clone(), "absent.h");
+        consumer
+            .write(
+                "#if defined(LEFT)\n#include \"left.h\"\n#endif\n\
+                 #if defined(RIGHT)\n#include \"right.h\"\n#endif\n",
+            )
+            .expect("write consumer");
+        left.write("#include \"shared.h\"\n").expect("write left");
+        right.write("#include \"shared.h\"\n").expect("write right");
+        shared
+            .write("#include \"cycle.h\"\nstruct Shared {};\n")
+            .expect("write shared");
+        cycle
+            .write("#include \"shared.h\"\nstruct Cycle {};\n")
+            .expect("write cycle");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let prepared = analyzer
+            .prepared_syntax(&consumer)
+            .expect("prepared consumer");
+
+        let [
+            left_projections,
+            right_projections,
+            shared_projections,
+            cycle_projections,
+        ] = std::thread::scope(|scope| {
+            let handles = [&left, &right, &shared, &cycle].map(|donor| {
+                scope.spawn(|| {
+                    visibility.conditional_include_projections_for_source(
+                        &consumer,
+                        prepared.as_ref(),
+                        donor,
+                    )
+                })
+            });
+            handles.map(|handle| handle.join().expect("projection query"))
+        });
+
+        assert_eq!(left_projections.len(), 1);
+        assert_eq!(right_projections.len(), 1);
+        assert_eq!(shared_projections.len(), 2);
+        assert_eq!(cycle_projections.len(), 2);
+        assert!(
+            left_projections[0]
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("LEFT".to_string()))
+        );
+        assert!(
+            right_projections[0]
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("RIGHT".to_string()))
+        );
+        assert!(shared_projections.iter().any(|projection| {
+            projection
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("LEFT".to_string()))
+        }));
+        assert!(shared_projections.iter().any(|projection| {
+            projection
+                .required_guards
+                .contains(&PreprocessorGuard::Defined("RIGHT".to_string()))
+        }));
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 6),
+            "four concurrent donor queries must single-flight one six-state graph traversal"
+        );
+
+        assert!(
+            visibility
+                .conditional_include_projections_for_source(&consumer, prepared.as_ref(), &absent,)
+                .is_empty()
+        );
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 6),
+            "an absent donor is a map miss, not a new graph traversal"
+        );
+    }
+
+    #[test]
     fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -1796,6 +1936,69 @@ ABSL_NAMESPACE_END
         assert!(
             !arity.accepts(0),
             "required parameter must remain enforced: {arity:?}"
+        );
+    }
+
+    #[test]
+    fn recovered_c_precision_membership_keeps_roles_bounded_and_structured() {
+        let source = r#"typedef struct Widget Widget;
+struct Widget { int field; };
+#define THIS(type) type *self
+
+int trigger(Widget *value) { return value->field; }
+int recovered(void) { THIS(const Widget); return 0; }
+
+struct Stamp { int sec; };
+struct State { struct Stamp timestamp; };
+#define DISCARD(value) 0
+int recovered_member(struct State *state) {
+    DISCARD(const int = state->timestamp);
+    return 0;
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp root");
+        let file = ProjectFile::new(&root, "recovered.c");
+        fs::write(file.abs_path(), source).expect("write recovery fixture");
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(&analyzer, &roots).expect("C batch");
+        let ranges = batch
+            .recovered_c_reference_ranges(&file, 100)
+            .expect("complete recovered ranges");
+        let ranges = ranges
+            .into_iter()
+            .map(|range| (range.start_byte, range.end_byte))
+            .collect::<HashSet<_>>();
+
+        let recovered_type = source.rfind("Widget").expect("recovered Widget");
+        let recovered_member = source.rfind("timestamp").expect("recovered timestamp");
+        assert!(
+            ranges.contains(&(recovered_type, recovered_type + "Widget".len())),
+            "the macro-shaped type remains a structured reference: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&(recovered_member, recovered_member + "timestamp".len())),
+            "the recovered selected member remains a structured reference: {ranges:?}"
+        );
+
+        let macro_definition =
+            source.find("#define THIS").expect("THIS definition") + "#define ".len();
+        let macro_formal = source.find("THIS(type)").expect("THIS formal") + "THIS(".len();
+        assert!(
+            !ranges.contains(&(macro_definition, macro_definition + "THIS".len())),
+            "macro definition names are not references"
+        );
+        assert!(
+            !ranges.contains(&(macro_formal, macro_formal + "type".len())),
+            "macro formal parameters are not references"
+        );
+        assert!(
+            batch.recovered_c_reference_ranges(&file, 0).is_none(),
+            "a cap hit makes the whole recovery membership unavailable"
         );
     }
 }

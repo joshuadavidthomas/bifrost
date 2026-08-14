@@ -760,6 +760,24 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Number of files in the project, i.e. an upper bound on the distinct
+    /// files any demand-cached analysis can materialize.
+    ///
+    /// A whole-workspace analysis such as a policy compile legitimately touches
+    /// every relevant file once; the content-keyed materialization cache makes
+    /// that cost proportional to distinct files, never more than this count. A
+    /// caller can therefore size a materialization budget to this value instead
+    /// of a fixed per-query cap that a large corpus would exceed by construction.
+    /// Returns `0` when the file listing is unavailable, which callers fold into
+    /// their existing lower bound with `max`.
+    pub fn project_file_count(&self) -> usize {
+        self.analyzer()
+            .project()
+            .all_files_shared()
+            .map(|files| files.len())
+            .unwrap_or(0)
+    }
+
     /// Pre-build whatever lazily constructed usage indexes each language wants
     /// warmed ahead of demand. Languages that need none inherit the trait's
     /// no-op, so this stays a no-op for the workspaces they make up.

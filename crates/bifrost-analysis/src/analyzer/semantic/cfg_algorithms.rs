@@ -104,10 +104,6 @@ impl CfgAlgorithmBudget {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "test convenience for all on-demand algorithms")
-    )]
     pub(crate) const fn uniform(limit: usize) -> Self {
         Self::new(CfgAlgorithmWork {
             node_visits: limit,
@@ -774,6 +770,752 @@ where
     })
 }
 
+/// Complete immediate-dominator relation for one entry, dense by node index.
+///
+/// Unreachable nodes carry no dominator: they dominate nothing and nothing
+/// dominates them. The entry stores itself internally so the chain walk has a
+/// fixed point, and reports `None` externally because no node dominates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dominators<Node> {
+    immediate: Box<[Option<usize>]>,
+    work: CfgAlgorithmWork,
+    node: std::marker::PhantomData<Node>,
+}
+
+impl<Node: Copy> Dominators<Node> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "issue 1480 milestone 2 flow-state derivation is the pending consumer"
+        )
+    )]
+    pub(crate) fn immediate_dominator<G>(&self, graph: &G, node: Node) -> Option<Node>
+    where
+        G: DenseBidirectionalGraph<Node = Node>,
+    {
+        let index = graph.node_index(node)?;
+        let parent = self.immediate.get(index).copied().flatten()?;
+        (parent != index).then(|| required_node(graph, parent))
+    }
+
+    /// Reflexive dominance: `a` dominates itself, and dominates `b` when every
+    /// entry-to-`b` path passes through `a`. The idom chain is walked
+    /// iteratively and strictly ascends, so the walk always terminates.
+    pub(crate) fn dominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
+    where
+        G: DenseBidirectionalGraph<Node = Node>,
+    {
+        let (Some(a_index), Some(b_index)) = (graph.node_index(a), graph.node_index(b)) else {
+            return false;
+        };
+        if self.immediate.get(a_index).copied().flatten().is_none() {
+            return false;
+        }
+        let mut cursor = b_index;
+        loop {
+            let Some(parent) = self.immediate.get(cursor).copied().flatten() else {
+                return false;
+            };
+            if cursor == a_index {
+                return true;
+            }
+            if parent == cursor {
+                return false;
+            }
+            cursor = parent;
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "benchmark and future consumers inspect exact work"
+        )
+    )]
+    pub(crate) const fn work(&self) -> CfgAlgorithmWork {
+        self.work
+    }
+}
+
+/// Cooper-Harvey-Kennedy iterative dominance over the nodes reachable from `entry`.
+pub(crate) fn dominators<G>(
+    graph: &G,
+    entry: G::Node,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<Dominators<G::Node>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    request.checkpoint()?;
+    let started = request.budget.used();
+    let entry_index = required_index(graph, entry)?;
+    let order = reverse_postorder_from(graph, entry, request)?;
+    debug_assert_eq!(
+        order.first().copied(),
+        Some(entry),
+        "reverse postorder from the entry must start at the entry"
+    );
+    let mut rpo_position = vec![usize::MAX; graph.node_count()];
+    for (position, node) in order.iter().copied().enumerate() {
+        request.checkpoint()?;
+        rpo_position[required_index(graph, node)?] = position;
+    }
+
+    let mut immediate = vec![None::<usize>; graph.node_count()];
+    immediate[entry_index] = Some(entry_index);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in order.iter().copied().skip(1) {
+            let index = required_index(graph, node)?;
+            request.visit_node()?;
+            let mut candidate = None::<usize>;
+            for (_, predecessor) in graph.predecessors(node) {
+                request.visit_edge()?;
+                let predecessor_index = required_index(graph, predecessor)?;
+                if immediate[predecessor_index].is_none() {
+                    continue;
+                }
+                candidate = Some(match candidate {
+                    None => predecessor_index,
+                    Some(current) => intersect_dominators(
+                        &immediate,
+                        &rpo_position,
+                        current,
+                        predecessor_index,
+                        request,
+                    )?,
+                });
+            }
+            let candidate = candidate.expect(
+                "reverse postorder reaches a node only after its depth-first tree predecessor",
+            );
+            if immediate[index] != Some(candidate) {
+                immediate[index] = Some(candidate);
+                changed = true;
+            }
+        }
+    }
+
+    Ok(Dominators {
+        immediate: immediate.into_boxed_slice(),
+        work: request.budget.used().saturating_sub(started),
+        node: std::marker::PhantomData,
+    })
+}
+
+/// Canonical live regions which are reachable from the procedure entry but
+/// have no structural path to either real exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NonExitingRegion<Node> {
+    pub(crate) members: Box<[Node]>,
+}
+
+/// Complete postdominator relation for the analyzable part of one procedure.
+///
+/// The synthetic common exit is stored as index `graph.node_count()` and is
+/// never returned by the public queries. Live non-exiting points have no
+/// postdominator parent and are reported separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Postdominators<Node> {
+    immediate: Box<[Option<usize>]>,
+    synthetic_exit: usize,
+    pub(crate) non_exiting_regions: Box<[NonExitingRegion<Node>]>,
+    pub(crate) unreachable_points: usize,
+    pub(crate) work: CfgAlgorithmWork,
+}
+
+impl<Node: Copy> Postdominators<Node> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "algorithm contract query"))]
+    pub(crate) fn immediate_postdominator<G>(&self, graph: &G, node: Node) -> Option<Node>
+    where
+        G: DenseBidirectionalGraph<Node = Node>,
+    {
+        let parent = self
+            .immediate
+            .get(graph.node_index(node)?)
+            .copied()
+            .flatten()?;
+        (parent != self.synthetic_exit).then(|| required_node(graph, parent))
+    }
+
+    pub(crate) fn postdominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
+    where
+        G: DenseBidirectionalGraph<Node = Node>,
+    {
+        let (Some(a), Some(mut cursor)) = (graph.node_index(a), graph.node_index(b)) else {
+            return false;
+        };
+        loop {
+            if cursor == a {
+                return true;
+            }
+            let Some(parent) = self.immediate.get(cursor).copied().flatten() else {
+                return false;
+            };
+            if parent == cursor || parent == self.synthetic_exit {
+                return false;
+            }
+            cursor = parent;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ControlDependenceRow<Edge, Node> {
+    pub(crate) controlling_edge: Edge,
+    pub(crate) governed: Node,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ControlDependenceResult<Edge, Node> {
+    pub(crate) rows: Box<[ControlDependenceRow<Edge, Node>]>,
+    pub(crate) non_exiting_regions: Box<[NonExitingRegion<Node>]>,
+    pub(crate) unreachable_points: usize,
+    pub(crate) work: CfgAlgorithmWork,
+}
+
+/// Narrow cross-crate projection used by the extension runtime. The extension
+/// contract maps these procedure-local identities to stable source identities;
+/// it never exposes them to callers.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureControlDependence {
+    pub rows: Box<[(ControlEdgeId, ProgramPointId)]>,
+    pub non_exiting_regions: Box<[Box<[ProgramPointId]>]>,
+    pub unreachable_points: usize,
+    pub node_visits: usize,
+    pub edge_visits: usize,
+}
+
+#[doc(hidden)]
+pub fn derive_procedure_control_dependence(
+    procedure: &ProcedureSemantics,
+    max_work: usize,
+    cancellation: &CancellationToken,
+) -> Result<ProcedureControlDependence, Box<str>> {
+    let mut budget = CfgAlgorithmBudget::uniform(max_work);
+    let mut request = CfgAlgorithmRequest::new(&mut budget, cancellation);
+    let result = control_dependence(
+        procedure,
+        procedure.entry_point(),
+        procedure.normal_exit_point(),
+        procedure.exceptional_exit_point(),
+        &mut request,
+    )
+    .map_err(|error| format!("{error:?}").into_boxed_str())?;
+    Ok(ProcedureControlDependence {
+        rows: result
+            .rows
+            .iter()
+            .map(|row| (row.controlling_edge, row.governed))
+            .collect(),
+        non_exiting_regions: result
+            .non_exiting_regions
+            .iter()
+            .map(|region| region.members.clone())
+            .collect(),
+        unreachable_points: result.unreachable_points,
+        node_visits: result.work.node_visits,
+        edge_visits: result.work.edge_visits,
+    })
+}
+
+pub(crate) fn postdominators<G>(
+    graph: &G,
+    entry: G::Node,
+    normal_exit: G::Node,
+    exceptional_exit: G::Node,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<Postdominators<G::Node>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    request.checkpoint()?;
+    let started = request.budget.used();
+    required_index(graph, entry)?;
+    required_index(graph, normal_exit)?;
+    required_index(graph, exceptional_exit)?;
+    let live = forward_reachability(graph, entry, request)?;
+    let normal_reaching = reverse_reachability(graph, normal_exit, request)?;
+    let exceptional_reaching = reverse_reachability(graph, exceptional_exit, request)?;
+    let analyzable = live
+        .membership()
+        .iter()
+        .zip(normal_reaching.membership())
+        .zip(exceptional_reaching.membership())
+        .map(|((&live, &normal), &exceptional)| live && (normal || exceptional))
+        .collect::<Vec<_>>();
+
+    let components = strongly_connected_components(graph, request)?;
+    let mut non_exiting_regions = Vec::new();
+    for members in &components.components {
+        request.checkpoint()?;
+        let retained = members
+            .iter()
+            .copied()
+            .filter(|node| {
+                let index = graph
+                    .node_index(*node)
+                    .expect("SCC member belongs to graph");
+                live.membership()[index] && !analyzable[index]
+            })
+            .collect::<Vec<_>>();
+        if !retained.is_empty() {
+            for _ in &retained {
+                request.visit_node()?;
+            }
+            non_exiting_regions.push(NonExitingRegion {
+                members: retained.into_boxed_slice(),
+            });
+        }
+    }
+
+    let synthetic = graph.node_count();
+    let mut order = reverse_postorder_postdom(
+        graph,
+        synthetic,
+        normal_exit,
+        exceptional_exit,
+        &analyzable,
+        request,
+    )?;
+    debug_assert_eq!(order.first().copied(), Some(synthetic));
+    let mut position = vec![usize::MAX; graph.node_count() + 1];
+    for (offset, index) in order.iter().copied().enumerate() {
+        request.checkpoint()?;
+        position[index] = offset;
+    }
+    let mut immediate = vec![None; graph.node_count() + 1];
+    immediate[synthetic] = Some(synthetic);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in order.iter().copied().skip(1) {
+            request.visit_node()?;
+            let node = required_node(graph, index);
+            let mut predecessors = graph.successors(node).map(|(_, target)| target);
+            let mut candidate = None;
+            for successor in predecessors.by_ref() {
+                request.visit_edge()?;
+                let successor = required_index(graph, successor)?;
+                if !analyzable[successor] || immediate[successor].is_none() {
+                    continue;
+                }
+                candidate = Some(match candidate {
+                    None => successor,
+                    Some(current) => {
+                        intersect_dominators(&immediate, &position, current, successor, request)?
+                    }
+                });
+            }
+            if node == normal_exit || node == exceptional_exit {
+                request.visit_edge()?;
+                candidate = Some(match candidate {
+                    None => synthetic,
+                    Some(current) => {
+                        intersect_dominators(&immediate, &position, current, synthetic, request)?
+                    }
+                });
+            }
+            let candidate = candidate.expect("analyzable node reaches a real exit");
+            if immediate[index] != Some(candidate) {
+                immediate[index] = Some(candidate);
+                changed = true;
+            }
+        }
+    }
+    order.clear();
+    Ok(Postdominators {
+        immediate: immediate.into_boxed_slice(),
+        synthetic_exit: synthetic,
+        non_exiting_regions: non_exiting_regions.into_boxed_slice(),
+        unreachable_points: live.membership().iter().filter(|live| !**live).count(),
+        work: request.budget.used().saturating_sub(started),
+    })
+}
+
+fn reverse_postorder_postdom<G>(
+    graph: &G,
+    synthetic: usize,
+    normal_exit: G::Node,
+    exceptional_exit: G::Node,
+    analyzable: &[bool],
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<Vec<usize>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    let mut colors = vec![0_u8; graph.node_count() + 1];
+    let mut postorder = Vec::new();
+    let mut actions = vec![(synthetic, false)];
+    while let Some((index, finish)) = actions.pop() {
+        request.checkpoint()?;
+        if finish {
+            colors[index] = 2;
+            postorder.push(index);
+            continue;
+        }
+        if colors[index] != 0 {
+            continue;
+        }
+        request.visit_node()?;
+        colors[index] = 1;
+        actions.push((index, true));
+        if index == synthetic {
+            for exit in [exceptional_exit, normal_exit] {
+                request.visit_edge()?;
+                let exit = required_index(graph, exit)?;
+                if analyzable[exit] && colors[exit] == 0 {
+                    actions.push((exit, false));
+                }
+            }
+        } else {
+            let node = required_node(graph, index);
+            for (_, predecessor) in graph.predecessors(node).rev() {
+                request.visit_edge()?;
+                let predecessor = required_index(graph, predecessor)?;
+                if analyzable[predecessor] && colors[predecessor] == 0 {
+                    actions.push((predecessor, false));
+                }
+            }
+        }
+    }
+    postorder.reverse();
+    Ok(postorder)
+}
+
+pub(crate) fn control_dependence<G>(
+    graph: &G,
+    entry: G::Node,
+    normal_exit: G::Node,
+    exceptional_exit: G::Node,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<ControlDependenceResult<G::Edge, G::Node>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    let started = request.budget.used();
+    let postdom = postdominators(graph, entry, normal_exit, exceptional_exit, request)?;
+    let mut rows = Vec::new();
+    for index in 0..graph.node_count() {
+        request.checkpoint()?;
+        let source = required_node(graph, index);
+        if postdom.immediate[index].is_none() {
+            continue;
+        }
+        let stop = postdom.immediate[index].expect("analyzable node has parent");
+        for (edge, target) in graph.successors(source) {
+            request.visit_edge()?;
+            let mut runner = required_index(graph, target)?;
+            if postdom.immediate[runner].is_none() || postdom.postdominates(graph, target, source) {
+                continue;
+            }
+            while runner != stop {
+                request.visit_node()?;
+                if runner == postdom.synthetic_exit {
+                    return Err(CfgAlgorithmError::InvalidNode(source));
+                }
+                rows.push(ControlDependenceRow {
+                    controlling_edge: edge,
+                    governed: required_node(graph, runner),
+                });
+                runner = postdom.immediate[runner]
+                    .expect("analyzable postdominator chain reaches expected stop");
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Ok(ControlDependenceResult {
+        rows: rows.into_boxed_slice(),
+        non_exiting_regions: postdom.non_exiting_regions,
+        unreachable_points: postdom.unreachable_points,
+        work: request.budget.used().saturating_sub(started),
+    })
+}
+
+fn intersect_dominators<Node>(
+    immediate: &[Option<usize>],
+    rpo_position: &[usize],
+    mut first: usize,
+    mut second: usize,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<usize, CfgAlgorithmError<Node>> {
+    while first != second {
+        while rpo_position[first] > rpo_position[second] {
+            request.visit_node::<Node>()?;
+            first = immediate[first].expect("a processed node has an immediate dominator");
+        }
+        while rpo_position[second] > rpo_position[first] {
+            request.visit_node::<Node>()?;
+            second = immediate[second].expect("a processed node has an immediate dominator");
+        }
+    }
+    Ok(first)
+}
+
+/// Deterministic reverse postorder over exactly the nodes reachable from `entry`.
+fn reverse_postorder_from<G>(
+    graph: &G,
+    entry: G::Node,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<Vec<G::Node>, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    required_index(graph, entry)?;
+    let mut colors = vec![0_u8; graph.node_count()];
+    let mut postorder = Vec::new();
+    let mut actions = vec![DfsAction::Enter(entry)];
+
+    while let Some(action) = actions.pop() {
+        request.checkpoint()?;
+        match action {
+            DfsAction::Enter(node) => {
+                let index = required_index(graph, node)?;
+                if colors[index] != 0 {
+                    continue;
+                }
+                request.visit_node()?;
+                colors[index] = 1;
+                actions.push(DfsAction::Finish(node));
+                for (edge, target) in graph.successors(node).rev() {
+                    request.visit_edge()?;
+                    actions.push(DfsAction::Examine(edge, target));
+                }
+            }
+            DfsAction::Examine(_, target) => {
+                let target_index = required_index(graph, target)?;
+                if colors[target_index] == 0 {
+                    actions.push(DfsAction::Enter(target));
+                }
+            }
+            DfsAction::Finish(node) => {
+                let index = required_index(graph, node)?;
+                colors[index] = 2;
+                postorder.push(node);
+            }
+        }
+    }
+
+    postorder.reverse();
+    Ok(postorder)
+}
+
+/// Definition identities per dense bitset word.
+const DEFINITIONS_PER_WORD: usize = u64::BITS as usize;
+
+/// Dense per-node generated and killed definition sets.
+///
+/// Definition identities are dense `usize` values minted by the caller. The
+/// node count must match the graph the facts are solved over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GenKillFacts {
+    node_count: usize,
+    definition_count: usize,
+    words_per_node: usize,
+    generated: Box<[u64]>,
+    killed: Box<[u64]>,
+}
+
+impl GenKillFacts {
+    pub(crate) fn new(node_count: usize, definition_count: usize) -> Self {
+        let words_per_node = definition_count.div_ceil(DEFINITIONS_PER_WORD);
+        let words = node_count
+            .checked_mul(words_per_node)
+            .expect("dense gen/kill words fit in memory");
+        Self {
+            node_count,
+            definition_count,
+            words_per_node,
+            generated: vec![0; words].into_boxed_slice(),
+            killed: vec![0; words].into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn record_generated(&mut self, node_index: usize, definition: usize) {
+        let (word, bit) = self.locate(node_index, definition);
+        self.generated[word] |= bit;
+    }
+
+    pub(crate) fn record_killed(&mut self, node_index: usize, definition: usize) {
+        let (word, bit) = self.locate(node_index, definition);
+        self.killed[word] |= bit;
+    }
+
+    fn locate(&self, node_index: usize, definition: usize) -> (usize, u64) {
+        assert!(
+            node_index < self.node_count,
+            "node index {node_index} outside {} nodes",
+            self.node_count
+        );
+        assert!(
+            definition < self.definition_count,
+            "definition {definition} outside {} definitions",
+            self.definition_count
+        );
+        (
+            node_index * self.words_per_node + definition / DEFINITIONS_PER_WORD,
+            1_u64 << (definition % DEFINITIONS_PER_WORD),
+        )
+    }
+}
+
+/// Complete may-reaching definition sets at every node's entry.
+///
+/// Only the IN sets are retained: a read at a program point consults the
+/// definitions that reach that point, and the OUT set is the caller's own
+/// transfer of IN through the node's gen/kill facts. Nodes unreachable from
+/// the entry carry the empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReachingSets {
+    node_count: usize,
+    definition_count: usize,
+    words_per_node: usize,
+    entry_sets: Box<[u64]>,
+    work: CfgAlgorithmWork,
+}
+
+impl ReachingSets {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "issue 1480 milestone 2 flow-state derivation is the pending consumer"
+        )
+    )]
+    pub(crate) fn reaches_in(&self, node_index: usize, definition: usize) -> bool {
+        assert!(
+            node_index < self.node_count,
+            "node index {node_index} outside {} nodes",
+            self.node_count
+        );
+        assert!(
+            definition < self.definition_count,
+            "definition {definition} outside {} definitions",
+            self.definition_count
+        );
+        let word = node_index * self.words_per_node + definition / DEFINITIONS_PER_WORD;
+        self.entry_sets[word] & (1_u64 << (definition % DEFINITIONS_PER_WORD)) != 0
+    }
+
+    /// Ascending definition identities reaching the node's entry.
+    pub(crate) fn reaching_in(&self, node_index: usize) -> impl Iterator<Item = usize> + '_ {
+        assert!(
+            node_index < self.node_count,
+            "node index {node_index} outside {} nodes",
+            self.node_count
+        );
+        let start = node_index * self.words_per_node;
+        self.entry_sets[start..start + self.words_per_node]
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(word, bits)| {
+                (0..DEFINITIONS_PER_WORD)
+                    .filter(move |bit| bits & (1_u64 << bit) != 0)
+                    .map(move |bit| word * DEFINITIONS_PER_WORD + bit)
+            })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "benchmark and future consumers inspect exact work"
+        )
+    )]
+    pub(crate) const fn work(&self) -> CfgAlgorithmWork {
+        self.work
+    }
+}
+
+/// Classic forward may gen/kill fixed point seeded in reverse postorder.
+///
+/// The entry's IN set is the empty boundary set even when the entry has
+/// predecessors, so a definition never reaches the procedure's own start.
+pub(crate) fn reaching_definitions<G>(
+    graph: &G,
+    entry: G::Node,
+    facts: &GenKillFacts,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> AlgorithmResult<ReachingSets, G::Node>
+where
+    G: DenseBidirectionalGraph,
+{
+    request.checkpoint()?;
+    let started = request.budget.used();
+    assert_eq!(
+        facts.node_count,
+        graph.node_count(),
+        "gen/kill facts must cover exactly the graph's nodes"
+    );
+    let entry_index = required_index(graph, entry)?;
+    let stride = facts.words_per_node;
+    let order = reverse_postorder_from(graph, entry, request)?;
+
+    let mut in_sets = vec![0_u64; graph.node_count() * stride];
+    let mut out_sets = vec![0_u64; graph.node_count() * stride];
+    let mut queued = vec![false; graph.node_count()];
+    let mut worklist = VecDeque::with_capacity(order.len());
+    for node in order {
+        request.checkpoint()?;
+        queued[required_index(graph, node)?] = true;
+        worklist.push_back(node);
+    }
+    let mut incoming = vec![0_u64; stride];
+    let mut transferred = vec![0_u64; stride];
+
+    while let Some(node) = worklist.pop_front() {
+        let index = required_index(graph, node)?;
+        request.visit_node()?;
+        queued[index] = false;
+        let row = index * stride;
+
+        incoming.fill(0);
+        if index != entry_index {
+            for (_, predecessor) in graph.predecessors(node) {
+                request.visit_edge()?;
+                let predecessor_row = required_index(graph, predecessor)? * stride;
+                for word in 0..stride {
+                    incoming[word] |= out_sets[predecessor_row + word];
+                }
+            }
+        }
+        in_sets[row..row + stride].copy_from_slice(&incoming);
+
+        let mut changed = false;
+        for word in 0..stride {
+            let value = (incoming[word] & !facts.killed[row + word]) | facts.generated[row + word];
+            transferred[word] = value;
+            changed |= value != out_sets[row + word];
+        }
+        if !changed {
+            continue;
+        }
+        out_sets[row..row + stride].copy_from_slice(&transferred);
+        for (_, successor) in graph.successors(node) {
+            request.visit_edge()?;
+            let successor_index = required_index(graph, successor)?;
+            if !queued[successor_index] {
+                queued[successor_index] = true;
+                worklist.push_back(successor);
+            }
+        }
+    }
+
+    Ok(ReachingSets {
+        node_count: facts.node_count,
+        definition_count: facts.definition_count,
+        words_per_node: stride,
+        entry_sets: in_sets.into_boxed_slice(),
+        work: request.budget.used().saturating_sub(started),
+    })
+}
+
 fn required_node<G>(graph: &G, index: usize) -> G::Node
 where
     G: DenseBidirectionalGraph,
@@ -1244,6 +1986,247 @@ mod tests {
     }
 
     #[test]
+    fn dominance_on_a_diamond_separates_branches_from_the_join() {
+        let graph = TestGraph::new(5, &[(0, 1, 0), (0, 2, 0), (1, 3, 0), (2, 3, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        let dominance = dominators(&graph, 0, &mut request(&mut budget, &cancellation)).unwrap();
+
+        assert_eq!(dominance.immediate_dominator(&graph, 0), None);
+        assert_eq!(dominance.immediate_dominator(&graph, 1), Some(0));
+        assert_eq!(dominance.immediate_dominator(&graph, 2), Some(0));
+        assert_eq!(dominance.immediate_dominator(&graph, 3), Some(0));
+        for node in 0..4 {
+            assert!(dominance.dominates(&graph, 0, node));
+            assert!(dominance.dominates(&graph, node, node));
+        }
+        assert!(!dominance.dominates(&graph, 1, 3));
+        assert!(!dominance.dominates(&graph, 2, 3));
+        assert!(!dominance.dominates(&graph, 3, 1));
+
+        assert_eq!(dominance.immediate_dominator(&graph, 4), None);
+        assert!(!dominance.dominates(&graph, 4, 4));
+        assert!(!dominance.dominates(&graph, 0, 4));
+        assert!(!dominance.dominates(&graph, 4, 3));
+        assert_eq!(dominance.immediate_dominator(&graph, 9), None);
+        assert!(!dominance.dominates(&graph, 9, 0));
+        assert!(dominance.work().node_visits > 0);
+    }
+
+    #[test]
+    fn dominance_on_a_loop_puts_the_header_over_the_body() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (1, 3, 0), (2, 1, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let dominance = dominators(&graph, 0, &mut request(&mut budget, &cancellation)).unwrap();
+
+        assert_eq!(dominance.immediate_dominator(&graph, 1), Some(0));
+        assert_eq!(dominance.immediate_dominator(&graph, 2), Some(1));
+        assert_eq!(dominance.immediate_dominator(&graph, 3), Some(1));
+        assert!(dominance.dominates(&graph, 1, 2));
+        assert!(dominance.dominates(&graph, 1, 3));
+        assert!(!dominance.dominates(&graph, 2, 3));
+    }
+
+    #[test]
+    fn dominance_reports_invalid_entries_and_typed_budget_exhaustion() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        assert_eq!(
+            dominators(&graph, 9, &mut request(&mut budget, &cancellation)),
+            Err(CfgAlgorithmError::InvalidNode(9))
+        );
+
+        let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
+            node_visits: 2,
+            edge_visits: 100,
+        });
+        assert!(matches!(
+            dominators(&graph, 0, &mut request(&mut budget, &cancellation)),
+            Err(CfgAlgorithmError::ExceededBudget(
+                CfgAlgorithmBudgetExceeded {
+                    limit_kind: CfgAlgorithmLimit::NodeVisits,
+                    limit: 2,
+                    ..
+                }
+            ))
+        ));
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let mut budget = CfgAlgorithmBudget::uniform(100);
+        assert!(matches!(
+            dominators(&graph, 0, &mut request(&mut budget, &cancelled)),
+            Err(CfgAlgorithmError::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn reaching_definitions_carry_a_straight_line_definition_until_a_kill() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)]);
+        let mut facts = GenKillFacts::new(4, 2);
+        for definition in 0..2 {
+            facts.record_killed(0, definition);
+            facts.record_killed(2, definition);
+        }
+        facts.record_generated(0, 0);
+        facts.record_generated(2, 1);
+
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let reaching =
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &cancellation))
+                .unwrap();
+
+        assert_eq!(
+            reaching.reaching_in(0).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(reaching.reaching_in(1).collect::<Vec<_>>(), vec![0]);
+        assert!(reaching.reaches_in(2, 0));
+        assert_eq!(reaching.reaching_in(3).collect::<Vec<_>>(), vec![1]);
+        assert!(!reaching.reaches_in(3, 0));
+        assert!(reaching.work().node_visits > 0);
+    }
+
+    #[test]
+    fn reaching_definitions_join_both_arms_of_a_diamond() {
+        let graph = TestGraph::new(5, &[(0, 1, 0), (0, 2, 0), (1, 3, 0), (2, 3, 0)]);
+        let mut facts = GenKillFacts::new(5, 3);
+        for node in [0, 1, 2] {
+            for definition in 0..3 {
+                facts.record_killed(node, definition);
+            }
+            facts.record_generated(node, node);
+        }
+
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let reaching =
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &cancellation))
+                .unwrap();
+
+        assert_eq!(reaching.reaching_in(1).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(reaching.reaching_in(2).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(reaching.reaching_in(3).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(!reaching.reaches_in(3, 0));
+        assert_eq!(
+            reaching.reaching_in(4).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn reaching_definitions_propagate_a_loop_body_definition_back_to_the_header() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (1, 3, 0), (2, 1, 0)]);
+        let mut facts = GenKillFacts::new(4, 2);
+        for node in [0, 2] {
+            for definition in 0..2 {
+                facts.record_killed(node, definition);
+            }
+        }
+        facts.record_generated(0, 0);
+        facts.record_generated(2, 1);
+
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        let reaching =
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &cancellation))
+                .unwrap();
+
+        assert_eq!(reaching.reaching_in(1).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(reaching.reaching_in(2).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(reaching.reaching_in(3).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn reaching_definitions_report_typed_budget_exhaustion_and_cancellation() {
+        let graph = TestGraph::new(4, &[(0, 1, 0), (1, 2, 0), (2, 3, 0)]);
+        let facts = GenKillFacts::new(4, 1);
+        let cancellation = CancellationToken::default();
+
+        let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
+            node_visits: 3,
+            edge_visits: 100,
+        });
+        assert!(matches!(
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &cancellation)),
+            Err(CfgAlgorithmError::ExceededBudget(
+                CfgAlgorithmBudgetExceeded {
+                    limit_kind: CfgAlgorithmLimit::NodeVisits,
+                    limit: 3,
+                    ..
+                }
+            ))
+        ));
+
+        let mut budget = CfgAlgorithmBudget::new(CfgAlgorithmWork {
+            node_visits: 100,
+            edge_visits: 2,
+        });
+        assert!(matches!(
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &cancellation)),
+            Err(CfgAlgorithmError::ExceededBudget(
+                CfgAlgorithmBudgetExceeded {
+                    limit_kind: CfgAlgorithmLimit::EdgeVisits,
+                    ..
+                }
+            ))
+        ));
+
+        let mid_traversal = CancellationToken::cancel_after_checks_for_test(3);
+        let mut budget = CfgAlgorithmBudget::uniform(1_000);
+        assert!(matches!(
+            reaching_definitions(&graph, 0, &facts, &mut request(&mut budget, &mid_traversal)),
+            Err(CfgAlgorithmError::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn dominance_and_reaching_definitions_are_deterministic_across_runs() {
+        let graph = TestGraph::new(
+            7,
+            &[
+                (0, 1, 0),
+                (0, 2, 0),
+                (1, 3, 0),
+                (2, 3, 0),
+                (3, 4, 0),
+                (4, 3, 0),
+                (4, 5, 0),
+            ],
+        );
+        let mut facts = GenKillFacts::new(7, 4);
+        for (node, definition) in [(0_usize, 0_usize), (1, 1), (2, 2), (4, 3)] {
+            for killed in 0..4 {
+                facts.record_killed(node, killed);
+            }
+            facts.record_generated(node, definition);
+        }
+        let cancellation = CancellationToken::default();
+
+        let run = || {
+            let mut budget = CfgAlgorithmBudget::uniform(10_000);
+            let mut request = CfgAlgorithmRequest::new(&mut budget, &cancellation);
+            let dominance = dominators(&graph, 0, &mut request).unwrap();
+            let reaching = reaching_definitions(&graph, 0, &facts, &mut request).unwrap();
+            (dominance, reaching)
+        };
+        assert_eq!(run(), run());
+
+        let (dominance, reaching) = run();
+        assert_eq!(dominance.immediate_dominator(&graph, 3), Some(0));
+        assert_eq!(dominance.immediate_dominator(&graph, 5), Some(4));
+        assert!(dominance.dominates(&graph, 3, 5));
+        assert_eq!(reaching.reaching_in(3).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            reaching.reaching_in(6).collect::<Vec<usize>>(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
     fn hundred_thousand_node_chain_is_stack_safe() {
         let node_count = 100_000;
         let edges = (0..node_count - 1)
@@ -1262,5 +2245,198 @@ mod tests {
             strongly_connected_components(&graph, &mut request(&mut budget, &cancellation))
                 .unwrap();
         assert_eq!(components.components.len(), node_count);
+    }
+
+    #[test]
+    fn postdominators_and_control_dependence_cover_diamond_and_two_exits() {
+        // 0 branches to 1/2, joins at 3, then selects normal 4 or exceptional 5.
+        let graph = TestGraph::new(
+            6,
+            &[
+                (0, 1, 1),
+                (0, 2, 2),
+                (1, 3, 0),
+                (2, 3, 0),
+                (3, 4, 3),
+                (3, 5, 4),
+            ],
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(10_000);
+        let postdom =
+            postdominators(&graph, 0, 4, 5, &mut request(&mut budget, &cancellation)).unwrap();
+        assert_eq!(postdom.immediate_postdominator(&graph, 0), Some(3));
+        assert_eq!(postdom.immediate_postdominator(&graph, 1), Some(3));
+        assert_eq!(postdom.immediate_postdominator(&graph, 3), None);
+        assert!(postdom.postdominates(&graph, 3, 0));
+        assert!(!postdom.postdominates(&graph, 1, 0));
+
+        let mut budget = CfgAlgorithmBudget::uniform(10_000);
+        let result =
+            control_dependence(&graph, 0, 4, 5, &mut request(&mut budget, &cancellation)).unwrap();
+        let rows = result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    graph.edge_label(row.controlling_edge).unwrap(),
+                    row.governed,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![(1, 1), (2, 2), (3, 4), (4, 5)]);
+        assert!(result.non_exiting_regions.is_empty());
+        assert_eq!(result.unreachable_points, 0);
+    }
+
+    #[test]
+    fn postdominators_report_unreachable_and_live_non_exiting_regions() {
+        // 0->1->4 exits; 0->2->3->2 is a live non-exiting SCC; 5 is unreachable.
+        let graph = TestGraph::new(6, &[(0, 1, 0), (1, 4, 0), (0, 2, 1), (2, 3, 0), (3, 2, 0)]);
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(10_000);
+        let postdom =
+            postdominators(&graph, 0, 4, 4, &mut request(&mut budget, &cancellation)).unwrap();
+        assert_eq!(postdom.unreachable_points, 1);
+        assert_eq!(postdom.non_exiting_regions.len(), 1);
+        assert_eq!(&*postdom.non_exiting_regions[0].members, &[2, 3]);
+        assert_eq!(postdom.immediate_postdominator(&graph, 2), None);
+    }
+
+    #[test]
+    fn hundred_thousand_node_postdominator_chain_is_stack_safe() {
+        let node_count = 100_000;
+        let graph = TestGraph::from_edges(
+            node_count,
+            (0..node_count - 1).map(|source| (source, source + 1, 0)),
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(node_count * 30);
+        let postdom = postdominators(
+            &graph,
+            0,
+            node_count - 1,
+            node_count - 1,
+            &mut request(&mut budget, &cancellation),
+        )
+        .unwrap();
+        assert_eq!(postdom.immediate_postdominator(&graph, 0), Some(1));
+        assert!(postdom.postdominates(&graph, node_count - 1, 0));
+    }
+
+    fn oracle_paths(graph: &TestGraph, start: usize, exits: [usize; 2]) -> Vec<Vec<usize>> {
+        let mut paths = Vec::new();
+        let mut stack = vec![(start, vec![start])];
+        while let Some((node, path)) = stack.pop() {
+            if exits.contains(&node) {
+                paths.push(path);
+                continue;
+            }
+            for (_, successor) in graph.successors(node).rev() {
+                if !path.contains(&successor) {
+                    let mut next = path.clone();
+                    next.push(successor);
+                    stack.push((successor, next));
+                }
+            }
+        }
+        paths
+    }
+
+    fn oracle_postdominators(
+        graph: &TestGraph,
+        exits: [usize; 2],
+    ) -> Vec<std::collections::BTreeSet<usize>> {
+        (0..graph.node_count())
+            .map(|node| {
+                let paths = oracle_paths(graph, node, exits);
+                let Some(first) = paths.first() else {
+                    return std::collections::BTreeSet::new();
+                };
+                let mut common = first
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                for path in paths.iter().skip(1) {
+                    let members = path
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    common.retain(|node| members.contains(node));
+                }
+                common
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exhaustive_four_node_oracle_agrees_with_production() {
+        // Enumerate every simple directed topology without self edges. Entry is
+        // 0 and the distinct real exits are 2 and 3. Retain exactly graphs in
+        // which every entry-live node has a finite path to either exit.
+        let candidates = (0..4)
+            .flat_map(|source| {
+                (0..4)
+                    .filter(move |target| *target != source)
+                    .map(move |target| (source, target))
+            })
+            .collect::<Vec<_>>();
+        let mut retained = 0;
+        for mask in 0_u16..(1_u16 << candidates.len()) {
+            let edges = candidates
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, &(source, target))| (source, target, 0))
+                .collect::<Vec<_>>();
+            let graph = TestGraph::new(4, &edges);
+            let oracle = oracle_postdominators(&graph, [2, 3]);
+            let live = {
+                let cancellation = CancellationToken::default();
+                let mut budget = CfgAlgorithmBudget::uniform(10_000);
+                forward_reachability(&graph, 0, &mut request(&mut budget, &cancellation)).unwrap()
+            };
+            if live.iter(&graph).any(|node| oracle[node].is_empty()) {
+                continue;
+            }
+            retained += 1;
+            let cancellation = CancellationToken::default();
+            let mut budget = CfgAlgorithmBudget::uniform(100_000);
+            let production =
+                postdominators(&graph, 0, 2, 3, &mut request(&mut budget, &cancellation)).unwrap();
+            for node in live.iter(&graph) {
+                for candidate in live.iter(&graph) {
+                    assert_eq!(
+                        production.postdominates(&graph, candidate, node),
+                        oracle[node].contains(&candidate),
+                        "mask={mask:#x} candidate={candidate} node={node}"
+                    );
+                }
+            }
+            let mut expected_rows = std::collections::BTreeSet::new();
+            for source in live.iter(&graph) {
+                for (edge, target) in graph.successors(source) {
+                    for governed in live.iter(&graph) {
+                        if oracle[target].contains(&governed)
+                            && (governed == source || !oracle[source].contains(&governed))
+                        {
+                            expected_rows.insert((edge, governed));
+                        }
+                    }
+                }
+            }
+            let expected_rows = expected_rows.into_iter().collect::<Vec<_>>();
+            let mut budget = CfgAlgorithmBudget::uniform(100_000);
+            let control =
+                control_dependence(&graph, 0, 2, 3, &mut request(&mut budget, &cancellation))
+                    .unwrap();
+            let actual_rows = control
+                .rows
+                .iter()
+                .map(|row| (row.controlling_edge, row.governed))
+                .collect::<Vec<_>>();
+            assert_eq!(actual_rows, expected_rows, "control rows mask={mask:#x}");
+        }
+        assert!(retained > 500, "retained {retained} exhaustive graphs");
     }
 }

@@ -4,6 +4,7 @@ use brokk_bifrost_analysis::Language;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -195,6 +196,21 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!("2025-11-25", initialize["result"]["protocolVersion"]);
     assert_eq!(initialize["result"]["capabilities"]["tools"], json!({}));
     assert_eq!(initialize["result"]["capabilities"]["resources"], json!({}));
+    let instructions = initialize["result"]["instructions"]
+        .as_str()
+        .expect("server instructions");
+    assert!(
+        instructions.starts_with("Semantic source-code analysis and repository navigation."),
+        "{initialize}"
+    );
+    assert!(instructions.contains("Symbol tools"), "{initialize}");
+    assert!(instructions.contains("CodeQuery and RQL"), "{initialize}");
+    assert!(instructions.contains("repository policies"), "{initialize}");
+    assert!(
+        !instructions.contains("Semantic search finds"),
+        "semantic search is disabled for this process: {initialize}"
+    );
+    assert!(instructions.chars().count() <= 2_000, "{initialize}");
 
     write_line(
         &mut stdin,
@@ -1322,7 +1338,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         listed["result"]["structuredContent"]["policies"]
             .as_array()
             .map(Vec::len),
-        Some(12)
+        Some(13)
     );
 
     let run = round_trip(
@@ -1383,6 +1399,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         category_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ],
         "{category}"
@@ -1417,6 +1434,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         pack_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
             "bifrost.performance.expensive-operation-in-nested-loop",
@@ -3914,6 +3932,1014 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
             .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "MRTR activation must not analyze the process working directory"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// The per-request negotiation keys a stateless `2026-07-28` request carries
+/// in its `_meta` in place of a connection-level `initialize`.
+fn stateless_2026_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "search_symbols",
+            "arguments": { "patterns": [pattern] },
+            "_meta": stateless_2026_meta()
+        }
+    })
+}
+
+/// Issue #2007: the `2026-07-28` lifecycle is stateless. A rootless client
+/// that never sends `initialize` discovers the server, is asked for its roots
+/// through MRTR on its first workspace tool call, and executes the retried
+/// call -- every request negotiated independently through its own `_meta`.
+#[test]
+fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let workspace = InlineTestProject::new()
+        .file("StatelessWorkspace.java", "class StatelessWorkspace {}\n")
+        .build();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    // Discovery opens the session; there is no initialize and no
+    // notifications/initialized anywhere in this exchange.
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
+    );
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|version| version == "2026-07-28")),
+        "{discover}"
+    );
+
+    let search = stateless_search_symbols_call(2, "StatelessWorkspace");
+    let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
+    assert_eq!(
+        input_required["result"]["resultType"], "input_required",
+        "an unbound stateless call must be answered with an MRTR roots activation: {input_required}"
+    );
+    assert_eq!(
+        input_required["result"]["inputRequests"]["roots"]["method"], "roots/list",
+        "{input_required}"
+    );
+    let request_state = input_required["result"]["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an activation must carry a requestState: {input_required}"));
+
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+    let mut retry = stateless_search_symbols_call(3, "StatelessWorkspace");
+    retry["params"]["requestState"] = json!(request_state);
+    retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(
+        bound["result"]["resultType"], "complete",
+        "the retry must bind the validated root and execute: {bound}"
+    );
+    assert_eq!(bound["result"]["isError"], false, "{bound}");
+    assert!(bound.to_string().contains("StatelessWorkspace"), "{bound}");
+    assert!(!bound.to_string().contains("PluginOnly"), "{bound}");
+
+    // A later call on the bound workspace needs no further activation, and
+    // still carries its own negotiation keys like every stateless request.
+    let followup = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_search_symbols_call(4, "StatelessWorkspace"),
+    );
+    assert_eq!(followup["result"]["resultType"], "complete", "{followup}");
+    assert_eq!(followup["result"]["isError"], false, "{followup}");
+
+    assert!(
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
+            .exists(),
+        "stateless activation must not analyze the process working directory"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2007 negative coverage: every stateless request is validated on its
+/// own, and nothing short of a Bifrost-issued activation binds a workspace.
+#[test]
+fn stateless_2026_07_28_requests_are_independently_validated() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("Validated.java", "class Validated {}\n")
+        .build();
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
+    );
+
+    // Required request metadata is per request: declaring the version without
+    // the capabilities key is refused at dispatch, before any tool runs.
+    let mut missing_capabilities = stateless_search_symbols_call(2, "Validated");
+    missing_capabilities["params"]["_meta"] =
+        json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, missing_capabilities);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("required fields")),
+        "a stateless request missing required metadata must be refused: {refused}"
+    );
+
+    // So is omitting `_meta` entirely on a session that opened statelessly.
+    let mut no_meta = stateless_search_symbols_call(3, "Validated");
+    no_meta["params"]
+        .as_object_mut()
+        .expect("params object")
+        .remove("_meta");
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, no_meta);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("required fields")),
+        "a stateless request without _meta must be refused: {refused}"
+    );
+
+    // An unknown protocol version is refused per request as well.
+    let mut unknown_version = stateless_search_symbols_call(4, "Validated");
+    unknown_version["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2099-01-01");
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, unknown_version);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unsupported protocol version")),
+        "an unknown protocol version must be refused: {refused}"
+    );
+
+    // A requestState Bifrost never issued must not bind, however well-formed
+    // the roots beside it are.
+    let mut tampered = stateless_search_symbols_call(5, "Validated");
+    tampered["params"]["requestState"] = json!("bifrost-roots-0-0");
+    tampered["params"]["inputResponses"] =
+        json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, tampered);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "an unsolicited requestState must not bind a workspace: {refused}"
+    );
+
+    // A genuine activation answered with unusable roots binds nothing, and
+    // only one round is offered: the retry gets the plain unbound error.
+    let activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_search_symbols_call(6, "Validated"),
+    );
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let request_state = activation["result"]["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an activation must carry a requestState: {activation}"));
+    let missing_dir_uri = url::Url::from_directory_path(workspace.root().join("no-such-dir"))
+        .expect("missing dir URI")
+        .to_string();
+    let mut unusable = stateless_search_symbols_call(7, "Validated");
+    unusable["params"]["requestState"] = json!(request_state);
+    unusable["params"]["inputResponses"] = json!({ "roots": { "roots": [
+        { "uri": "https://example.com/not-a-file-root" },
+        { "uri": missing_dir_uri }
+    ] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, unusable);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "unusable roots must leave the server unbound: {refused}"
+    );
+
+    // The spent requestState is single use: replaying it with usable roots is
+    // no longer an activation.
+    let mut replay = stateless_search_symbols_call(8, "Validated");
+    replay["params"]["requestState"] = json!(request_state);
+    replay["params"]["inputResponses"] =
+        json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, replay);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "a replayed requestState must not bind a workspace: {refused}"
+    );
+
+    assert!(
+        !workspace
+            .root()
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
+            .exists(),
+        "no refused request may have analyzed the workspace"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Read messages until the response for `id` arrives, collecting the
+/// `notifications/progress` params seen on the way. Any other interleaved
+/// message fails the test: nothing but progress may precede the response.
+fn read_response_collecting_progress(
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: i64,
+) -> (Value, Vec<Value>) {
+    let mut progress = Vec::new();
+    loop {
+        let message = read_line(reader, stderr);
+        if message["id"] == json!(id) {
+            return (message, progress);
+        }
+        assert_eq!(
+            message["method"], "notifications/progress",
+            "unexpected message while waiting for response {id}: {message}"
+        );
+        progress.push(message["params"].clone());
+    }
+}
+
+fn assert_progress_is_monotonic(notifications: &[Value]) {
+    let mut last = f64::NEG_INFINITY;
+    for notification in notifications {
+        let value = notification["progress"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("progress must be a number: {notification}"));
+        assert!(
+            value > last,
+            "progress must increase on every notification: {notifications:?}"
+        );
+        assert!(
+            notification["total"].is_null(),
+            "no phase has a known total; inventing one is forbidden: {notification}"
+        );
+        last = value;
+    }
+}
+
+/// Issue #2005: a caller that supplies `progressToken` observes truthful
+/// phase progress -- readiness, admission, execution -- on its own request,
+/// with the token echoed exactly; a caller that omits the token gets nothing.
+#[test]
+fn progress_token_yields_phase_progress_and_silence_without_it() {
+    let workspace = InlineTestProject::new()
+        .file("Progressive.java", "class Progressive {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // A string token, echoed as a string.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] },
+                "_meta": { "progressToken": "progress-abc" }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let messages = progress
+        .iter()
+        .map(|notification| {
+            assert_eq!(
+                notification["progressToken"], "progress-abc",
+                "the token must be preserved exactly: {notification}"
+            );
+            notification["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec![
+            "waiting for workspace readiness",
+            "waiting for analyzer admission",
+            "executing search_symbols"
+        ],
+        "{progress:?}"
+    );
+    assert_progress_is_monotonic(&progress);
+
+    // An integer token, echoed as a number, not a string.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] },
+                "_meta": { "progressToken": 7 }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 3);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert!(!progress.is_empty(), "{response}");
+    for notification in &progress {
+        assert_eq!(
+            notification["progressToken"],
+            json!(7),
+            "an integer token must stay a number: {notification}"
+        );
+    }
+
+    // No token, no notifications: the response is the very next message.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 4);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert!(
+        progress.is_empty(),
+        "a caller that did not opt in must receive no progress: {progress:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2005: concurrent calls with distinct tokens must never cross-route.
+/// Every notification carries the token of exactly the call whose phases it
+/// reports, and each token's progress is independently monotonic.
+#[test]
+fn concurrent_progress_tokens_never_cross_route() {
+    let workspace = InlineTestProject::new()
+        .file(
+            "Concurrent.java",
+            "public class Concurrent { public void run() {} }\n",
+        )
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Both calls are on the wire before either response, so their phase
+    // notifications can interleave freely; routing is what must not.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": { "targets": [{ "path": "Concurrent.java", "line": 1, "symbol": "Concurrent" }] },
+                "_meta": { "progressToken": "scan-token" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Concurrent"] },
+                "_meta": { "progressToken": "search-token" }
+            }
+        }),
+    );
+
+    let mut responses = HashMap::new();
+    let mut progress_by_token: HashMap<String, Vec<Value>> = HashMap::new();
+    while responses.len() < 2 {
+        let message = read_line(&mut reader, &mut stderr);
+        if let Some(id) = message["id"].as_i64() {
+            responses.insert(id, message);
+            continue;
+        }
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        let token = message["params"]["progressToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("string token expected: {message}"))
+            .to_string();
+        progress_by_token
+            .entry(token)
+            .or_default()
+            .push(message["params"].clone());
+    }
+    assert_eq!(responses[&10]["result"]["isError"], false, "{responses:?}");
+    assert_eq!(responses[&11]["result"]["isError"], false, "{responses:?}");
+
+    let scan = &progress_by_token["scan-token"];
+    let search = &progress_by_token["search-token"];
+    assert_eq!(progress_by_token.len(), 2, "{progress_by_token:?}");
+    assert_progress_is_monotonic(scan);
+    assert_progress_is_monotonic(search);
+    assert!(
+        scan.iter()
+            .any(|n| n["message"] == "executing scan_usages_by_location"),
+        "{scan:?}"
+    );
+    assert!(
+        search
+            .iter()
+            .any(|n| n["message"] == "executing search_symbols"),
+        "{search:?}"
+    );
+    assert!(
+        !scan
+            .iter()
+            .any(|n| n["message"] == "executing search_symbols"),
+        "phases of one call must not report under another call's token: {scan:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2005: cancelling a call that opted into progress leaves the session
+/// healthy. The cancelled call's progress stops with the call, and the next
+/// call is served normally.
+#[test]
+fn cancellation_with_progress_in_flight_leaves_the_session_healthy() {
+    let workspace = InlineTestProject::new()
+        .file("Cancellable.java", "class Cancellable {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Cancel immediately after sending, so the cancellation lands during
+    // readiness, admission, or execution -- whichever phase the call is in.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": { "targets": [{ "path": "Cancellable.java", "line": 1, "symbol": "Cancellable" }] },
+                "_meta": { "progressToken": "doomed" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 20, "reason": "test cancels" }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Cancellable"] }
+            }
+        }),
+    );
+
+    // The cancelled call may or may not still answer, depending on how far it
+    // got; the follow-up must answer either way, and the only other traffic
+    // permitted on the wire is the doomed call's own progress.
+    loop {
+        let message = read_line(&mut reader, &mut stderr);
+        if message["id"] == json!(21) {
+            assert_eq!(message["result"]["isError"], false, "{message}");
+            break;
+        }
+        if message["id"] == json!(20) {
+            continue;
+        }
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        assert_eq!(message["params"]["progressToken"], "doomed", "{message}");
+    }
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Open a session declaring the MCP Tasks extension (SEP-2663).
+fn initialize_tasks_session(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    protocol_version: &str,
+) -> Value {
+    let initialize = round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": { "extensions": { "io.modelcontextprotocol/tasks": {} } },
+                "clientInfo": { "name": "tasks-client", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    initialize
+}
+
+fn run_policy_request(id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "run_policy",
+            "arguments": {
+                "policy_files": ["policies/dynamic-eval.rqlp"],
+                "evaluation_date": "2026-07-27",
+                "fail_on": "warning"
+            }
+        }
+    })
+}
+
+/// Poll `tasks/get` until the task reaches a terminal status, returning the
+/// terminal response. Polls faster than the advertised interval because this
+/// is a test, not a considerate client.
+fn poll_task_until_terminal(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    task_id: &str,
+    first_id: i64,
+) -> Value {
+    let give_up_at = std::time::Instant::now() + Duration::from_secs(60);
+    let mut id = first_id;
+    loop {
+        let response = round_trip(
+            stdin,
+            reader,
+            stderr,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tasks/get",
+                "params": { "taskId": task_id }
+            }),
+        );
+        let status = response["result"]["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tasks/get must report a status: {response}"));
+        if matches!(status, "completed" | "failed" | "cancelled") {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < give_up_at,
+            "task never settled: {response}"
+        );
+        id += 1;
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A workspace whose cold snapshot build and policy run are slow enough to
+/// observe a task in flight: enough files that readiness alone takes long
+/// past any cancellation or tiny-TTL window a test needs to hit.
+fn slow_policy_project() -> common::BuiltInlineTestProject {
+    let mut project = InlineTestProject::with_language(Language::Python)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY);
+    for index in 0..300 {
+        project = project.file(
+            format!("src/module_{index}.py"),
+            format!("def handler_{index}(value):\n    return eval(value)\n"),
+        );
+    }
+    project.build()
+}
+
+/// Issue #2006: a capable `2026-07-28` client calling `run_policy` receives a
+/// durable task handle and collects the finished report by polling, after the
+/// initiating request has ended. The terminal result preserves the synchronous
+/// content/structured-content contract, pinned by comparing the embedded
+/// report against a direct in-process policy evaluation.
+#[test]
+fn mcp_tasks_run_policy_completes_through_a_task_handle() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let expected = evaluate_policy_files(
+        workspace.root(),
+        &[PathBuf::from("policies/dynamic-eval.rqlp")],
+        &PolicyEvaluationOptions::new("2026-07-27".parse().expect("fixed evaluation date"))
+            .with_fail_on(PolicyFailOn::Warning),
+    )
+    .expect("direct policy evaluation");
+    let expected_report = serde_json::to_value(expected.report()).expect("serialize report");
+
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    let initialize = initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    assert!(
+        initialize["result"]["capabilities"]["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_some(),
+        "the server must advertise the tasks extension: {initialize}"
+    );
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    assert_eq!(created["result"]["status"], "working", "{created}");
+    assert!(created["result"]["ttlMs"].is_number(), "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a task handle must carry a taskId: {created}"))
+        .to_string();
+
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "completed", "{terminal}");
+    let result = &terminal["result"]["result"];
+    assert_eq!(result["isError"], false, "{terminal}");
+    assert!(
+        result["content"][0]["text"].is_string(),
+        "the terminal result must keep the synchronous content contract: {terminal}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["status"], "finding", "{terminal}");
+    assert_eq!(structured["exit_status"], 1, "{terminal}");
+    assert_eq!(structured["report"], expected_report, "{terminal}");
+    assert!(
+        structured["request_correlation_id"]
+            .as_str()
+            .is_some_and(|correlation| correlation.starts_with("sha256:")),
+        "task results keep the run_policy correlation contract: {terminal}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: clients without the extension must never receive a
+/// task-shaped result -- neither a `2026-07-28` client that did not declare
+/// it, nor a legacy `2025-11-25` client that did (tasks require the new
+/// revision's result discriminators).
+#[test]
+fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+
+    // A 2026-07-28 client without the capability keeps synchronous behavior,
+    // and its tasks/get is refused before reaching Bifrost's handler.
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "no-tasks", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(
+        synchronous["result"]["resultType"], "complete",
+        "{synchronous}"
+    );
+    assert_eq!(
+        synchronous["result"]["structuredContent"]["status"], "finding",
+        "{synchronous}"
+    );
+    let refused = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/get",
+            "params": { "taskId": "irrelevant" }
+        }),
+    );
+    assert!(
+        !refused["error"].is_null(),
+        "tasks/get without the capability must be refused: {refused}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+
+    // A 2025-11-25 client declaring the capability still gets synchronous
+    // results: the task result shape does not exist in its revision.
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2025-11-25");
+    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert!(
+        synchronous["result"]["resultType"].is_null(),
+        "a legacy session has no result discriminators at all: {synchronous}"
+    );
+    assert_eq!(
+        synchronous["result"]["structuredContent"]["status"], "finding",
+        "{synchronous}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: `tasks/cancel` requests cooperative cancellation and the task
+/// settles as terminal `cancelled`, stopping the underlying analyzer work.
+#[test]
+fn mcp_tasks_cancel_settles_cancelled() {
+    let workspace = slow_policy_project();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+
+    // Cancel immediately: the task is still waiting for the cold snapshot
+    // build, so cancellation lands during readiness or admission.
+    let ack = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/cancel",
+            "params": { "taskId": task_id }
+        }),
+    );
+    assert!(ack["error"].is_null(), "{ack}");
+
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "cancelled", "{terminal}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: an expired task is observed as terminal `failed`; the TTL is
+/// also the execution deadline, so the analyzer work stops rather than
+/// running on behind a dead handle.
+#[test]
+fn mcp_tasks_expire_to_failed() {
+    let workspace = slow_policy_project();
+    let mut child = mcp_server_command(workspace.root(), "searchtools", &[])
+        .env("BIFROST_MCP_TASK_TTL_MS", "300")
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    assert_eq!(created["result"]["ttlMs"], 300, "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+
+    // The 300-file cold build cannot finish in 300 ms; the task must be
+    // observed as failed, not left working forever.
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "failed", "{terminal}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: unknown task ids fail safely.
+#[test]
+fn mcp_tasks_unknown_ids_fail_safely() {
+    let workspace = InlineTestProject::new()
+        .file("Anything.java", "class Anything {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {
+        let mut params = json!({ "taskId": "no-such-task" });
+        if method == "tasks/update" {
+            params["inputResponses"] = json!({});
+        }
+        let refused = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        );
+        assert!(
+            !refused["error"].is_null(),
+            "{method} with an unknown id must fail safely: {refused}"
+        );
+    }
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: a task handle is bound to the workspace authorization it was
+/// created under. After the client revokes its roots, polling the old handle
+/// is refused -- the handle must never carry results across a workspace
+/// boundary, even though the task itself completed before the revocation.
+#[test]
+fn mcp_tasks_handles_die_with_workspace_rebinding() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol|extended");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    // Rootless 2026-07-28 binding goes through MRTR: the first call is
+    // answered with a roots activation, and the retry that carries the roots
+    // is the call that becomes the task.
+    let activation = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let request_state = activation["result"]["requestState"]
+        .as_str()
+        .expect("requestState")
+        .to_string();
+    let mut retry = run_policy_request(2);
+    retry["params"]["requestState"] = json!(request_state);
+    retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(
+        created["result"]["resultType"], "task",
+        "an MRTR retry from a capable client must still task-ify: {created}"
+    );
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "completed", "{terminal}");
+
+    // The client withdraws its roots. The next tool call proves the
+    // revocation landed (the server is unbound again and starts a fresh MRTR
+    // round), and the old handle must now be dead.
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let reactivation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["handler"] } }
+        }),
+    );
+    assert_eq!(
+        reactivation["result"]["resultType"], "input_required",
+        "the roots change must unbind the workspace: {reactivation}"
+    );
+
+    let refused = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tasks/get",
+            "params": { "taskId": task_id }
+        }),
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("workspace authorization was revoked")),
+        "a rebound workspace must kill outstanding handles: {refused}"
     );
 
     drop(stdin);

@@ -138,7 +138,7 @@ fn the_prototype_reports_a_receiver_declared_outside_the_loop() {
     let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
         panic!("assertion policies produce assertion evidence");
     };
-    assert_eq!(evidence.assert_kind(), "reaching");
+    assert_eq!(evidence.assert_kind(), "binding_scope");
     assert_eq!(
         evidence.observed(),
         Some("binding `ready` is declared outside capture `region`"),
@@ -228,7 +228,7 @@ fn a_field_projection_of_the_loop_variable_is_not_a_finding() {
 /// False-positive family 4: an outer name is rebound inside the loop. Source
 /// order alone cannot separate this from the true positive -- both spell the
 /// same identifier and both have an outer declaration above the loop -- and
-/// reaching-binding semantics can, because the nearer binder wins.
+/// binding-of semantics can, because the nearer binder wins.
 const NEAR_MISS_REBINDING: &str = "\
 pub fn order(outer: Vec<usize>, groups: Vec<Vec<usize>>) -> usize {
     let ready = outer;
@@ -498,7 +498,7 @@ fn java_loop_local_declaration_is_not_a_finding() {
 
 // Java forbids shadowing a local variable in a nested block, so the rebinding
 // near-miss has no legal Java spelling; the loop-local near-miss carries the
-// same reaching-binding burden for this language.
+// same binding-of burden for this language.
 
 #[test]
 fn java_deferred_body_is_an_explicit_lexical_positive() {

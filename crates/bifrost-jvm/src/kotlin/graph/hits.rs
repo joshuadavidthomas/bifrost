@@ -141,7 +141,12 @@ pub fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingCont
         start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
-    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range);
+    let enclosing = Some(
+        ctx.graph
+            .index
+            .enclosing_code_unit(ctx.file, &range)
+            .unwrap_or_else(|| CodeUnit::file_scope(ctx.file.clone())),
+    );
     let resolved = EnclosingContext { enclosing };
     ctx.enclosing_cache.insert(key, resolved.clone());
     resolved

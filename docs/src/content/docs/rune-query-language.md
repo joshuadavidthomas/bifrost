@@ -232,7 +232,7 @@ Containment for occurrences is `occurrences-in` over a structural query rather t
 
 ## Lexical Scopes, Bindings and Resolution Candidates
 
-Schema v9 adds the rows that say *why* an identifier resolved the way it did. `(scopes ...)` and `(bindings ...)` are sources like `(occurrences ...)`; `(scope-of ...)`, `(scope-ancestors ...)`, `(bindings-in ...)`, `(reaching-binding ...)`, `(binding-occurrence ...)`, `(candidates-of ...)` and `(candidate-target ...)` are wrappers.
+Schema v9 adds the rows that say *why* an identifier resolved the way it did. `(scopes ...)` and `(bindings ...)` are sources like `(occurrences ...)`; `(scope-of ...)`, `(scope-ancestors ...)`, `(bindings-in ...)`, `(binding-of ...)`, `(binding-occurrence ...)`, `(candidates-of ...)` and `(candidate-target ...)` are wrappers.
 
 <!-- code-query-test:rql:scope-seed -->
 ```lisp
@@ -246,12 +246,12 @@ Schema v9 adds the rows that say *why* an identifier resolved the way it did. `(
   (bindings :kind [local parameter] :hoisting source_order))
 ```
 
-The reaching binding of an occurrence is the binding of that name in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Composing it with `scope-of` answers the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body?
+The binding of an occurrence is the declaration of that name in effect at its exact position, computed from activation intervals and scope ancestry rather than from source-order co-presence. Composing it with `scope-of` answers the loop-invariance question -- is the value operated on inside this loop declared inside or outside the loop body?
 
-<!-- code-query-test:rql:reaching-binding -->
+<!-- code-query-test:rql:binding-of -->
 ```lisp
 (scope-of
-  (reaching-binding
+  (binding-of
     (language "java"
       (occurrences :role receiver_position))))
 ```
@@ -277,9 +277,9 @@ Schema v10 adds the rows that keep a qualified path's identity visible segment b
 
 A segment row states its namespace only when the adapter's classification or the segment's own resolution decides it; a Java or Rust scope segment without resolution has none, which is "not stated", never a guess. A language whose adapter does not answer the path axes makes the run incomplete rather than returning an empty complete answer.
 
-<!-- code-query-test:rql:reaching-binding-shadowed -->
+<!-- code-query-test:rql:binding-of-shadowed -->
 ```lisp
-(reaching-binding :include-shadowed true
+(binding-of :include-shadowed true
   (language "rust"
     (occurrences :class reference)))
 ```
@@ -323,6 +323,57 @@ The direction is a field on every row, not something read off which wrapper prod
 Four absences are answers rather than gaps. An absent `ast_id` means the producer could not address the site token as an AST node, not that the edge is weaker. An absent `reference_kind` means no structured kind was classified, and is not a kind to compare against. An `owner_relation` of `unknown` is inconclusive and never silently equal to `external`. A `site_class` of `declaration_site` is editor-visible navigation rather than a runtime usage, which is why it is classified instead of dropped.
 
 Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection today. `(edges-from ...)` in any other language reports `edge_axis_unsupported` with `incomplete` impact -- never a clean empty answer -- and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
+
+## Flow-Sensitive State and Flow Relations
+
+`reaching-binding` was renamed to `binding-of` for a reason: that relation is *lexical*. It answers "which declaration does this name bind to under scoping rules", not "has an assignment to this binding executed before this read". The flow-sensitive family answers the second question, and it stands on the production control-flow graph alone.
+
+`(state-events-of ...)` derives one row per establishment, kill, or read of a binding or of a property of a canonical binding base, each anchored to a program point of the seed procedure's CFG. `(flow-relations-of ...)` relates two such events. `(flow-source ...)` and `(flow-target ...)` project a relation back to its establishment end and its read end.
+
+<!-- code-query-test:rql:state-events -->
+```lisp
+(state-events-of :class [establish read] :subject [binding]
+  (procedure-of
+    (function :name "handler")))
+```
+
+<!-- code-query-test:rql:flow-relations -->
+```lisp
+(flow-target
+  (flow-relations-of :relation [reaching] :certainty [exact]
+    (state-events-of
+      (procedure-of
+        (function :name "handler")))))
+```
+
+`:class` accepts `establish`, `kill` and `read`; `:subject` accepts `binding` and `property`; `:relation` accepts `reaching`, `dominates` and `same-evaluation`; `:certainty` accepts `exact` and `may`. Every axis is a list, and an omitted axis means "every value", never "no value".
+
+The three relations say different things and are deliberately not folded together. `reaching` means some CFG path carries the establishment to the read with no intervening kill of the same subject. `dominates` means every entry-to-read path passes the establishment's program point. `same-evaluation` means the read feeds the very value the establishment assigns, so that establishment cannot serve that read -- `x = wrap(x)` is the canonical shape. Certainty is a separate axis: a reaching row is `exact` when the establishment is the *only* definition of the subject in the read's IN set **and** dominates it, and `may` otherwise. One-armed conditional establishment is the shape that separates the two.
+
+Seeding matters. Seeded from a procedure, `(flow-relations-of ...)` returns every relation of that procedure. Seeded from a state event, it returns only the relations incident to that event -- both ends are matched, because an author asking about one write wants what it serves and an author asking about one read wants what serves it.
+
+Four things are absences that are answers rather than gaps, and each says so. A row's `completeness` is `partial` when the derivation did not answer that row's own axis, and `uncovered_axes` names every axis the derivation left uncovered. A language whose adapter publishes no assignment for a binder yields no establishment for it and reports `flow_state_derivation_incomplete` rather than a proven-absent relation -- Go's `for x := range x` binder is exactly this case today. A control-flow algorithm that exhausts its budget emits *no rows at all* for its relation and reports `flow_state_derivation_incomplete`; a truncated relation set is never presented as a complete one. A field access whose base the IR does not flow from a binding contributes no property subject rather than an approximated one.
+
+There is no lexical, textual, or source-order fallback anywhere on this surface, by construction: the derivation has no other evidence source to fall back to.
+
+## Bounded Rewrite Paths
+
+An analyzer that chases a chain of rewrites -- import-alias substitution, specifier rewriting, type-inference delegation -- is supposed to converge, and a cyclic input is what makes it loop forever. Three things make such a chase analysable rather than merely terminating: a *semantic state key* per step, a *declared finite bound*, and an *explicit terminal outcome*. `(rewrite-paths-of ...)` exposes all three as rows.
+
+<!-- code-query-test:rql:rewrite-paths -->
+```lisp
+(rewrite-paths-of :domain [rust-import-alias] :outcome [cycle]
+  (file-of
+    (function :name "use_alias")))
+```
+
+`:domain` accepts `rust-import-alias`, the only declared domain today: the `use <module> as <alias>` chase in the Rust resolver. Its state key is the *root* of the module specifier, and that choice is the whole point. The rewrite replaces only the root, so the specifier grows on every hop and a whole-string visited set can never trip; the cycle lives in root space, because the binder maps each root to exactly one target. Its declared bound is the importing file's rewritable root count -- the size of the finite space the chase walks, not an arbitrary iteration cap.
+
+`:outcome` accepts `converged`, `cycle` and `exceeded-budget`, and the three say different things. `converged` carries the `fixed_point` the chase stopped on. `cycle` carries the ordered `witness` whose last state repeats its first and closes the loop, which is a concrete counterexample a reader can replay. `exceeded-budget` carries only `explored`: it is *absence of evidence*, so it is never a proven cycle and never a clean convergence, and the termination assert maps it to an inconclusive result rather than to a pass or a finding.
+
+Every row carries the ordered `steps`, each naming its `state_key`, its `input`, its `output` and the `rule` that fired, so the derivation is on the row rather than implied by it. The rows come from the production chase itself, instrumented in place -- there is no second walk of the binder, so a row that says `cycle` says the production resolver met that cycle.
+
+A file no declared domain applies to answers empty and complete: there is nothing the derivation failed to compute. A derivation that genuinely could not run reports `rewrite_domain_unsupported` or `rewrite_path_derivation_incomplete` with `incomplete` impact instead, and never a clean empty answer.
 
 ## Registered Typestate Findings and Witnesses
 

@@ -224,14 +224,17 @@ class SearchToolsClient:
         The ``occurrences`` source pairs with the ``occurrences_in``,
         ``occurrences_of``, and ``occurrence_target`` steps. The ``scopes``
         and ``bindings`` sources pair with the ``scope_of``,
-        ``scope_ancestors``, ``bindings_in``, ``reaching_binding``,
+        ``scope_ancestors``, ``bindings_in``, ``binding_of``,
         ``binding_occurrence``, ``candidates_of``, and ``candidate_target``
         steps, and the package clause sits on the file row. The ``paths``
         source pairs with the ``segments_of`` and ``segment_target`` steps
         over qualified-path rows. The ``generation_sites`` and ``exports``
         sources pair with the ``generates``, ``generated_by``,
-        ``declaration_state_of``, ``implementation_of``, and ``export_target``
-        steps over recorded declaration-materialization provenance.
+        ``declaration_state_of``, ``implementation_of``, ``stubs_of``, and
+        ``export_target`` steps over recorded declaration-materialization
+        provenance; ``stubs_of`` is the inverse of ``implementation_of``, so
+        composed with ``except_`` it lists the declaration-only stubs no
+        implementation answers.
         The canonical reference-edge domain provides
         ``edges_of``, ``edges_from``, and ``edge_target`` over
         canonical ``CodeQueryReferenceEdge`` rows. ``edges_of`` is the inverse
@@ -243,6 +246,26 @@ class SearchToolsClient:
         answer includes editor-only rows. A forward query in a language whose
         adapter has no forward projection reports ``edge_axis_unsupported``
         rather than an empty answer.
+        The flow-sensitive state domain provides ``state_events_of``,
+        ``flow_relations_of``, ``flow_source``, and ``flow_target`` over
+        ``CodeQueryStateEvent`` and ``CodeQueryFlowRelation`` rows.
+        ``state_events_of`` derives establishment, kill, and read events of
+        bindings and properties from the production control-flow graph and
+        accepts ``event_class`` and ``subject``; ``flow_relations_of`` relates
+        them as ``reaching``, ``dominates``, or ``same_evaluation`` with
+        ``exact`` or ``may`` certainty and accepts ``flow_relation`` and
+        ``certainty``. Source order and containment are never presented as any
+        of the three relations, and a derivation that cannot answer an axis
+        reports ``flow_state_axis_unsupported`` or
+        ``flow_state_derivation_incomplete`` rather than an empty answer.
+        The bounded rewrite domain provides ``rewrite_paths_of`` over
+        ``CodeQueryRewritePath`` rows: one row per bounded chase a production
+        analysis engaged in a declared finite rewrite domain (today
+        ``rust_import_alias``), with its ordered steps, the bound the domain
+        declared for itself, and the terminal outcome. It accepts ``domain``
+        and ``rewrite_outcome``. ``converged`` carries the fixed point,
+        ``cycle`` carries the ordered repeated-state witness, and
+        ``exceeded_budget`` is absence of evidence rather than a proven cycle.
         Receiver and member analysis adds ``receiver_outcome``,
         ``receiver_evidence``, and ``member_selection`` rows.
         ``receiver_outcome`` is the mandatory per-site outcome row that states

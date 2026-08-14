@@ -612,7 +612,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver,
+                    SemanticValueKind::Receiver { dispatch: true },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -1265,7 +1265,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), GoLoweringError> {
-        let evaluations = assignment_evaluation_nodes(node);
+        let mut evaluations = assignment_evaluation_nodes(node);
         let boundary = self.point(builder, node, Vec::new())?;
         let operator_is_simple = node.kind() == "short_var_declaration"
             || node
@@ -1279,6 +1279,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             && left_items.len() == 1
             && right_items.len() == 1
             && left_items[0].kind() == "identifier";
+        let compound_target = (!operator_is_simple
+            && node.kind() == "assignment_statement"
+            && left_items.len() == 1
+            && right_items.len() == 1
+            && left_items[0].kind() == "identifier")
+            .then(|| {
+                let name = node_text(self.prepared.source(), left_items[0])?;
+                Some((name, self.binding_value(name, node.start_byte())?))
+            })
+            .flatten();
 
         if simple_pair {
             let name_node = left_items[0];
@@ -1343,6 +1353,53 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     }
                 }
             }
+        } else if let Some((name, target)) = compound_target {
+            // A compound `x op= y` reads both operands, computes a value of the
+            // target's own type, and writes it back into the target binding.
+            let name_node = left_items[0];
+            let source_node = right_items[0];
+            evaluations.insert(0, name_node);
+            let left_value =
+                self.expression_value(builder, name_node, expression_value_kind(name_node))?;
+            let right_value =
+                self.expression_value(builder, source_node, expression_value_kind(source_node))?;
+            let computed = self.source_value(builder, node, SemanticValueKind::Temporary)?;
+            if let Some(identity) = self.value_types.get(&target).cloned() {
+                self.value_types.insert(computed, identity);
+            }
+            self.session.append_language_defined_value_flows(
+                builder,
+                boundary,
+                [left_value, right_value],
+                computed,
+            )?;
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::Assignment {
+                    target,
+                    value: computed,
+                },
+            )?;
+            let kind = if Some(target) == self.receiver {
+                ValueFlowKind::Receiver
+            } else if self
+                .local_at(name, node.end_byte())
+                .is_some_and(|local| local == target)
+            {
+                ValueFlowKind::Local
+            } else {
+                ValueFlowKind::Parameter
+            };
+            self.append_effect(
+                builder,
+                boundary,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source: computed,
+                    target,
+                },
+            )?;
         } else if !left_items.is_empty() || !right_items.is_empty() {
             self.add_gap(
                 builder,
@@ -2107,6 +2164,66 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCapability::ExceptionalControlFlow,
                     SemanticGapKind::Unsupported,
                     "range target evaluation and assignment panics are not lowered",
+                )?;
+            }
+            // Each plain-identifier target is written a fresh element derived
+            // from the iterable on every iteration. The element value depends
+            // on the iterable's value, so a `for x := range x` binder relates
+            // to the outer `x` read as same-evaluation rather than serving it.
+            let declares = direct_child_kind(clause, ":=");
+            let iterable = self.expression_value(builder, right, expression_value_kind(right))?;
+            for name_node in expression_sequence(left) {
+                if name_node.kind() != "identifier" {
+                    continue;
+                }
+                let Some(name) = node_text(self.prepared.source(), name_node) else {
+                    continue;
+                };
+                if name == "_" {
+                    continue;
+                }
+                let target = if declares {
+                    self.local_declaration_value(name, name_node.start_byte())
+                } else {
+                    self.binding_value(name, clause.start_byte())
+                };
+                let Some(target) = target else {
+                    continue;
+                };
+                let element =
+                    self.source_value(builder, name_node, SemanticValueKind::Temporary)?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    binding_boundary,
+                    [iterable],
+                    element,
+                )?;
+                self.append_effect(
+                    builder,
+                    binding_boundary,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: element,
+                    },
+                )?;
+                let kind = if Some(target) == self.receiver {
+                    ValueFlowKind::Receiver
+                } else if self
+                    .local_at(name, body.start_byte())
+                    .is_some_and(|local| local == target)
+                {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::Parameter
+                };
+                self.append_effect(
+                    builder,
+                    binding_boundary,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: element,
+                        target,
+                    },
                 )?;
             }
             self.edge(builder, binding_boundary, EdgeTarget::normal(body_entry))?;

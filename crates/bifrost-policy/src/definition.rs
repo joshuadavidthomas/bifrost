@@ -11,12 +11,14 @@ use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
+use brokk_bifrost_analysis::analyzer::structural::flow_state::{FlowRelation, FlowStateAxis};
 use brokk_bifrost_analysis::analyzer::structural::materialization::{
     DeclarationOrigin, GenerationKind,
 };
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
+use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteDomainKind;
 use brokk_bifrost_analysis::analyzer::structural::{
     BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
 };
@@ -332,7 +334,7 @@ impl Default for RelationalAssertionLimits {
 pub enum PolicyAssert {
     Occurrence(OccurrenceAssert),
     Resolution(ResolutionAssert),
-    Reaching(ReachingAssert),
+    BindingScope(BindingScopeAssert),
     Boundary(BoundaryAssert),
     Generation(GenerationAssert),
     DeclarationState(DeclarationStateAssert),
@@ -341,6 +343,8 @@ pub enum PolicyAssert {
     Canonical(CanonicalAssert),
     Route(RouteAssert),
     RoundTrip(RoundTripAssert),
+    FlowEstablishment(FlowEstablishmentAssert),
+    RewriteTermination(RewriteTerminationAssert),
 }
 
 impl PolicyAssert {
@@ -348,7 +352,7 @@ impl PolicyAssert {
         match self {
             Self::Occurrence(assertion) => &assertion.id,
             Self::Resolution(assertion) => &assertion.id,
-            Self::Reaching(assertion) => &assertion.id,
+            Self::BindingScope(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
             Self::Generation(assertion) => &assertion.id,
             Self::DeclarationState(assertion) => &assertion.id,
@@ -357,23 +361,30 @@ impl PolicyAssert {
             Self::Canonical(assertion) => &assertion.id,
             Self::Route(assertion) => &assertion.id,
             Self::RoundTrip(assertion) => &assertion.id,
+            Self::FlowEstablishment(assertion) => &assertion.id,
+            Self::RewriteTermination(assertion) => &assertion.id,
         }
     }
 
-    /// The subject capture whose AST node the rows are joined to.
-    pub fn at(&self) -> &str {
+    /// The subject capture whose AST node the rows are joined to, for the
+    /// families that are about one captured node. The termination family is
+    /// about a whole file set rather than a node, so it binds no subject
+    /// capture and is evaluated once per run.
+    pub fn at(&self) -> Option<&str> {
         match self {
-            Self::Occurrence(assertion) => &assertion.at,
-            Self::Resolution(assertion) => &assertion.at,
-            Self::Reaching(assertion) => &assertion.at,
-            Self::Boundary(assertion) => &assertion.at,
-            Self::Generation(assertion) => &assertion.at,
-            Self::DeclarationState(assertion) => &assertion.at,
-            Self::EdgeParity(assertion) => &assertion.at,
-            Self::EdgeClass(assertion) => &assertion.at,
-            Self::Canonical(assertion) => &assertion.at,
-            Self::Route(assertion) => &assertion.at,
-            Self::RoundTrip(assertion) => &assertion.at,
+            Self::Occurrence(assertion) => Some(&assertion.at),
+            Self::Resolution(assertion) => Some(&assertion.at),
+            Self::BindingScope(assertion) => Some(&assertion.at),
+            Self::Boundary(assertion) => Some(&assertion.at),
+            Self::Generation(assertion) => Some(&assertion.at),
+            Self::DeclarationState(assertion) => Some(&assertion.at),
+            Self::EdgeParity(assertion) => Some(&assertion.at),
+            Self::EdgeClass(assertion) => Some(&assertion.at),
+            Self::Canonical(assertion) => Some(&assertion.at),
+            Self::Route(assertion) => Some(&assertion.at),
+            Self::RoundTrip(assertion) => Some(&assertion.at),
+            Self::FlowEstablishment(assertion) => Some(&assertion.at),
+            Self::RewriteTermination(_) => None,
         }
     }
 
@@ -386,14 +397,15 @@ impl PolicyAssert {
         match self {
             Self::Occurrence(assertion) => Some(assertion.role),
             Self::Resolution(assertion) => Some(assertion.role),
-            Self::Reaching(assertion) => Some(assertion.role),
+            Self::BindingScope(assertion) => Some(assertion.role),
             Self::Boundary(assertion) => Some(assertion.role),
             Self::EdgeParity(assertion) => Some(assertion.role),
             Self::EdgeClass(assertion) => Some(assertion.role),
             Self::Canonical(assertion) => Some(assertion.role),
             Self::Route(assertion) => Some(assertion.role),
             Self::RoundTrip(assertion) => Some(assertion.role),
-            Self::Generation(_) | Self::DeclarationState(_) => None,
+            Self::FlowEstablishment(assertion) => Some(assertion.role),
+            Self::Generation(_) | Self::DeclarationState(_) | Self::RewriteTermination(_) => None,
         }
     }
 
@@ -401,7 +413,7 @@ impl PolicyAssert {
         match self {
             Self::Occurrence(_) => "occurrence",
             Self::Resolution(_) => "resolution",
-            Self::Reaching(_) => "reaching",
+            Self::BindingScope(_) => "binding_scope",
             Self::Boundary(_) => "boundary",
             Self::Generation(_) => "generation",
             Self::DeclarationState(_) => "declaration-state",
@@ -410,6 +422,8 @@ impl PolicyAssert {
             Self::Canonical(_) => "canonical",
             Self::Route(_) => "route",
             Self::RoundTrip(_) => "round_trip",
+            Self::FlowEstablishment(_) => "flow_establishment",
+            Self::RewriteTermination(_) => "rewrite_termination",
         }
     }
 }
@@ -571,14 +585,14 @@ impl ResolutionAssert {
     }
 }
 
-/// Require the reaching binding of the subject occurrence to be declared inside
+/// Require the binding of the subject occurrence to be declared inside
 /// or outside a second captured node.
 ///
 /// This is the loop-invariance predicate: capture the receiver and the loop,
 /// then ask whether the binding actually in effect at the receiver is declared
 /// within the loop body.
 #[derive(Debug, Clone)]
-pub struct ReachingAssert {
+pub struct BindingScopeAssert {
     pub id: PolicyAssertId,
     pub at: String,
     pub role: OccurrenceRole,
@@ -587,10 +601,10 @@ pub struct ReachingAssert {
     pub relative_to: String,
 }
 
-impl ReachingAssert {
+impl BindingScopeAssert {
     pub fn expectation(&self) -> String {
         format!(
-            "reaching binding declared {} capture `{}`",
+            "binding declared {} capture `{}`",
             self.containment.label(),
             self.relative_to
         )
@@ -721,6 +735,126 @@ pub struct RoundTripAssert {
 impl RoundTripAssert {
     pub fn expectation(&self) -> String {
         "forward and inverse routes round-trip the subject site".to_string()
+    }
+}
+
+/// Which temporal relation must hold between an establishment and a read
+/// (#1480).
+///
+/// The two values are genuinely different statements, which is why the
+/// derivation layer emits them as separate relations: `Reached` says some CFG
+/// path carries an establishment to the read, `Dominated` says every
+/// entry-to-read path passes one. A one-armed conditional establishment
+/// satisfies the first and violates the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EstablishmentRequirement {
+    Reached,
+    Dominated,
+}
+
+impl EstablishmentRequirement {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reached => "reached",
+            Self::Dominated => "dominated",
+        }
+    }
+
+    /// The flow relation a qualifying establishment must carry to the read.
+    pub const fn relation(self) -> FlowRelation {
+        match self {
+            Self::Reached => FlowRelation::Reaching,
+            Self::Dominated => FlowRelation::Dominates,
+        }
+    }
+
+    /// The derivation axis the requirement reads. An assert consults exactly
+    /// the axes it names, so a hole in an unrelated axis does not make the run
+    /// unreliable.
+    pub const fn axis(self) -> FlowStateAxis {
+        match self {
+            Self::Reached => FlowStateAxis::ReachingRelation,
+            Self::Dominated => FlowStateAxis::DominanceRelation,
+        }
+    }
+}
+
+/// Require that control flow has established a binding or property before the
+/// captured token reads it (#1480).
+///
+/// The evidence is the production CFG's own reaching-definition and dominance
+/// relations; source co-presence and textual order are never consulted, by
+/// construction of the derivation layer this reads. `forbid_same_evaluation`
+/// adds the second half of the mined contract: a binder introduced by one
+/// statement must not serve a read inside that same statement's evaluation
+/// (the Go `for x := range x` and JavaScript `x = wrap(x)` shapes).
+#[derive(Debug, Clone)]
+pub struct FlowEstablishmentAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub require: EstablishmentRequirement,
+    pub forbid_same_evaluation: bool,
+}
+
+impl FlowEstablishmentAssert {
+    pub fn expectation(&self) -> String {
+        let mut text = format!(
+            "every read of the captured subject is {} by an establishment",
+            self.require.label()
+        );
+        if self.forbid_same_evaluation {
+            text.push_str(", and no establishment serves a read of its own evaluation");
+        }
+        text
+    }
+
+    /// Every derivation axis this assert consults. An uncovered axis here is
+    /// what makes a run inconclusive; an uncovered axis outside it is none of
+    /// this assert's business, which is why a derivation that is partial on an
+    /// axis the assert never reads still concludes.
+    ///
+    /// `subject` is the event axis of one joined read. `None` asks for the
+    /// axes the question "did any read join at all" depends on: absence of a
+    /// read is only an answer when both event axes are covered.
+    ///
+    /// The same-evaluation axis is deliberately not listed: that half of the
+    /// assert is decided on its own, because a same-evaluation row that exists
+    /// is a proven counterexample no matter what else the derivation could not
+    /// enumerate, and only its absence needs the axis covered.
+    pub fn consulted_axes(&self, subject: Option<FlowStateAxis>) -> Vec<FlowStateAxis> {
+        let mut axes = match subject {
+            Some(axis) => vec![axis],
+            None => vec![FlowStateAxis::BindingEvents, FlowStateAxis::PropertyEvents],
+        };
+        axes.push(self.require.axis());
+        axes
+    }
+}
+
+/// Require that every bounded rewrite chase of one declared domain converges
+/// within the bound the domain declares for itself (#1480).
+///
+/// Only a cycle is a counterexample. A chase that exhausts its budget proves
+/// nothing in either direction, so it makes the run inconclusive rather than
+/// producing a finding or a clean pass.
+#[derive(Debug, Clone)]
+pub struct RewriteTerminationAssert {
+    pub id: PolicyAssertId,
+    pub domain: RewriteDomainKind,
+    /// Narrow the file set to the files whose subject rows bind this capture.
+    /// Absent, the assert states the domain terminates on every analyzed file
+    /// of the workspace, which is what the domain's own contract is about.
+    pub scope: Option<String>,
+}
+
+impl RewriteTerminationAssert {
+    pub fn expectation(&self) -> String {
+        format!(
+            "every {} rewrite chase converges within its declared bound ({})",
+            self.domain.label(),
+            self.domain.bound_description()
+        )
     }
 }
 

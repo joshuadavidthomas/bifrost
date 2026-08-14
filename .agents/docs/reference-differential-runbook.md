@@ -49,8 +49,8 @@ Canonical clone root:
 Corpus membership, pinned commits, and LOC metadata:
   /home/jonathan/Projects/brokkbench/sft-tools-commits
 
-Durable raw run output and logs:
-  /mnt/optane/tmp/reference-differential
+Durable raw run output and logs for the census campaign:
+  /mnt/optane/tmp/bifrost-fird
 ```
 
 The clone directory name is the canonical repository slug, for example
@@ -62,9 +62,13 @@ Corpus membership comes from:
 <commits-root>/<language>/<slug>.jsonl
 ```
 
-Repository ranking uses `repos.csv::code_loc` under the commits root. Sidecar files such as
-`.testsome.jsonl` are not corpus members. A missing clone, invalid pinned commit, missing LOC value,
-or dirty tracked checkout must be reported rather than silently treated as a smaller repository.
+The default repository ranking uses `repos.csv::code_loc`. A task-ranked campaign must pass
+`--task-ranked`. That option imports `tasks.py`, calls
+`tasks.task_repos(tasks.SFT_PREDICATES, langs=[language])`, and applies a stable descending
+task-count sort. Stable sorting keeps `tasks.py` order for ties. `SFT_PREDICATES.not_overlarge`
+excludes `large-repos.csv`. Sidecar files such as `.testsome.jsonl` are not corpus members. A
+missing clone, invalid pinned commit, missing LOC value, or dirty tracked checkout must be reported
+rather than silently treated as a smaller repository.
 
 ## Preconditions
 
@@ -90,10 +94,11 @@ git -C /home/jonathan/Projects/brokkbench/clones/REPOSITORY_SLUG status --short
 git -C /home/jonathan/Projects/brokkbench/clones/REPOSITORY_SLUG rev-parse HEAD
 ```
 
-Persisted analyzer caches live below each clone in `.brokk/bifrost_cache.db`. If `.brokk/` is
-untracked, exclude it locally in the clone's `.git/info/exclude` so cache creation does not make an
-otherwise clean evidence record appear dirty. Do not delete `.brokk` as a retry strategy; diagnose
-epoch or migration failures at their source.
+Persisted analyzer caches live below each clone in `.bifrost/cache`; older checkouts can also contain
+legacy `.brokk/` state. FIRD excludes those two generated top-level directories from repository
+dirtiness metadata. Every other tracked or untracked path remains material and makes the record
+dirty. Do not delete analyzer state as a retry strategy; diagnose epoch or migration failures at
+their source.
 
 ## Build the runner
 
@@ -126,6 +131,7 @@ target/release/bifrost_reference_differential run-corpus \
   --clones-root /home/jonathan/Projects/brokkbench/clones \
   --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
   --language cpp \
+  --task-ranked \
   --repos-per-language 5 \
   --repo-jobs 1 \
   --jobs 8 \
@@ -135,6 +141,11 @@ target/release/bifrost_reference_differential run-corpus \
 `--language` and `--repo` are repeatable. Use explicit `--repo SLUG` filters when the requested set
 has exclusions, such as selecting the five largest non-Chromium C++ repositories. Record the dry-run
 selection and pinned clone heads in the campaign ExecPlan before starting the expensive run.
+
+For task-ranked selection, `--repos-per-language N` means up to N eligible task repositories. A
+language can have fewer than N repositories after `SFT_PREDICATES` applies every gate. Record the
+eligible count and audit all eligible repositories. Do not replace excluded repositories with rows
+that failed the selector.
 
 ## Run a resumable corpus audit
 
@@ -160,6 +171,7 @@ set -o pipefail
   --clones-root /home/jonathan/Projects/brokkbench/clones \
   --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
   --language cpp \
+  --task-ranked \
   --repo REPOSITORY_SLUG \
   --repo-jobs 1 \
   --jobs 8 \
@@ -173,13 +185,20 @@ set -o pipefail
   --max-usage-files 1000 \
   --max-usages 100000 \
   --seed 0 \
-  --output /mnt/optane/tmp/reference-differential/LANGUAGE-CAMPAIGN-BIFROST_HEAD.jsonl \
-  2>&1 | tee -a /mnt/optane/tmp/reference-differential/LANGUAGE-CAMPAIGN-BIFROST_HEAD.log
+  --probe-seed census \
+  --tiers 1,2,3 \
+  --output /mnt/optane/tmp/bifrost-fird/LANGUAGE-CAMPAIGN-BIFROST_HEAD.jsonl \
+  2>&1 | tee -a /mnt/optane/tmp/bifrost-fird/LANGUAGE-CAMPAIGN-BIFROST_HEAD.log
 ```
 
 For a complete top-N run, omit explicit `--repo` filters and use `--repos-per-language N`, or repeat
 `--repo` for an exact selected set. `run-corpus` appends one JSON object per completed repository.
 Records are written in completion order; JSONL line order is not semantically meaningful.
+
+Use `--shard K/N` to partition the globally sampled file set. K is one-based. Shards are disjoint,
+and their union contains the same sampled files as the unsharded run. Each shard has a distinct run
+fingerprint and resume key. Use a separate output file for each shard, then audit their ledgers as
+one campaign leg.
 
 ### Parallelism
 
@@ -287,6 +306,11 @@ Important site classifications:
   not form a valid complete comparison.
 - `missing`: a forward-resolved site is absent from the complete inverse result and requires triage.
 
+The report also contains `inverse_precision_findings`. Each row is a proven inverse hit whose exact
+range contains a literal target terminal name but has no matching raw census occurrence. Alias
+spellings are skipped until the analyzer emits alias sets. The summary counter
+`inverse_precision_unbacked_hits` contributes to strict-mode actionable findings.
+
 Also inspect each site's `forward_status`, `targets`, `note`, `diagnostics`, and `inverse_hit`
 (including its nested `exact_range`). At report level, inspect `summary.target_truncated_sites`,
 `summary.skipped_targets`, candidate-limit counters, configured usage limits, and `file_errors`. A
@@ -308,17 +332,54 @@ For every `missing` site:
 7. Group genuine witnesses by root cause, not by repository or syntax spelling.
 8. Record every row in a checksummed ledger, including non-actionable dispositions and evidence.
 
+Create the initial exact-site ledger with:
+
+```bash
+python3 scripts/fird-report-ledger.py \
+  --input RUN.jsonl \
+  --output RUN-missing-ledger.jsonl \
+  --binary target/release/bifrost_reference_differential \
+  --clones-root /home/jonathan/Projects/brokkbench/clones \
+  --exact-output-root /mnt/optane/tmp/bifrost-fird/exact
+sha256sum RUN-missing-ledger.jsonl > RUN-missing-ledger.sha256
+```
+
+The script streams one row per raw finding into a new output file and refuses to overwrite an
+existing raw ledger. It adds a failure signature, an occurrence key, the originating configuration,
+minimal source evidence, and a single-line exact rerun command. Inverse-precision findings retain the
+forward census site that triggered their inverse query, so their command deterministically reproduces
+that query as well. Fill dispositions in a separate audited copy after the exact audit. Preserve the
+immutable raw ledger and its checksum.
+
 Do not infer that a large cluster is one bug merely because source text looks similar. Conversely, do
 not file one issue per symptom when structured tracing proves a shared resolver invariant.
+
+### Language-by-language issue workflow
+
+Work depth-first by corpus language. For language A, create issues for every legitimate root-cause
+family found in that language, then fix and close the issues that are assigned to you before starting
+triage or implementation for language B. Merge each completed fix into `origin/master` as it is
+finished. When the language has no remaining actionable families, publish a concise summary of its
+results, including fixes, skipped issues, escalations, and final corpus status.
+
+Every new issue must begin with the title prefix `FIRD: `. Before changing product code, assign the
+issue to the current `gh` user. If an existing issue is assigned to someone else, record the link and
+disposition in the ledger, then skip it; do not reassign it or work around its ownership.
+
+If a finding has no straightforward, generalized, correct solution under this repository's design
+rules, do not add a hack or workaround. Assign the issue to `DavidBakerEffendi`, add a comment that
+explains the structural limitation and the evidence, record the escalation in the ledger, and proceed
+with the next eligible issue.
 
 ## Reduce and fix a legitimate defect
 
 Before implementation:
 
 1. search open issues for the root-cause family;
-2. if an issue is assigned to somebody else, record it and skip the implementation;
-3. otherwise create or reuse an issue assigned only to the authorized owner; and
-4. ensure assignment is complete before changing product code.
+2. if no suitable issue exists, create one with the `FIRD: ` title prefix;
+3. if an issue is assigned to somebody else, record it and skip the implementation;
+4. otherwise assign it to the current `gh` user; and
+5. ensure assignment is complete before changing product code.
 
 Use `tests/common/inline_project.rs::InlineTestProject` for small behavior-focused analyzer projects.
 Put forward identity regressions in definition tests, targeted inverse regressions in usage-graph tests,
@@ -339,15 +400,17 @@ After integrating a fix stack, run at least:
 
 ```bash
 cargo fmt --all -- --check
-scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+scripts/with-isolated-cargo-target.sh cargo clippy --workspace --all-targets --all-features -- -D warnings
 UV_CACHE_DIR=/tmp/bifrost-uv-cache \
   BIFROST_SEMANTIC_INDEX=off \
-  scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+  scripts/with-isolated-cargo-target.sh \
+  uv run --python 3.12 -- cargo test --features nlp,python
 ```
 
 Run focused behavior suites before the broad gates, then rebuild the release runner from the exact
-clean integrated head and rerun every accepted production witness. Do not wait for CI when a campaign
-explicitly defines the complete local gate as its transition boundary.
+clean integrated head and rerun every accepted production witness. Do not wait for CI: once the
+required local `cargo test` coverage passes, merge the completed fix and continue the depth-first
+language workflow. Investigate CI only if the operator reports that it turned red.
 
 If the execution sandbox denies process-I/O tests, rerun the same full feature-enabled suite outside
 that sandbox. Do not reinterpret a sandbox denial as a passing test or silently narrow the suite.
@@ -358,12 +421,12 @@ Exact probes and a dirty integration-candidate corpus are not closure evidence. 
 
 1. reconcile and publish the integrated head according to the repository's Git instructions;
 2. rebuild the release runner from that exact clean pushed head;
-3. run the complete selected corpus into new head-scoped JSONL and log files;
+3. run the not-yet-completed portion of the selected corpus into new head-scoped JSONL and log files;
 4. exhaustively audit every final raw `missing` row;
 5. verify all expected exact witnesses are `consistent` or honestly fail closed as `unproven`/
    `inconclusive` with zero actionable discrepancy;
 6. run formatting, Clippy, focused tests, and the full feature-enabled test suite;
-7. comment on and close only the assigned issues proven fixed by clean production evidence; and
+7. comment on and close only the self-assigned issues proven fixed by clean production evidence; and
 8. verify local HEAD, local `origin/master`, and remote `refs/heads/master` agree.
 
 Do not claim closure by subtracting baseline rows that exact probes fixed. Fixes can change forward
@@ -375,7 +438,7 @@ rerun and independently audited.
 Keep large, resumable raw artifacts outside the repository:
 
 ```text
-/mnt/optane/tmp/reference-differential/
+/mnt/optane/tmp/bifrost-fird/
   <language>-<campaign>-<bifrost-head>.jsonl
   <language>-<campaign>-<bifrost-head>.log
   ...-missing-audit.jsonl
@@ -435,9 +498,10 @@ and write to a new head-scoped output.
 
 ### Clone becomes dirty during a persisted run
 
-If only `.brokk/` is untracked, add a local `.git/info/exclude` entry and rerun the accepted record. If
-tracked source changed, restore or re-create the pinned clone through the normal corpus workflow; do
-not accept the dirty record.
+Generated top-level `.bifrost/` and legacy `.brokk/` analyzer state is ignored by the record metadata.
+Any other untracked path or tracked source change is material. Restore a clean clone through the
+normal corpus workflow or use a clean alternate worktree at the pinned commit; do not discard user
+changes or accept the dirty record.
 
 ### Progress is quiet for several minutes
 
@@ -473,7 +537,8 @@ Before accepting a baseline:
 - [ ] every selected repository has one completed record;
 - [ ] heads, dirtiness, and fingerprints are correct;
 - [ ] every raw missing row has an evidence-backed ledger disposition;
-- [ ] every legitimate root cause has an assigned issue before implementation; and
+- [ ] every legitimate root cause has a `FIRD: ` issue assigned to the current `gh` user before
+  implementation, or an evidence-backed skip/escalation; and
 - [ ] exact production witnesses and structured reductions exist.
 
 Before closure:
@@ -484,5 +549,6 @@ Before closure:
 - [ ] every final residual exhaustively audited;
 - [ ] focused tests, formatting, all-feature Clippy, and `cargo test --features nlp,python` pass;
 - [ ] compact manifest and narrative committed;
-- [ ] fixed assigned issues commented and closed with clean evidence; and
+- [ ] fixed self-assigned issues commented and closed with clean evidence;
+- [ ] each language was completed depth-first and has a published summary; and
 - [ ] local and remote `master` agree.

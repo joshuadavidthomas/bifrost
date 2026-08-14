@@ -1,11 +1,12 @@
-use crate::analyzer::rust::{usage_binding_seeds, usage_candidate_files_while};
+use crate::analyzer::rust::usage_binding_seeds;
+use crate::analyzer::rust::usage_candidate_files_while;
 mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
 use crate::analyzer::usages::outcome::{
@@ -14,10 +15,11 @@ use crate::analyzer::usages::outcome::{
 use crate::analyzer::usages::rust_graph::extractor::{
     effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
+use crate::analyzer::usages::rust_graph::resolver::infer_graph_seeds_while;
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, infer_graph_seeds_while,
-    is_graph_visible_member_target, is_member_target, local_impl_target_importer_files,
-    trait_member_for_impl_member, unresolved_external_frontier_specifiers,
+    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
+    is_member_target, local_impl_target_importer_files_while, trait_member_for_impl_member,
+    unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
@@ -37,8 +39,8 @@ pub(crate) use resolver::{
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Rust
 /// files. `nodes`/`keep_file` mirror the Go builder.
 ///
-/// Both usage paths resolve references through analyzer state: per-reference name
-/// resolution via the cached [`crate::analyzer::RustReferenceContext`], and the
+/// Both usage paths resolve references through analyzer state: lazy,
+/// query-scoped per-reference name resolution, and the
 /// forward path's re-export seeds + importer narrowing via the analyzer's
 /// `usage_*` index (`RustAnalyzer::usage_seeds` / `usage_importers` /
 /// `usage_binding_names`).
@@ -122,12 +124,25 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
 
         union_candidate_usages(&candidates, max_usages, |target| {
             let (hits, unproven_hits) = if is_member_target(rust, target) {
-                let seed_result = infer_graph_seeds(rust, target);
+                let seed_result = {
+                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
+                    infer_graph_seeds(rust, target)
+                };
                 if seed_result.roots.is_empty() {
                     return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
                         .diagnostic(target.fq_name(), RUST_STRATEGY));
                 }
-                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let seeds = {
+                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
+                    usage_binding_seeds(rust, &seed_result.roots)
+                };
+                crate::profiling::note_with(|| {
+                    format!(
+                        "rust_graph seed roots={} candidate_names={}",
+                        seed_result.roots.len(),
+                        seeds.candidate_names().count()
+                    )
+                });
                 let graph_visible = is_graph_visible_member_target(rust, target);
                 let private_authoritative_scope = scan_scope.is_authoritative();
                 if seed_result.kind == RustGraphSeedKind::Export
@@ -138,7 +153,12 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 }
                 let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
                 if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                    scan_files.extend(local_impl_target_importer_files(rust, target));
+                    scan_files.extend(
+                        local_impl_target_importer_files_while(rust, target, &|| {
+                            !scan_scope.is_cancelled()
+                        })
+                        .unwrap_or_default(),
+                    );
                 }
                 let scan_target = trait_member_for_impl_member(rust, target);
                 let scan_target = scan_target.as_ref().unwrap_or(target);
@@ -149,18 +169,37 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     scan_target,
                     target,
                     scan_scope.cancellation(),
+                    max_usages,
                 );
                 (result.hits, result.unproven_hits)
             } else {
-                let seed_result = infer_graph_seeds(rust, target);
+                let seed_result = {
+                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
+                    infer_graph_seeds(rust, target)
+                };
                 if seed_result.roots.is_empty() {
                     return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
                         .diagnostic(target.fq_name(), RUST_STRATEGY));
                 }
-                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let seeds = {
+                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
+                    usage_binding_seeds(rust, &seed_result.roots)
+                };
+                crate::profiling::note_with(|| {
+                    format!(
+                        "rust_graph seed roots={} candidate_names={}",
+                        seed_result.roots.len(),
+                        seeds.candidate_names().count()
+                    )
+                });
                 let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
                 if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                    scan_files.extend(local_impl_target_importer_files(rust, target));
+                    scan_files.extend(
+                        local_impl_target_importer_files_while(rust, target, &|| {
+                            !scan_scope.is_cancelled()
+                        })
+                        .unwrap_or_default(),
+                    );
                 }
                 (
                     scan_files_for_target(
@@ -170,6 +209,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                         target,
                         Some(&seeds),
                         scan_scope.cancellation(),
+                        max_usages,
                     ),
                     BTreeSet::new(),
                 )
@@ -179,7 +219,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             // kept, classified `SelfReceiver`. The unproven channel still drops
             // them -- an unproven recursive call is not evidence of anything.
             Ok(CandidateUsageHits {
-                hits: classify_recursive_hits(analyzer, hits, target),
+                hits,
                 unproven_hits: unproven_hits
                     .into_iter()
                     .filter(|hit| &hit.enclosing != target)
@@ -324,6 +364,189 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
 mod tests {
     use super::*;
     use crate::analyzer::{CodeUnitIndex, Language, TestProject};
+    use crate::test_support::AnalyzerFixture;
+
+    const WIDE_EXPORT_SURFACE: usize = 20;
+
+    fn wide_export_surface_fixture() -> Vec<(String, String)> {
+        let mut wide = String::from("pub fn target() {}\n");
+        for index in 0..WIDE_EXPORT_SURFACE {
+            wide.push_str(&format!("pub struct Filler{index};\n"));
+        }
+        vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"wide\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub mod wide;\npub mod consumer;\n".to_string(),
+            ),
+            ("src/wide.rs".to_string(), wide),
+            (
+                "src/consumer.rs".to_string(),
+                "use crate::wide;\npub fn call() { wide::target(); }\n".to_string(),
+            ),
+        ]
+    }
+
+    fn fixture_for(files: &[(String, String)]) -> AnalyzerFixture {
+        let borrowed: Vec<_> = files
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        AnalyzerFixture::new_for_language(Language::Rust, &borrowed)
+    }
+
+    fn declaration_named(analyzer: &RustAnalyzer, file: &ProjectFile, name: &str) -> CodeUnit {
+        analyzer
+            .declarations(file)
+            .into_iter()
+            .find(|unit| unit.identifier() == name)
+            .unwrap_or_else(|| panic!("no declaration named {name}"))
+    }
+
+    #[test]
+    fn usage_scan_does_not_canonicalize_the_whole_namespace_export_surface() {
+        let files = wide_export_surface_fixture();
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let wide_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
+        let target = declaration_named(&analyzer, &wide_file, "target");
+        let candidates: HashSet<_> = [consumer].into_iter().collect();
+
+        analyzer.reset_export_name_canonicalization_count_for_test();
+        let scope = UsageScanScope::new(&candidates, false);
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+        assert!(!outcome.all_hits().is_empty());
+        let canonicalizations = analyzer.export_name_canonicalization_count_for_test();
+        assert!(
+            canonicalizations <= 4,
+            "one written site canonicalized {canonicalizations} names from a {}-name surface",
+            WIDE_EXPORT_SURFACE + 1
+        );
+    }
+
+    #[test]
+    fn cancelled_usage_scan_stops_before_walking_an_export_surface() {
+        let files = wide_export_surface_fixture();
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let wide_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
+        let target = declaration_named(&analyzer, &wide_file, "target");
+        let candidates: HashSet<_> = [consumer].into_iter().collect();
+
+        analyzer.reset_export_name_canonicalization_count_for_test();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
+        let scope = UsageScanScope::with_cancellation(&candidates, false, &cancellation);
+        let _ = RustExportUsageGraphStrategy::new().find_graph_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &scope,
+            1000,
+        );
+
+        assert!(cancellation.is_cancelled());
+        let canonicalizations = analyzer.export_name_canonicalization_count_for_test();
+        assert!(
+            canonicalizations <= 4,
+            "cancelled scan canonicalized {canonicalizations} export names"
+        );
+    }
+
+    #[test]
+    fn usage_scan_stops_opening_candidates_once_the_callsite_cap_is_proven() {
+        const CALLERS: usize = 24;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "Cargo.toml")
+            .write("[package]\nname = \"capped\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+            .expect("write Cargo.toml");
+        let target_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        target_file
+            .write("pub fn target() {}\n")
+            .expect("write target");
+        let mut lib = String::from("pub mod wide;\n");
+        let mut candidates = HashSet::default();
+        for index in 0..CALLERS {
+            lib.push_str(&format!("pub mod caller{index};\n"));
+            let file = ProjectFile::new(root.clone(), format!("src/caller{index}.rs"));
+            file.write(format!(
+                "use crate::wide::target;\npub fn call{index}() {{ target(); target(); }}\n"
+            ))
+            .expect("write caller");
+            candidates.insert(file);
+        }
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write(&lib)
+            .expect("write lib.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let target = analyzer
+            .declarations(&target_file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("target declaration");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-thread pool");
+
+        analyzer.reset_scanned_candidate_file_count_for_test();
+        let outcome = pool.install(|| {
+            let scope = UsageScanScope::new(&candidates, false);
+            RustExportUsageGraphStrategy::new().find_graph_usages(
+                &analyzer,
+                std::slice::from_ref(&target),
+                &scope,
+                1,
+            )
+        });
+
+        assert!(matches!(
+            outcome,
+            GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites { .. })
+        ));
+        let opened = analyzer.scanned_candidate_file_count_for_test();
+        assert!(opened < CALLERS, "opened all {opened} candidate files");
+    }
+
+    #[test]
+    fn recursive_reference_is_classified_before_the_external_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        file.write("pub fn target(n: usize) { if n > 0 { target(n - 1); } }\n")
+            .expect("write lib.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let target = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "target")
+            .expect("target declaration");
+        let candidates: HashSet<_> = [file].into_iter().collect();
+        let scope = UsageScanScope::new(&candidates, true);
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 0)
+            .into_fuzzy_result();
+
+        assert!(
+            !matches!(outcome, FuzzyResult::TooManyCallsites { .. }),
+            "recursive reference must not trip the external cap: {outcome:?}"
+        );
+        assert!(outcome.all_hits().is_empty());
+        let editor_hits = outcome.all_hits_including_imports();
+        assert_eq!(editor_hits.len(), 1, "recursive hit: {editor_hits:#?}");
+        assert_eq!(
+            editor_hits.iter().next().expect("recursive hit").kind,
+            crate::analyzer::usages::model::UsageHitKind::SelfReceiver
+        );
+    }
 
     #[test]
     fn cancelled_cold_candidate_discovery_does_not_publish_partial_index() {

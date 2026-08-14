@@ -117,6 +117,9 @@ pub enum DetailedCodeQueryDomain {
     Export,
     DeclarationState,
     ReferenceEdge,
+    StateEvent,
+    FlowRelation,
+    RewritePath,
     QualifiedPath,
     PathSegment,
 }
@@ -160,6 +163,9 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::Export,
     DetailedCodeQueryDomain::DeclarationState,
     DetailedCodeQueryDomain::ReferenceEdge,
+    DetailedCodeQueryDomain::StateEvent,
+    DetailedCodeQueryDomain::FlowRelation,
+    DetailedCodeQueryDomain::RewritePath,
     DetailedCodeQueryDomain::QualifiedPath,
     DetailedCodeQueryDomain::PathSegment,
 ];
@@ -313,6 +319,9 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::QualifiedPath => Self::QualifiedPath,
             QueryValueKind::PathSegment => Self::PathSegment,
             QueryValueKind::ReferenceEdge => Self::ReferenceEdge,
+            QueryValueKind::StateEvent => Self::StateEvent,
+            QueryValueKind::FlowRelation => Self::FlowRelation,
+            QueryValueKind::RewritePath => Self::RewritePath,
             QueryValueKind::File => Self::File,
         }
     }
@@ -359,6 +368,9 @@ impl DetailedCodeQueryDomain {
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
             Self::ReferenceEdge => "reference_edge",
+            Self::StateEvent => "state_event",
+            Self::FlowRelation => "flow_relation",
+            Self::RewritePath => "rewrite_path",
         }
     }
 
@@ -733,6 +745,45 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("edge_provenance", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("generation", Scalar::Integer),
             ],
+            Self::StateEvent => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("event_class", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("subject", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("member", Scalar::String),
+                CodeQueryRowField::required("subject_value", Scalar::Integer),
+                CodeQueryRowField::required("program_point", Scalar::Integer),
+                CodeQueryRowField::required("value", Scalar::Integer),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("generation", Scalar::Integer),
+            ],
+            Self::RewritePath => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("domain", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("origin_specifier", Scalar::String),
+                CodeQueryRowField::required("declared_bound", Scalar::Integer),
+                CodeQueryRowField::required("step_count", Scalar::Integer),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("fixed_point", Scalar::String),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("generation", Scalar::Integer),
+            ],
+            Self::FlowRelation => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("certainty", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("source_id", Scalar::StableId),
+                CodeQueryRowField::required("target_id", Scalar::StableId),
+                CodeQueryRowField::optional("source_ast_id", Scalar::StableId),
+                CodeQueryRowField::optional("target_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("generation", Scalar::Integer),
+            ],
         }
     }
 }
@@ -784,6 +835,9 @@ impl CodeQueryResultValue {
             Self::Export { value } => Some(value.range),
             Self::DeclarationState { value } => value.range,
             Self::ReferenceEdge { value } => Some(value.range),
+            Self::StateEvent { value } => Some(value.range),
+            Self::FlowRelation { value } => Some(value.range),
+            Self::RewritePath { value } => Some(value.range),
             Self::QualifiedPath { value } => Some(value.range),
             Self::PathSegment { value } => Some(value.range),
         }
@@ -831,6 +885,9 @@ impl CodeQueryResultValue {
             Self::QualifiedPath { .. } => DetailedCodeQueryDomain::QualifiedPath,
             Self::PathSegment { .. } => DetailedCodeQueryDomain::PathSegment,
             Self::ReferenceEdge { .. } => DetailedCodeQueryDomain::ReferenceEdge,
+            Self::StateEvent { .. } => DetailedCodeQueryDomain::StateEvent,
+            Self::FlowRelation { .. } => DetailedCodeQueryDomain::FlowRelation,
+            Self::RewritePath { .. } => DetailedCodeQueryDomain::RewritePath,
         }
     }
 }
@@ -1707,6 +1764,99 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ReferenceEdge { value }, "edge_provenance") => {
             Some(Scalar::ConstrainedEnum(value.provenance))
         }
+        (CodeQueryResultValue::StateEvent { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::StateEvent { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::StateEvent { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "event_class") => {
+            Some(Scalar::ConstrainedEnum(value.event_class))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "subject") => {
+            Some(Scalar::ConstrainedEnum(value.subject))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "member") => {
+            value.member.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::StateEvent { value }, "subject_value") => {
+            Some(Scalar::Integer(value.subject_value as u64))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "program_point") => {
+            Some(Scalar::Integer(value.program_point as u64))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "value") => {
+            Some(Scalar::Integer(value.value as u64))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::StateEvent { value }, "generation") => {
+            Some(Scalar::Integer(value.generation))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::RewritePath { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "domain") => {
+            Some(Scalar::ConstrainedEnum(value.domain))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "origin_specifier") => {
+            Some(Scalar::String(&value.origin_specifier))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "declared_bound") => {
+            Some(Scalar::Integer(value.declared_bound as u64))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "step_count") => {
+            Some(Scalar::Integer(value.step_count as u64))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "fixed_point") => {
+            value.fixed_point.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RewritePath { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::RewritePath { value }, "generation") => {
+            Some(Scalar::Integer(value.generation))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::FlowRelation { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "certainty") => {
+            Some(Scalar::ConstrainedEnum(value.certainty))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "source_id") => {
+            Some(Scalar::StableId(&value.source.id))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "target_id") => {
+            Some(Scalar::StableId(&value.target.id))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "source_ast_id") => {
+            value.source.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "target_ast_id") => {
+            value.target.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::FlowRelation { value }, "generation") => {
+            Some(Scalar::Integer(value.generation))
+        }
         (CodeQueryResultValue::ReferenceEdge { value }, "generation") => {
             Some(Scalar::Integer(value.generation))
         }
@@ -1875,6 +2025,24 @@ pub enum DetailedCodeQueryKey {
         ast_id: Option<String>,
         target_fq_name: String,
         provenance: String,
+    },
+    StateEvent {
+        id: String,
+        ast_id: Option<String>,
+        procedure_id: String,
+        event_class: String,
+    },
+    FlowRelation {
+        id: String,
+        procedure_id: String,
+        relation: String,
+        certainty: String,
+    },
+    RewritePath {
+        id: String,
+        domain: String,
+        origin_specifier: String,
+        outcome: String,
     },
     QualifiedPath {
         id: String,
@@ -2064,6 +2232,18 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::ReferenceEdge { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::StateEvent,
+                            DetailedCodeQueryKey::StateEvent { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::FlowRelation,
+                            DetailedCodeQueryKey::FlowRelation { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::RewritePath,
+                            DetailedCodeQueryKey::RewritePath { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::QualifiedPath,
                             DetailedCodeQueryKey::QualifiedPath { .. }
                         )
@@ -2214,7 +2394,10 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::GenerationSite { .. }
         | CodeQueryResultValue::Export { .. }
         | CodeQueryResultValue::DeclarationState { .. }
-        | CodeQueryResultValue::ReferenceEdge { .. } => None,
+        | CodeQueryResultValue::ReferenceEdge { .. }
+        | CodeQueryResultValue::StateEvent { .. }
+        | CodeQueryResultValue::FlowRelation { .. }
+        | CodeQueryResultValue::RewritePath { .. } => None,
         CodeQueryResultValue::QualifiedPath { .. } | CodeQueryResultValue::PathSegment { .. } => {
             None
         }
@@ -2293,6 +2476,15 @@ fn assert_detailed_terminal_identities(
                 // digest, carried in the typed key like the environment
                 // domains above.
                 | DetailedCodeQueryDomain::ReferenceEdge
+                // A state event and a flow relation are identified by their
+                // own content-scoped digests in the typed key too; neither is
+                // artifact-backed, so neither carries a semantic identity
+                // (#1480).
+                | DetailedCodeQueryDomain::StateEvent
+                | DetailedCodeQueryDomain::FlowRelation
+                // A rewrite path is identified by its own content-scoped
+                // digest over the domain, origin and derivation (#1480).
+                | DetailedCodeQueryDomain::RewritePath
                 // A path and its segments are likewise identified by their
                 // own content-scoped digests in the typed key.
                 | DetailedCodeQueryDomain::QualifiedPath
@@ -2347,7 +2539,10 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::GenerationSite { .. }
         | DetailedCodeQueryKey::Export { .. }
         | DetailedCodeQueryKey::DeclarationState { .. }
-        | DetailedCodeQueryKey::ReferenceEdge { .. } => None,
+        | DetailedCodeQueryKey::ReferenceEdge { .. }
+        | DetailedCodeQueryKey::StateEvent { .. }
+        | DetailedCodeQueryKey::FlowRelation { .. }
+        | DetailedCodeQueryKey::RewritePath { .. } => None,
         DetailedCodeQueryKey::QualifiedPath { .. } | DetailedCodeQueryKey::PathSegment { .. } => {
             None
         }

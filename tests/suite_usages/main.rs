@@ -10,6 +10,7 @@
 mod common;
 
 mod cpp_alias_primary_inverse_regression;
+mod cpp_issue_1967_macro_namespace_identity;
 mod cpp_member_dispatch_trace;
 mod csharp_bounded_receiver_hardening;
 mod csharp_ranks21_30_regression;
@@ -23,11 +24,18 @@ mod issue_1748_hierarchy_deadline;
 mod issue_1749_rust_macro_wrapped_inverse;
 mod issue_1785_js_file_scope_enclosing;
 mod issue_1786_flow_usage_suppression;
+mod issue_1788_non_js_file_scope_enclosing;
 mod issue_1819_cpp_macro_usages;
 mod issue_1854_scala_enclosing_def_shadow;
 mod issue_1855_scala_site_java_declaration;
 mod issue_1924_typescript_imported_returns;
 mod issue_1925_typescript_later_lexical_binding;
+mod issue_2026_php_direct_factory_receivers;
+mod issue_2034_rust_inverse_glob_precedence;
+mod issue_2055_python_module_qualified_attributes;
+mod issue_2056_python_module_receiver_root;
+mod issue_2073_go_package_variable_selector_base;
+mod issue_2112_rust_candidate_discovery;
 mod javascript_top30_residuals;
 mod kotlin_member_dispatch_trace;
 mod random_alias_recovery_test;

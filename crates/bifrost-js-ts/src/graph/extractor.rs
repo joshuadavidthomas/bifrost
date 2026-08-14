@@ -16,6 +16,7 @@ use crate::syntax::{
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
     pattern_binder_identifiers, slice, static_member_receiver,
+    typescript_enclosing_enum_initializer,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
@@ -1922,6 +1923,9 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && ctx.browser_global_object.is_none()
         && !ctx.binds_imported_target_value(text)
     {
+        if identifier_is_enclosing_enum_member_reference(node, text, ctx) {
+            record_hit(node, ctx);
+        }
         return;
     }
     if ctx.browser_global_object.is_some() && ctx.lexically_bound_at(text, node.start_byte()) {
@@ -1945,6 +1949,32 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     record_hit(node, ctx);
+}
+
+fn identifier_is_enclosing_enum_member_reference(
+    node: Node<'_>,
+    text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if ctx.language != Language::TypeScript || ctx.target_member != Some(text) {
+        return false;
+    }
+    let Some((declaration, assignment)) = typescript_enclosing_enum_initializer(node) else {
+        return false;
+    };
+    let Some(enum_name) = declaration.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    owner.source() == ctx.file
+        && owner.terminal_name() == slice(enum_name, ctx.source)
+        && ctx
+            .analyzer
+            .ranges(ctx.target)
+            .iter()
+            .any(|range| range.end_byte <= assignment.start_byte())
 }
 
 fn is_named_function_expression_declaration(node: Node<'_>) -> bool {

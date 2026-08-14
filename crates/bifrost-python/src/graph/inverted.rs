@@ -110,7 +110,25 @@ impl<'a> PythonEdgeScan<'a> {
                             &binding.module_specifier,
                         )
                         .unwrap_or_else(|| binding.module_specifier.clone());
-                        named.insert(local.clone(), format!("{module}.{imported}"));
+                        let imported_fqn = if module.ends_with('.') {
+                            format!("{module}{imported}")
+                        } else {
+                            format!("{module}.{imported}")
+                        };
+                        if let Some(imported_module) =
+                            canonical_import_module_fqn(graph, python, file, &imported_fqn)
+                        {
+                            namespace.insert(
+                                local.clone(),
+                                NamespaceBinding {
+                                    module: imported_module,
+                                    workspace_module: true,
+                                    consumed_attributes: 0,
+                                },
+                            );
+                        } else {
+                            named.insert(local.clone(), imported_fqn);
+                        }
                     }
                 }
                 ImportKind::Namespace => {
@@ -328,7 +346,7 @@ fn walk(
                 // assigns are local throughout it, so collect them up front. Resolve the
                 // scope's receiver-type facts once here and thread them down.
                 "function_definition" | "lambda" => {
-                    scopes.push(collect_function_scope(node, ctx.source));
+                    let function_scope = collect_function_scope(node, ctx.source);
                     let scope_facts = merged_enclosing_scope_facts(
                         ctx.graph,
                         ctx.file,
@@ -338,8 +356,7 @@ fn walk(
                         ctx.source,
                         facts,
                     );
-                    stack.push(WalkFrame::ExitScope);
-                    push_function_children(node, facts, scope_facts, &mut stack);
+                    push_function_children(node, facts, scope_facts, function_scope, &mut stack);
                 }
                 // A class body is not a function scope: code at the class-body level has
                 // no enclosing-function facts. Methods inside re-resolve their own facts.
@@ -372,6 +389,7 @@ fn walk(
             WalkFrame::ExitScope => {
                 scopes.pop();
             }
+            WalkFrame::EnterScope(scope) => scopes.push(scope),
         }
     }
 }
@@ -381,6 +399,7 @@ enum WalkFrame<'tree> {
         node: Node<'tree>,
         facts: Option<usize>,
     },
+    EnterScope(FunctionScope),
     ExitScope,
 }
 
@@ -400,9 +419,11 @@ fn push_function_children<'tree>(
     function: Node<'tree>,
     enclosing_facts: Option<usize>,
     body_facts: Option<usize>,
+    function_scope: FunctionScope,
     stack: &mut Vec<WalkFrame<'tree>>,
 ) {
     let body = function.child_by_field_name("body");
+    let mut function_scope = Some(function_scope);
     for index in (0..function.named_child_count()).rev() {
         if let Some(child) = function.named_child(index) {
             // Defaults and annotations are evaluated while defining the
@@ -413,7 +434,17 @@ fn push_function_children<'tree>(
             } else {
                 enclosing_facts
             };
-            stack.push(WalkFrame::Enter { node: child, facts });
+            if body == Some(child) {
+                stack.push(WalkFrame::ExitScope);
+                stack.push(WalkFrame::Enter { node: child, facts });
+                stack.push(WalkFrame::EnterScope(
+                    function_scope
+                        .take()
+                        .expect("a function has exactly one body scope"),
+                ));
+            } else {
+                stack.push(WalkFrame::Enter { node: child, facts });
+            }
         }
     }
 }

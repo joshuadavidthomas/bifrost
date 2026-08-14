@@ -2247,6 +2247,32 @@ pub type Selected = <LocalRunner as Runner>::Output;
 }
 
 #[test]
+fn rust_rootless_associated_type_navigation_uses_trait_contract() {
+    let source = r#"trait RustRunner { type Output; }
+struct LocalRustRunner;
+impl RustRunner for LocalRustRunner { type Output = String; }
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let impl_item = source.find("type Output =").expect("impl associated type") + 5;
+    let declaration = lookup_declaration(
+        project.root(),
+        &location_reference("lib.rs", source, impl_item),
+    );
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["fqn"], "RustRunner.Output",
+        "{declaration}"
+    );
+}
+
+#[test]
 fn java_declaration_navigation_uses_interface_receiver_contract() {
     let source = r#"
 interface Runner { void run(); }
@@ -3904,6 +3930,28 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+#[test]
+fn csharp_nested_type_precedes_same_named_namespace_type() {
+    let source = "namespace N { class Result {} class Outer<T> { public class Result {} private class Inner { public Result Value => null!; } } }";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("CollectionTally.cs", source)
+        .build();
+    let reference = source
+        .find("Result Value")
+        .expect("nested result type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("CollectionTally.cs", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer`1$Result",
+        "{value}"
+    );
+}
+
 // #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
 // ENCLOSING type declaration after the innermost type and its base chain are
 // exhausted. The nested caller's own base chain is empty here, so only the
@@ -4348,6 +4396,7 @@ namespace App {
         }
     }
 }
+
 "#,
         )
         .build();
@@ -4365,6 +4414,36 @@ namespace App {
     assert_eq!(result["status"], "no_type", "{value}");
     assert_eq!(
         result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_local_function_declaration_name_is_not_a_reference() {
+    let source = r#"namespace App;
+public class Contains {}
+public class Use {
+    public void Run() {
+        static void Contains(int value) {}
+        Contains(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Use.cs", source)
+        .build();
+    let declaration = source
+        .find("Contains(int value)")
+        .expect("local function declaration");
+    let value = lookup(
+        project.root(),
+        &location_reference("Use.cs", source, declaration),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "declaration_or_import_site",
         "{value}"
     );
 }
@@ -8274,7 +8353,7 @@ impl Provider {
     let result = &value["results"][0];
     assert_eq!(result["status"], "no_definition", "{value}");
     assert_eq!(
-        result["diagnostics"][0]["kind"], "local_receiver",
+        result["diagnostics"][0]["kind"], "local_variable_reference",
         "{value}"
     );
 
@@ -11969,7 +12048,7 @@ function render() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.js.classes.enabled",
+        result["definitions"][0]["fqn"], "classes.enabled",
         "{value}"
     );
     assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
@@ -12057,7 +12136,7 @@ bench.start();
     );
     assert_eq!(bench["results"][0]["status"], "resolved", "{bench}");
     assert_eq!(
-        bench["results"][0]["definitions"][0]["fqn"], "app.js.bench",
+        bench["results"][0]["definitions"][0]["fqn"], "bench",
         "{bench}"
     );
 }
@@ -12538,7 +12617,7 @@ function callLocal() {
         "{local_value}"
     );
     assert_eq!(
-        local_value["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.LOCALE",
+        local_value["results"][0]["definitions"][0]["fqn"], "googLocal.LOCALE",
         "{local_value}"
     );
 
@@ -12558,7 +12637,7 @@ function callLocal() {
         "{local_call}"
     );
     assert_eq!(
-        local_call["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.getMsg",
+        local_call["results"][0]["definitions"][0]["fqn"], "googLocal.getMsg",
         "{local_call}"
     );
 }
@@ -13968,7 +14047,7 @@ function accepts(value) {
     let result = &receiver_value["results"][0];
     assert_eq!(result["status"], "resolved", "{receiver_value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.js.re_aggrWithExpression",
+        result["definitions"][0]["fqn"], "re_aggrWithExpression",
         "{receiver_value}"
     );
     assert_eq!(

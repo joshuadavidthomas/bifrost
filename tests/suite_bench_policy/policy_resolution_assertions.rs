@@ -5,7 +5,7 @@
 //! `the_loop_invariance_verdict_separates_the_two_fixture_halves`: the 284
 //! false positives that motivated this slice reduce to one missing predicate --
 //! is the value operated on inside this loop declared inside or outside the
-//! loop body? -- and `assert-reaching` answers it as a policy, on both halves
+//! loop body? -- and `assert-binding-scope` answers it as a policy, on both halves
 //! of one fixture, with nothing but the binding's declaring scope to go on.
 //!
 //! Every test asserts the run's completion before reading its findings. The
@@ -256,9 +256,9 @@ fn the_loop_invariance_verdict_separates_the_two_fixture_halves() {
     // re-sorted every iteration.
     let inside_required = evaluate(
         &policy(
-            "test.reaching.inside",
+            "test.binding-scope.inside",
             SORT_IN_LOOP_SUBJECT,
-            r#"(assert-reaching :id invariant :at "target" :role value_reference
+            r#"(assert-binding-scope :id invariant :at "target" :role value_reference
                           :declared inside :relative-to "region")"#,
         ),
         &analyzer,
@@ -288,7 +288,7 @@ fn the_loop_invariance_verdict_separates_the_two_fixture_halves() {
     let PolicyFindingEvidence::Assertion { evidence } = finding.evidence() else {
         panic!("assertion policies produce assertion evidence");
     };
-    assert_eq!(evidence.assert_kind(), "reaching");
+    assert_eq!(evidence.assert_kind(), "binding_scope");
     assert_eq!(
         evidence.observed(),
         Some("binding `rows` is declared outside capture `region`"),
@@ -300,7 +300,7 @@ fn the_loop_invariance_verdict_separates_the_two_fixture_halves() {
         .map(|related| related.relationship())
         .collect::<Vec<_>>();
     assert!(
-        relationships.contains(&PolicyLocationRelationship::ReachingBinding),
+        relationships.contains(&PolicyLocationRelationship::BindingOf),
         "{relationships:?}"
     );
     assert!(
@@ -310,9 +310,9 @@ fn the_loop_invariance_verdict_separates_the_two_fixture_halves() {
 
     let outside_required = evaluate(
         &policy(
-            "test.reaching.outside",
+            "test.binding-scope.outside",
             SORT_IN_LOOP_SUBJECT,
-            r#"(assert-reaching :id per-iteration :at "target" :role value_reference
+            r#"(assert-binding-scope :id per-iteration :at "target" :role value_reference
                           :declared outside :relative-to "region")"#,
         ),
         &analyzer,
@@ -456,9 +456,9 @@ fn unsatisfiable_resolution_asserts_are_rejected_at_decode_time() {
     );
 
     let self_containment = policy(
-        "test.reaching.contradiction",
+        "test.binding-scope.contradiction",
         VALUE_SUBJECT,
-        r#"(assert-reaching :id a :at "target" :role value_reference
+        r#"(assert-binding-scope :id a :at "target" :role value_reference
                       :declared outside :relative-to "target")"#,
     );
     assert!(
@@ -488,11 +488,15 @@ fn the_formatter_round_trips_the_three_new_records() {
         "test.resolution.format",
         SORT_IN_LOOP_SUBJECT,
         r#"(assert-resolution :id a :at "target" :role value_reference :expect-tier lexical_binding)
-       (assert-reaching :id b :at "target" :role value_reference :declared outside :relative-to "region")
+       (assert-binding-scope :id b :at "target" :role value_reference :declared outside :relative-to "region")
        (assert-boundary :id c :at "target" :role value_reference :forbid-fallback-past external_unknown)"#,
     );
     let formatted = format_rqlp_source(&source).expect("formattable");
-    for head in ["(assert-resolution", "(assert-reaching", "(assert-boundary"] {
+    for head in [
+        "(assert-resolution",
+        "(assert-binding-scope",
+        "(assert-boundary",
+    ] {
         assert!(formatted.contains(head), "{formatted}");
     }
     assert_eq!(
@@ -531,7 +535,7 @@ fn stdout_of(output: &Output) -> String {
 /// declared, one policy, and opposite exit codes. This is the shape a
 /// conformance fixture reuses.
 const LOOP_INVARIANT_POLICY: &str = r#"(policy
-  :id "test.reaching.loop-invariant-receiver"
+  :id "test.binding-scope.loop-invariant-receiver"
   :name "Sorted receiver is loop-invariant"
   :message "the sorted list is declared outside the loop, so every iteration sorts the same list"
   :severity warning
@@ -540,7 +544,7 @@ const LOOP_INVARIANT_POLICY: &str = r#"(policy
     :subject (rql (inside (loop :capture "region")
                           (call :callee (name "sort") :args [(capture "target")])))
     :asserts [
-      (assert-reaching :id declared-inside :at "target" :role value_reference
+      (assert-binding-scope :id declared-inside :at "target" :role value_reference
                        :declared inside :relative-to "region")
     ]))"#;
 
@@ -564,8 +568,11 @@ fn the_policy_cli_separates_the_fixture_pair_and_renders_the_same_locations_ever
         String::from_utf8_lossy(&human.stderr)
     );
     let human_text = stdout_of(&human);
-    assert!(human_text.contains("reaching assertion"), "{human_text}");
-    assert!(human_text.contains("reaching_binding"), "{human_text}");
+    assert!(
+        human_text.contains("binding_scope assertion"),
+        "{human_text}"
+    );
+    assert!(human_text.contains("binding_of"), "{human_text}");
     assert!(human_text.contains("declaring_scope"), "{human_text}");
 
     let json = bifrost_policy_run(invariant.root(), "policies/loop-invariant.rqlp", "json");
@@ -573,7 +580,10 @@ fn the_policy_cli_separates_the_fixture_pair_and_renders_the_same_locations_ever
     let report: Value = serde_json::from_slice(&json.stdout).expect("JSON report");
     let finding = &report["runs"][0]["findings"][0];
     assert_eq!(finding["evidence"]["type"], "assertion");
-    assert_eq!(finding["evidence"]["evidence"]["assert_kind"], "reaching");
+    assert_eq!(
+        finding["evidence"]["evidence"]["assert_kind"],
+        "binding_scope"
+    );
     let json_relationships = finding["related"]
         .as_array()
         .expect("related locations")
@@ -581,7 +591,7 @@ fn the_policy_cli_separates_the_fixture_pair_and_renders_the_same_locations_ever
         .map(|related| related["relationship"].as_str().unwrap_or_default())
         .collect::<Vec<_>>();
     assert!(
-        json_relationships.contains(&"reaching_binding")
+        json_relationships.contains(&"binding_of")
             && json_relationships.contains(&"declaring_scope"),
         "{json_relationships:?}"
     );
@@ -604,7 +614,7 @@ fn the_policy_cli_separates_the_fixture_pair_and_renders_the_same_locations_ever
     assert!(
         sarif_relationships
             .iter()
-            .any(|text| text.contains("reaching binding")),
+            .any(|text| text.contains("binding of")),
         "{sarif_relationships:?}"
     );
     assert_eq!(

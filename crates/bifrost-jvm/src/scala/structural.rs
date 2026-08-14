@@ -363,6 +363,7 @@ impl StructuralSpec for ScalaStructuralSpec {
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
         _source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Function && enclosing == Some(NormalizedKind::Class) {
             NormalizedKind::Method

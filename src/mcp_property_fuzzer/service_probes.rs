@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -267,6 +267,13 @@ pub struct ProbeSummary {
     /// Go blank identifiers (`_`) skipped at generation: unaddressable, and
     /// every blank in a package shares one fq.
     pub symbols_excluded_blank_identifier: usize,
+    /// Symbols skipped at generation because their recorded terminal segment
+    /// is not identifier-shaped, so the bare-terminal spelling every
+    /// selector invariant starts from does not exist for them: JS/TS
+    /// object-literal keys such as `"data/web-interface.csv"`, C++
+    /// `operator<<`, JVM `<init>`. Counted rather than dropped silently, so a
+    /// corpus that is mostly such names is visible in the summary (#2111).
+    pub symbols_excluded_non_ident_identifier: usize,
     pub selector_probes: usize,
     pub definition_probes: usize,
     pub definition_batch_probes: usize,
@@ -279,6 +286,25 @@ pub struct ProbeSummary {
     pub follow_up_probes: usize,
     pub calls_executed: usize,
     pub calls_errored: usize,
+    /// Probes skipped unexecuted because their symbol's fq had already
+    /// exhausted `--symbol-time-budget-ms`: a pathological selector family
+    /// (phalcon's `PHP_METHOD` macro declarations resolve for ~25 minutes
+    /// per probe, #1927) would otherwise hold a shard for weeks. Skipped
+    /// probes carry no outcome and are excluded from every checker --
+    /// unexecuted is neither pass nor fail.
+    pub calls_skipped_time_budget: usize,
+    /// Distinct symbol fqs that tripped the time budget at least once.
+    pub symbols_time_budgeted: usize,
+    /// Eligible (post-filter, in-shard) symbols carrying each anomaly signal;
+    /// a symbol can carry several. See [`super::AnomalySignals`].
+    pub symbols_flagged_duplicate_fq: usize,
+    pub symbols_flagged_generated_file: usize,
+    pub symbols_flagged_exotic_name: usize,
+    pub symbols_flagged_parse_error_file: usize,
+    /// Service-sample slots filled from the anomaly-flagged pool under
+    /// `--anomaly-percent`; 0 either when the percent is 0 or when no
+    /// eligible symbol was flagged.
+    pub symbols_anomaly_selected: usize,
     pub render_mode_comparisons: usize,
     /// Render-mode comparisons whose payloads differed but where at least one
     /// side reported wall-clock partiality (`summary.partial`): the two modes
@@ -288,6 +314,11 @@ pub struct ProbeSummary {
     /// (#1336).
     pub skipped_render_partial: usize,
     pub i1c_source_text_checks: usize,
+    /// I1(c) blocks whose recorded `text` hit the record-string cap
+    /// ([`DUMP_PAYLOAD_EXCERPT_BYTES`]), so only the retained prefix could be
+    /// compared. Every block bigger than the cap lands here: a 141-line Java
+    /// class is 5.6 KB of legitimate source (#1775).
+    pub i1c_prefix_only_checks: usize,
     /// I1(c) blocks whose file was outside the sampled input (or had no
     /// source text available): unverifiable, neither pass nor fail.
     pub skipped_unsampled_source: usize,
@@ -434,6 +465,7 @@ pub fn run_service_invariants(
         &mut probes,
         summary,
         probe_parallelism,
+        config.symbol_time_budget_ms,
         dump_writer.as_mut(),
     )?;
     let mut follow_ups = derive_follow_ups(&probes, config, summary);
@@ -442,9 +474,16 @@ pub fn run_service_invariants(
         &mut follow_ups,
         summary,
         probe_parallelism,
+        config.symbol_time_budget_ms,
         dump_writer.as_mut(),
     )?;
-    let records: Vec<&ProbeRecord> = probes.iter().chain(follow_ups.iter()).collect();
+    // Over-budget probes were never executed: they carry no outcome and are
+    // not evidence for any checker.
+    let records: Vec<&ProbeRecord> = probes
+        .iter()
+        .chain(follow_ups.iter())
+        .filter(|probe| probe.outcome.is_some())
+        .collect();
 
     let mut sink = ViolationSink::default();
     check_render_mode_drift(&records, language, &mut sink, summary);
@@ -608,6 +647,11 @@ fn cap_strings_for_record(value: Value) -> Value {
     }
 }
 
+/// The two halves of the marker [`truncate_record_string`] appends. Parsed
+/// back by [`retained_prefix`], so the format lives in exactly one place.
+const TRUNCATION_MARKER_OPEN: &str = "...[truncated, ";
+const TRUNCATION_MARKER_CLOSE: &str = " bytes total]";
+
 fn truncate_record_string(text: String) -> String {
     if text.len() <= DUMP_PAYLOAD_EXCERPT_BYTES {
         return text;
@@ -616,7 +660,26 @@ fn truncate_record_string(text: String) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...[truncated, {} bytes total]", &text[..end], text.len())
+    format!(
+        "{}{TRUNCATION_MARKER_OPEN}{}{TRUNCATION_MARKER_CLOSE}",
+        &text[..end],
+        text.len()
+    )
+}
+
+/// The prefix a capped string retained, when `text` is one this run capped.
+///
+/// A checker that reads a `text` payload is reading a record-time excerpt, not
+/// the tool's answer: comparing the excerpt against the whole reported range
+/// reports a contract break for every block over the cap, which is what made
+/// boost's preprocessor headers and chromium's Java classes share one I1(c)
+/// signature (#1775). The declared total must exceed what is left after the
+/// marker, so a source file that literally contains the marker text is not
+/// mistaken for a capped payload.
+fn retained_prefix(text: &str) -> Option<&str> {
+    let (prefix, total) = text.rsplit_once(TRUNCATION_MARKER_OPEN)?;
+    let total: usize = total.strip_suffix(TRUNCATION_MARKER_CLOSE)?.parse().ok()?;
+    (total > prefix.len()).then_some(prefix)
 }
 
 /// The JSONL line for one executed probe record: identity, exact arguments,
@@ -738,12 +801,27 @@ fn generate_probes(
     summary: &mut ProbeSummary,
 ) -> Vec<ProbeRecord> {
     let mut service_symbols: Vec<usize> = Vec::new();
+    let mut eligible: Vec<usize> = Vec::new();
     for (index, symbol) in input.symbols.iter().enumerate() {
         if invalid.contains(&index) {
             summary.symbols_excluded_range_invalid += 1;
             continue;
         }
-        if symbol.ranges.is_empty() || !is_ident_like(&symbol.identifier) {
+        if symbol.ranges.is_empty() {
+            continue;
+        }
+        // A module unit is named after its file (`utils.ts`), which is not
+        // identifier-shaped; I2 excludes it by kind further down, with its own
+        // counter, and the other invariants still probe it. So the
+        // identifier-shape gate applies to every other kind only.
+        //
+        // Until #2111 this exemption was unnecessary by accident: the fuzzer
+        // read a symbol's terminal through a helper that split the rendered
+        // name on `.`, so a module unit arrived here spelled `ts` and a
+        // slash-bearing object-literal key arrived spelled `csv`. Both passed
+        // the gate, and both produced selector spellings that named nothing.
+        if symbol.kind != CodeUnitType::Module && !is_ident_like(&symbol.identifier) {
+            summary.symbols_excluded_non_ident_identifier += 1;
             continue;
         }
         // Go blank identifiers (`var _ Iface = ...`): unaddressable by any
@@ -770,10 +848,54 @@ fn generate_probes(
         {
             continue;
         }
-        service_symbols.push(index);
-        if service_symbols.len() >= config.max_service_symbols {
-            break;
+        eligible.push(index);
+    }
+    for &index in &eligible {
+        let signals = &input.symbols[index].anomaly_signals;
+        if signals.duplicate_fq {
+            summary.symbols_flagged_duplicate_fq += 1;
         }
+        if signals.generated_file {
+            summary.symbols_flagged_generated_file += 1;
+        }
+        if signals.exotic_name {
+            summary.symbols_flagged_exotic_name += 1;
+        }
+        if signals.parse_error_file {
+            summary.symbols_flagged_parse_error_file += 1;
+        }
+    }
+    if config.anomaly_percent == 0 {
+        // Historical behavior: the first N eligible symbols in census order.
+        service_symbols = eligible
+            .into_iter()
+            .take(config.max_service_symbols)
+            .collect();
+    } else {
+        // Anomaly-directed composition: flagged symbols (campaign-proven
+        // suspicion strata) fill up to anomaly_percent of the cap, the
+        // uniform census-order draw fills the rest, and leftovers from either
+        // pool flow to the other so small or anomaly-poor repos still reach
+        // the cap. Both pools preserve census order, so runs reproduce.
+        let cap = config.max_service_symbols;
+        let quota = cap * config.anomaly_percent as usize / 100;
+        let mut flagged: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&index| input.symbols[index].anomaly_signals.any())
+            .collect();
+        let mut unflagged: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&index| !input.symbols[index].anomaly_signals.any())
+            .collect();
+        let take_flagged = flagged.len().min(quota);
+        service_symbols.extend(flagged.drain(..take_flagged));
+        summary.symbols_anomaly_selected = take_flagged;
+        let take_uniform = unflagged.len().min(cap - service_symbols.len());
+        service_symbols.extend(unflagged.drain(..take_uniform));
+        let backfill = flagged.len().min(cap - service_symbols.len());
+        service_symbols.extend(flagged.drain(..backfill));
     }
     summary.symbols_sampled = service_symbols.len();
 
@@ -1082,11 +1204,12 @@ fn execute_probes(
     probes: &mut [ProbeRecord],
     summary: &mut ProbeSummary,
     probe_parallelism: usize,
+    symbol_time_budget_ms: u64,
     mut dump: Option<&mut std::io::BufWriter<std::fs::File>>,
 ) -> Result<(), String> {
     // Owned work items: workers never borrow the probe slice, which keeps the
     // borrow story trivial and lets the calling thread apply results.
-    let work: Vec<(usize, &'static str, Value, bool, String)> = probes
+    let work: Vec<(usize, &'static str, Value, bool, String, String)> = probes
         .iter()
         .enumerate()
         .filter(|(_, probe)| probe.outcome.is_none())
@@ -1098,6 +1221,7 @@ fn execute_probes(
                 // Scans are the expensive calls; they run single-mode.
                 !matches!(probe.kind, ProbeKind::Scan { .. }),
                 probe.id.clone(),
+                probe.symbol_fq.clone(),
             )
         })
         .collect();
@@ -1107,19 +1231,44 @@ fn execute_probes(
     }
     let worker_count = probe_parallelism.min(work.len()).max(1);
     let next = AtomicUsize::new(0);
-    let (sender, receiver) = mpsc::channel::<(usize, ProbeOutcome, bool, u64)>();
+    // Cumulative executed wall-clock per symbol fq, applied by the receiver as
+    // outcomes land. Workers consult it before starting a probe, so once a
+    // pathological family trips the budget its remaining probes skip after at
+    // most one worker wave of overshoot.
+    let spent = Mutex::new(HashMap::<String, u64>::new());
+    // A `None` outcome marks a budget-skipped probe: it never executed, so the
+    // receiver leaves its record outcome-less and the checkers never see it.
+    let (sender, receiver) = mpsc::channel::<(usize, Option<ProbeOutcome>, bool, u64)>();
     thread::scope(|scope| -> Result<(), String> {
         for _ in 0..worker_count {
             let next = &next;
+            let spent = &spent;
             let sender = sender.clone();
             let work = &work;
             scope.spawn(move || {
                 loop {
                     let claim = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((index, tool, arguments, run_mode_b, probe_id)) = work.get(claim)
+                    let Some((index, tool, arguments, run_mode_b, probe_id, symbol_fq)) =
+                        work.get(claim)
                     else {
                         break;
                     };
+                    if symbol_time_budget_ms > 0 {
+                        let over = spent
+                            .lock()
+                            .expect("probe budget mutex poisoned")
+                            .get(symbol_fq)
+                            .is_some_and(|total| *total >= symbol_time_budget_ms);
+                        if over {
+                            if trace {
+                                eprintln!("[probe-skip] budget exhausted {tool} {probe_id}");
+                            }
+                            if sender.send((*index, None, false, 0)).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     if trace {
                         eprintln!("[probe-start] {tool} {probe_id}");
                     }
@@ -1140,7 +1289,7 @@ fn execute_probes(
                         eprintln!("[probe-done] {elapsed_ms}ms {tool} {probe_id}");
                     }
                     if sender
-                        .send((*index, outcome, compared_modes, elapsed_ms))
+                        .send((*index, Some(outcome), compared_modes, elapsed_ms))
                         .is_err()
                     {
                         break;
@@ -1153,7 +1302,13 @@ fn execute_probes(
         // for a finished probe must reach disk even when a sibling probe runs
         // for days (#1689 -- the collect-then-apply shape still withheld every
         // record until the slowest probe in the wave returned).
+        let mut budgeted_fqs = HashSet::new();
         for (index, outcome, compared_modes, elapsed_ms) in receiver.iter() {
+            let Some(outcome) = outcome else {
+                summary.calls_skipped_time_budget += 1;
+                budgeted_fqs.insert(probes[index].symbol_fq.clone());
+                continue;
+            };
             if compared_modes {
                 summary.render_mode_comparisons += 1;
             }
@@ -1161,12 +1316,20 @@ fn execute_probes(
                 summary.calls_errored += 1;
             }
             summary.calls_executed += 1;
+            if symbol_time_budget_ms > 0 {
+                *spent
+                    .lock()
+                    .expect("probe budget mutex poisoned")
+                    .entry(probes[index].symbol_fq.clone())
+                    .or_default() += elapsed_ms;
+            }
             probes[index].elapsed_ms = Some(elapsed_ms);
             probes[index].outcome = Some(outcome);
             if let Some(writer) = dump.as_deref_mut() {
                 write_probe_record_line(writer, &probes[index])?;
             }
         }
+        summary.symbols_time_budgeted += budgeted_fqs.len();
         Ok(())
     })
 }
@@ -1670,7 +1833,16 @@ pub fn check_i1c(
                 ));
                 continue;
             };
-            if !text_matches_reported_lines(&expected, text) {
+            // A capped payload makes no claim past its cap: compare what the
+            // record kept, and count the reduced coverage (#1775).
+            let matched = match retained_prefix(text) {
+                Some(prefix) => {
+                    summary.i1c_prefix_only_checks += 1;
+                    text_prefix_matches_reported_lines(&expected, prefix)
+                }
+                None => text_matches_reported_lines(&expected, text),
+            };
+            if !matched {
                 sink.record(violation(
                     InvariantKind::I1,
                     language,
@@ -1704,19 +1876,7 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    // Split the returned text with the same mixed-ending convention as
-    // line_slice: `str::lines` splits on `\n` alone, so a CR-only file's
-    // block reads as one line and never matches its multi-row range
-    // (erupt's EruptModifyController.java, #1431).
-    let mut text_lines: Vec<&str> = Vec::new();
-    let mut rest = text;
-    while let Some((line, remaining)) = split_mixed_line(rest) {
-        text_lines.push(line);
-        rest = remaining;
-    }
-    if !rest.is_empty() {
-        text_lines.push(rest);
-    }
+    let text_lines = mixed_lines(text);
     let expected: Vec<&str> = expected
         .iter()
         .map(|line| line.trim_end_matches('\r'))
@@ -1749,6 +1909,46 @@ fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
                 || strip_type_keyword(text_lines[index])
                     .is_some_and(|stripped| expected[index] == stripped)
         })
+}
+
+/// Split with the same mixed-ending convention as `line_slice`: `str::lines`
+/// splits on `\n` alone, so a CR-only file's block reads as one line and never
+/// matches its multi-row range (erupt's EruptModifyController.java, #1431).
+fn mixed_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some((line, remaining)) = split_mixed_line(rest) {
+        lines.push(line);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+/// [`text_matches_reported_lines`] for a payload the record capped: the same
+/// line anchoring over however many lines survived, with the cut line read as
+/// a prefix of its file line. Coverage stops at the cap, so this can only
+/// clear a block's head -- the summary counts it separately for that reason.
+fn text_prefix_matches_reported_lines(expected: &[&str], prefix: &str) -> bool {
+    let prefix_lines = mixed_lines(prefix);
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    if prefix_lines.is_empty() || prefix_lines.len() > expected.len() {
+        return false;
+    }
+    let last = prefix_lines.len() - 1;
+    if last == 0 {
+        // One retained line, cut at both ends: it can sit anywhere inside the
+        // block's first file line.
+        return expected[0].contains(prefix_lines[0]);
+    }
+    expected[0].ends_with(prefix_lines[0])
+        && expected[last].starts_with(prefix_lines[last])
+        && (1..last).all(|index| expected[index] == prefix_lines[index])
 }
 
 /// Strip a deliberately re-inserted `type` keyword (Go embedded fields
@@ -2565,11 +2765,11 @@ pub fn check_i4(
 }
 
 /// I5: every failure-status response must carry actionable next-step content.
-/// What counts as actionable per tool: a `note` on not-found entries, a
-/// non-empty matches/candidates list on ambiguous entries, diagnostics with
-/// messages on definition lookups, a message on scan failures, or a note on
-/// empty searches. A response with no content and no failure payload at all
-/// is an empty refusal.
+/// What counts as actionable per tool: a `note` on not-found and too-broad
+/// entries, a non-empty matches/candidates list on ambiguous entries,
+/// diagnostics with messages on definition lookups, a message on scan
+/// failures, or a note on empty searches. A response with no content and no
+/// failure payload at all is an empty refusal.
 pub fn check_i5(
     records: &[&ProbeRecord],
     language: &str,
@@ -2609,6 +2809,24 @@ pub fn check_i5(
                             "kind": "ambiguous",
                             "target": entry.get("target"),
                             "problem": "no candidate list",
+                        }));
+                    }
+                }
+                // A skipped target is a failure payload too. The
+                // declarations flavour carries no sample by construction (the
+                // candidate list is the work the cap skipped), so its `note`
+                // is the whole of its guidance; without examining this field
+                // at all, every over-cap selector read as an empty refusal
+                // (#2111).
+                for entry in array_field(structured, "too_broad") {
+                    any_failure_payload = true;
+                    examined += 1;
+                    let note = entry.get("note").and_then(Value::as_str).unwrap_or("");
+                    if note.trim().is_empty() {
+                        failures.push(json!({
+                            "kind": "too_broad",
+                            "target": entry.get("target"),
+                            "problem": "missing corrective note",
                         }));
                     }
                 }
@@ -2783,5 +3001,244 @@ mod tests {
         let text = capped["blocks"][0]["text"].as_str().unwrap();
         assert!(text.contains("[truncated,"));
         assert!(text.len() < DUMP_PAYLOAD_EXCERPT_BYTES * 2);
+    }
+
+    /// #1775: `check_i1c` reads a record-time excerpt, not the tool's answer.
+    /// Every source block over the record-string cap used to fail the whole
+    /// line-anchored comparison, which is how boost's preprocessor headers and
+    /// chromium's 141-line Java classes came to share one I1(c) signature.
+    #[test]
+    fn oversized_source_block_is_checked_against_its_retained_prefix() {
+        let file_text: String = (1..=400).map(|row| format!("line {row} text\n")).collect();
+        let block_text = file_text.clone();
+        let end_line = 400;
+
+        let input = I1Input {
+            files: vec![crate::mcp_property_fuzzer::I1File {
+                path: "src/Big.java".to_string(),
+                text: Some(file_text.clone()),
+                parse_errors: None,
+            }],
+            symbols: Vec::new(),
+        };
+        assert!(
+            block_text.len() > DUMP_PAYLOAD_EXCERPT_BYTES,
+            "the fixture must exceed the record-string cap to exercise the capped path"
+        );
+
+        let faithful = i1c_violations(&input, &file_text, block_text.clone(), 1, end_line);
+        assert!(
+            faithful.is_empty(),
+            "a faithful oversized block must clear I1(c): {faithful:#?}"
+        );
+
+        // The same block with one interior line rewritten must still fail,
+        // as long as the divergence is inside the retained prefix.
+        let corrupted = block_text.replacen("line 7 text", "line 7 TEXT", 1);
+        let violations = i1c_violations(&input, &file_text, corrupted, 1, end_line);
+        assert_eq!(
+            1,
+            violations.len(),
+            "a divergence inside the retained prefix must still be reported: {violations:#?}"
+        );
+    }
+
+    fn i1c_violations(
+        input: &I1Input,
+        file_text: &str,
+        block_text: String,
+        start_line: usize,
+        end_line: usize,
+    ) -> Vec<crate::mcp_property_fuzzer::Violation> {
+        assert!(
+            file_text.len() > DUMP_PAYLOAD_EXCERPT_BYTES,
+            "the fixture file must be big enough for the cap to bite"
+        );
+        let record = ProbeRecord {
+            id: "i2:get_symbol_sources#0:Big".to_string(),
+            tool: "get_symbol_sources",
+            arguments: json!({"symbols": ["Big"]}),
+            symbol_fq: "Big".to_string(),
+            symbol_path: "src/Big.java".to_string(),
+            kind: ProbeKind::Spelling {
+                order: 0,
+                spelling: "Big".to_string(),
+            },
+            outcome: Some(ProbeOutcome::Structured {
+                structured: cap_strings_for_record(json!({
+                    "sources": [{
+                        "path": "src/Big.java",
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "text": block_text,
+                    }],
+                })),
+                mode_b_structured: None,
+            }),
+            elapsed_ms: None,
+        };
+        let mut sink = ViolationSink::default();
+        let mut summary = ProbeSummary::default();
+        check_i1c(&[&record], input, "java", &mut sink, &mut summary);
+        assert_eq!(
+            1, summary.i1c_prefix_only_checks,
+            "an over-cap block must be counted as prefix-only coverage"
+        );
+        sink.into_sorted_vec()
+    }
+
+    // --- anomaly-directed service-sample composition ---
+
+    fn probe_symbol(
+        fq_name: &str,
+        signals: crate::mcp_property_fuzzer::AnomalySignals,
+    ) -> SymbolFacts {
+        SymbolFacts {
+            fq_name: fq_name.to_string(),
+            identifier: fq_name.to_string(),
+            display_fq: fq_name.to_string(),
+            kind: CodeUnitType::Function,
+            language: crate::analyzer::Language::Scala,
+            file_index: 0,
+            ranges: vec![crate::analyzer::Range {
+                start_byte: 0,
+                end_byte: 10,
+                start_line: 1,
+                end_line: 1,
+            }],
+            child_indexes: Vec::new(),
+            parent_index: None,
+            aux_constructor: false,
+            anomaly_signals: signals,
+        }
+    }
+
+    fn probe_input(symbols: Vec<SymbolFacts>) -> I1Input {
+        I1Input {
+            files: vec![crate::mcp_property_fuzzer::I1File {
+                path: "src/Fixture.scala".to_string(),
+                text: None,
+                parse_errors: None,
+            }],
+            symbols,
+        }
+    }
+
+    fn probe_config(max_service_symbols: usize, anomaly_percent: u8) -> FuzzerConfig {
+        FuzzerConfig {
+            corpus_language: "scala".to_string(),
+            invariants: vec![InvariantKind::I2],
+            max_symbols: 5_000,
+            max_service_symbols,
+            max_scan_probes: 0,
+            symbol_time_budget_ms: 0,
+            anomaly_percent,
+            symbol_filter: None,
+            path_filter: None,
+            shard: None,
+            seed: 0,
+        }
+    }
+
+    /// The service sample's symbol fqs in selection order, read off the
+    /// `get_symbol_sources#0` probe ids (one per selected symbol).
+    fn selected_fqs(input: &I1Input, config: &FuzzerConfig) -> Vec<String> {
+        let mut summary = ProbeSummary::default();
+        let probes = generate_probes(input, &HashSet::new(), config, &mut summary);
+        let mut fqs: Vec<String> = probes
+            .iter()
+            .filter(|probe| probe.id.starts_with("i2:get_symbol_sources#0:"))
+            .map(|probe| probe.symbol_fq.clone())
+            .collect();
+        fqs.dedup();
+        fqs
+    }
+
+    #[test]
+    fn anomaly_selection_prioritizes_flagged_symbols_within_quota() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            duplicate_fq: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", Default::default()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", Default::default()),
+            probe_symbol("d", Default::default()),
+            probe_symbol("e", flagged()),
+            probe_symbol("f", Default::default()),
+        ]);
+        // cap 4, percent 50: quota 2 flagged (b, e in census order), uniform
+        // fill takes a, c.
+        assert_eq!(
+            selected_fqs(&input, &probe_config(4, 50)),
+            vec!["b", "e", "a", "c"]
+        );
+        // percent 100: quota covers every flagged symbol, no uniform fill.
+        assert_eq!(selected_fqs(&input, &probe_config(2, 100)), vec!["b", "e"]);
+    }
+
+    #[test]
+    fn anomaly_selection_zero_percent_matches_historical_census_order() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            generated_file: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", Default::default()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", Default::default()),
+            probe_symbol("d", flagged()),
+        ]);
+        assert_eq!(
+            selected_fqs(&input, &probe_config(3, 0)),
+            vec!["a", "b", "c"],
+            "percent 0 must reproduce the pre-strata first-N sample exactly"
+        );
+    }
+
+    #[test]
+    fn anomaly_selection_backfills_from_flagged_pool_when_uniform_runs_dry() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            exotic_name: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", flagged()),
+            probe_symbol("b", flagged()),
+            probe_symbol("c", flagged()),
+            probe_symbol("d", flagged()),
+            probe_symbol("e", flagged()),
+            probe_symbol("f", Default::default()),
+        ]);
+        // cap 4, percent 50: quota 2 flagged (a, b), uniform pool has only f,
+        // so the last slot backfills from the flagged pool (c).
+        assert_eq!(
+            selected_fqs(&input, &probe_config(4, 50)),
+            vec!["a", "b", "f", "c"]
+        );
+    }
+
+    #[test]
+    fn anomaly_selection_is_deterministic_and_reports_the_mix() {
+        let flagged = || crate::mcp_property_fuzzer::AnomalySignals {
+            duplicate_fq: true,
+            parse_error_file: true,
+            ..Default::default()
+        };
+        let input = probe_input(vec![
+            probe_symbol("a", flagged()),
+            probe_symbol("b", Default::default()),
+            probe_symbol("c", flagged()),
+        ]);
+        let config = probe_config(3, 50);
+        assert_eq!(selected_fqs(&input, &config), selected_fqs(&input, &config));
+
+        let mut summary = ProbeSummary::default();
+        generate_probes(&input, &HashSet::new(), &config, &mut summary);
+        assert_eq!(summary.symbols_flagged_duplicate_fq, 2);
+        assert_eq!(summary.symbols_flagged_parse_error_file, 2);
+        assert_eq!(summary.symbols_anomaly_selected, 1);
+        assert_eq!(summary.symbols_sampled, 3);
     }
 }

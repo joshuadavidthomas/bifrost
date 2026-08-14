@@ -25,6 +25,10 @@ use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::OwnerRelation;
 use brokk_bifrost_analysis::analyzer::structural::edges::EdgeAxis;
+use brokk_bifrost_analysis::analyzer::structural::flow_state::{
+    FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowStateRequest, FlowSubject,
+    StateEventClass, StateEventRow, flow_state_for_file,
+};
 use brokk_bifrost_analysis::analyzer::structural::materialization::MaterializationAxis;
 use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
     DeclarationStateRow, MaterializationFileResult, materialization_for_file,
@@ -33,6 +37,10 @@ use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceClass a
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
     EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
+};
+use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteOutcome;
+use brokk_bifrost_analysis::analyzer::structural::rewrite_paths::{
+    FileRewritePaths, RewritePathIncompleteReason, RewritePathRequest, rewrite_paths_for_file,
 };
 use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
@@ -63,8 +71,8 @@ use brokk_bifrost_analysis::analyzer::structural::{
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_rql::{
-    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
-    QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+    BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed,
+    OccurrenceSeed, QueryStep, SCHEMA_VERSION, ScopeSeed,
 };
 use std::sync::Arc;
 
@@ -79,12 +87,13 @@ use super::cvss::{
     CvssSeverity, CvssValidationError, PolicyOverlayScope, reduce_cvss_for_finding,
 };
 use super::definition::{
-    ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BoundaryAssert, CanonicalAssert,
-    CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric, CvssMetricValue,
-    CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
-    EdgeClassConstraint, EdgeParityAssert, FindingSeverity, GenerationAssert, OccurrenceAssert,
-    PolicyAnalysis, PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec,
-    PolicySeveritySpec, ReachingAssert, ResolutionAssert, RoundTripAssert, RouteAssert,
+    ASSERTION_SUBJECT_SELECTOR_PATH, AssertionPolicySpec, BindingScopeAssert, BoundaryAssert,
+    CanonicalAssert, CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric,
+    CvssMetricValue, CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
+    EdgeClassConstraint, EdgeParityAssert, EstablishmentRequirement, FindingSeverity,
+    FlowEstablishmentAssert, GenerationAssert, OccurrenceAssert, PolicyAnalysis,
+    PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
+    ResolutionAssert, RoundTripAssert, RouteAssert,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
@@ -1802,6 +1811,13 @@ fn assemble_taint_projection_batch(
                     super::cvss::CvssAssessmentSet::has_truncated_source_scenarios,
                 ))),
         );
+        let display_path = report.display_path;
+        debug_assert!(display_path.as_ref().is_none_or(|path| {
+            report
+                .witnesses
+                .iter()
+                .any(|witness| witness.id() == path.witness_id())
+        }));
         let finding = PolicyFinding::try_new(
             metadata.id.clone(),
             policy.semantic_hash(),
@@ -1829,7 +1845,10 @@ fn assemble_taint_projection_batch(
             budget,
         );
         match finding {
-            Ok(finding) if finding.id() == expected_id => findings.push(finding),
+            Ok(mut finding) if finding.id() == expected_id => {
+                finding.attach_display_path(display_path);
+                findings.push(finding);
+            }
             Err(error) if error.is_budget_limit_exceeded() => {
                 omit_finding_for_report_budget(
                     &mut validated.completion,
@@ -2226,6 +2245,9 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::DispatchTarget
             | QueryValueKind::MemberFamily
             | QueryValueKind::MemberFamilyEdge
+            | QueryValueKind::StateEvent
+            | QueryValueKind::FlowRelation
+            | QueryValueKind::RewritePath
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
@@ -2818,6 +2840,40 @@ fn terminal_presentation(
         ),
         CodeQueryResultValue::GenerationSite { value } => (
             DetailedCodeQueryDomain::GenerationSite,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        // The flow-state rows are exact records of what the derivation
+        // computed at this site; per-axis completeness is the row's own
+        // `completeness` field and the response's diagnostics, not a proof
+        // tier of the site itself (issue #1480; the temporal asserts that
+        // consume these arrive in milestone 5).
+        CodeQueryResultValue::StateEvent { value } => (
+            DetailedCodeQueryDomain::StateEvent,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        // A rewrite-path row is an exact record of a bounded chase the
+        // production analysis ran; its completeness is the row's own
+        // `completeness` field and the response's diagnostics, not a proof tier
+        // of the origin site (issue #1480; the termination assert that consumes
+        // these arrives in milestone 5).
+        CodeQueryResultValue::RewritePath { value } => (
+            DetailedCodeQueryDomain::RewritePath,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::FlowRelation { value } => (
+            DetailedCodeQueryDomain::FlowRelation,
             value.path.as_str(),
             Some(value.range),
             Vec::new(),
@@ -3450,6 +3506,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::Export { .. } => "export",
         CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
         CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
+        CodeQueryResultRef::StateEvent { .. } => "state_event",
+        CodeQueryResultRef::FlowRelation { .. } => "flow_relation",
+        CodeQueryResultRef::RewritePath { .. } => "rewrite_path",
         CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
         CodeQueryResultRef::PathSegment { .. } => "path_segment",
     }
@@ -3494,7 +3553,10 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::GenerationSite { path, .. }
         | CodeQueryResultRef::Export { path, .. }
         | CodeQueryResultRef::DeclarationState { path, .. }
-        | CodeQueryResultRef::ReferenceEdge { path, .. } => path,
+        | CodeQueryResultRef::ReferenceEdge { path, .. }
+        | CodeQueryResultRef::StateEvent { path, .. }
+        | CodeQueryResultRef::FlowRelation { path, .. }
+        | CodeQueryResultRef::RewritePath { path, .. } => path,
         CodeQueryResultRef::QualifiedPath { path, .. }
         | CodeQueryResultRef::PathSegment { path, .. } => path,
     }
@@ -3535,7 +3597,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
-        DetailedCodeQueryDomain::Procedure
+        DetailedCodeQueryDomain::StateEvent
+        | DetailedCodeQueryDomain::FlowRelation
+        | DetailedCodeQueryDomain::RewritePath
+        | DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
         | DetailedCodeQueryDomain::TypestateFinding
@@ -3671,6 +3736,39 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_optional_hash(&mut hasher, ast_id.as_deref());
             update_hash(&mut hasher, target_fq_name.as_bytes());
             update_hash(&mut hasher, provenance.as_bytes());
+        }
+        DetailedCodeQueryKey::StateEvent {
+            id,
+            ast_id,
+            procedure_id,
+            event_class,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, event_class.as_bytes());
+        }
+        DetailedCodeQueryKey::FlowRelation {
+            id,
+            procedure_id,
+            relation,
+            certainty,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, relation.as_bytes());
+            update_hash(&mut hasher, certainty.as_bytes());
+        }
+        DetailedCodeQueryKey::RewritePath {
+            id,
+            domain,
+            origin_specifier,
+            outcome,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, domain.as_bytes());
+            update_hash(&mut hasher, origin_specifier.as_bytes());
+            update_hash(&mut hasher, outcome.as_bytes());
         }
         DetailedCodeQueryKey::QualifiedPath { id, ast_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -3849,6 +3947,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::MemberFamilyEdge => "member_family_edge",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
+        DetailedCodeQueryDomain::StateEvent => "state_event",
+        DetailedCodeQueryDomain::FlowRelation => "flow_relation",
+        DetailedCodeQueryDomain::RewritePath => "rewrite_path",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
@@ -3943,6 +4044,10 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
         | CodeQueryDiagnosticCode::EdgeAxisUnsupported
         | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
+        | CodeQueryDiagnosticCode::FlowStateAxisUnsupported
+        | CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
+        | CodeQueryDiagnosticCode::RewriteDomainUnsupported
+        | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
         | CodeQueryDiagnosticCode::IdentityAxisUnsupported
         | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete

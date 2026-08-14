@@ -7,18 +7,12 @@ import {
   MINIMUM_MCP_STARTUP_TIMEOUT_MS,
   SUPPORTED_TARGETS,
 } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
+import { validateAgentPluginDirectory } from "./check-agent-plugins-v1.mjs";
 import { readCargoVersion } from "./release-version.mjs";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
 const cargoVersion = readCargoVersion(cargoToml);
-
-const codexManifestPath = "plugins/bifrost-agent/.codex-plugin/plugin.json";
-const codexManifest = JSON.parse(fs.readFileSync(codexManifestPath, "utf8"));
-if (codexManifest.version !== cargoVersion) {
-  throw new Error(
-    `${codexManifestPath} version ${codexManifest.version} does not match Cargo.toml version ${cargoVersion}`,
-  );
-}
+validateAgentPluginDirectory("plugins/bifrost-agent", cargoVersion);
 
 const claudeManifestPath = "plugins/bifrost-agent/.claude-plugin/plugin.json";
 const claudeManifest = JSON.parse(fs.readFileSync(claudeManifestPath, "utf8"));
@@ -79,13 +73,8 @@ const sharedManifestFields = [
 for (const field of sharedManifestFields) {
   assert.deepStrictEqual(
     claudeManifest[field],
-    codexManifest[field],
-    `${claudeManifestPath} field ${field} does not match ${codexManifestPath}`,
-  );
-  assert.deepStrictEqual(
     cursorManifest[field],
-    codexManifest[field],
-    `${cursorManifestPath} field ${field} does not match ${codexManifestPath}`,
+    `${claudeManifestPath} field ${field} does not match ${cursorManifestPath}`,
   );
 }
 assert.deepStrictEqual(
@@ -99,14 +88,9 @@ assert.deepStrictEqual(
   `${cursorManifestPath} should use Bifrost-facing display text`,
 );
 assert.deepStrictEqual(
-  claudeManifest.author,
-  codexManifest.author,
-  `${claudeManifestPath} author does not match ${codexManifestPath}`,
-);
-assert.deepStrictEqual(
+  claudeManifest.author?.name,
   cursorManifest.author?.name,
-  codexManifest.author?.name,
-  `${cursorManifestPath} author name does not match ${codexManifestPath}`,
+  `${claudeManifestPath} author name does not match ${cursorManifestPath}`,
 );
 assert.deepStrictEqual(
   cursorManifest.logo,
@@ -114,11 +98,6 @@ assert.deepStrictEqual(
   `${cursorManifestPath} should reference the package icon`,
 );
 fs.accessSync("plugins/bifrost-agent/assets/icon.png", fsConstants.R_OK);
-assert.deepStrictEqual(
-  codexManifest.mcpServers,
-  "./.mcp.json",
-  `${codexManifestPath} should keep using the Codex MCP config`,
-);
 assert.deepStrictEqual(
   claudeManifest.mcpServers,
   "./claude-mcp.json",
@@ -131,7 +110,7 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
   cursorManifest.mcpServers,
-  "./mcp.json",
+  "./cursor-mcp.json",
   `${cursorManifestPath} should select Cursor's host-specific MCP config`,
 );
 fs.accessSync("plugins/bifrost-agent/assets/icon.png", fsConstants.R_OK);
@@ -141,24 +120,12 @@ if (!cursorPluginNamePattern.test(cursorManifest.name)) {
   throw new Error(`${cursorManifestPath} name must be lowercase kebab-case`);
 }
 
-const mcpPath = "plugins/bifrost-agent/.mcp.json";
-const mcpConfig = JSON.parse(fs.readFileSync(mcpPath, "utf8"));
 const claudeMcpPath = "plugins/bifrost-agent/claude-mcp.json";
 const claudeMcpConfig = JSON.parse(fs.readFileSync(claudeMcpPath, "utf8"));
 const claudeLspPath = "plugins/bifrost-agent/.lsp.json";
 const claudeLspConfig = JSON.parse(fs.readFileSync(claudeLspPath, "utf8"));
-const cursorMcpPath = "plugins/bifrost-agent/mcp.json";
+const cursorMcpPath = "plugins/bifrost-agent/cursor-mcp.json";
 const cursorMcpConfig = JSON.parse(fs.readFileSync(cursorMcpPath, "utf8"));
-assert.deepStrictEqual(
-  mcpConfig.mcpServers?.bifrost?.command,
-  "./bin/bifrost-launcher.mjs",
-  `${mcpPath} should launch the package-local Bifrost launcher`,
-);
-assert.deepStrictEqual(
-  mcpConfig.mcpServers?.bifrost?.cwd,
-  ".",
-  `${mcpPath} should retain Codex's package-relative working directory`,
-);
 assert.deepStrictEqual(
   claudeMcpConfig.mcpServers?.bifrost?.command,
   "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
@@ -216,11 +183,6 @@ assert.deepStrictEqual(
   `${cursorMcpPath} should not infer a workspace from Cursor's process directory`,
 );
 assert.deepStrictEqual(
-  mcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
-  ["--mcp", "symbol|extended"],
-  `${mcpPath} should use the default Bifrost MCP toolset`,
-);
-assert.deepStrictEqual(
   claudeMcpConfig.mcpServers?.bifrost?.args,
   ["--mcp", "symbol|extended"],
   `${claudeMcpPath} should start rootless with the default Bifrost MCP toolset`,
@@ -230,7 +192,6 @@ assert.deepStrictEqual(
   ["--mcp", "symbol|extended"],
   `${cursorMcpPath} should start rootless with the default Bifrost MCP toolset`,
 );
-const sharedMcpServer = mcpConfig.mcpServers?.bifrost;
 const claudeMcpServer = claudeMcpConfig.mcpServers?.bifrost;
 const cursorMcpServer = cursorMcpConfig.mcpServers?.bifrost;
 assert.deepStrictEqual(
@@ -245,27 +206,37 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(
   cursorMcpServer?.startup_timeout_sec,
-  sharedMcpServer?.startup_timeout_sec,
-  `${cursorMcpPath} and ${mcpPath} should use the same startup timeout`,
+  180,
+  `${cursorMcpPath} should retain the 180-second startup timeout`,
 );
 assert.deepStrictEqual(
   cursorMcpServer?.tool_timeout_sec,
-  sharedMcpServer?.tool_timeout_sec,
-  `${cursorMcpPath} and ${mcpPath} should use the same tool timeout`,
+  300,
+  `${cursorMcpPath} should retain the 300-second tool timeout`,
 );
 const minimumStartupTimeoutSec = Math.ceil(MINIMUM_MCP_STARTUP_TIMEOUT_MS / 1000);
-if ((sharedMcpServer?.startup_timeout_sec ?? 0) < minimumStartupTimeoutSec) {
+if ((cursorMcpServer?.startup_timeout_sec ?? 0) < minimumStartupTimeoutSec) {
   throw new Error(
-    `${mcpPath} startup_timeout_sec must be at least ${minimumStartupTimeoutSec} seconds ` +
+    `${cursorMcpPath} startup_timeout_sec must be at least ${minimumStartupTimeoutSec} seconds ` +
     "to cover download, extraction, version probing, and startup margin",
   );
 }
-assert.deepStrictEqual(
-  sharedMcpServer?.tool_timeout_sec,
-  300,
-  `${mcpPath} should retain the 300-second analyzer tool timeout`,
-);
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
+const piSessionSource = fs.readFileSync(
+  "plugins/bifrost-agent/extensions/bifrost-session.ts",
+  "utf8",
+);
+assert.match(
+  piSessionSource,
+  /from "\.\.\/bin\/bifrost-launcher\.mjs"/u,
+  "Pi must resolve Bifrost through the shared launcher module",
+);
+const pluginReadme = fs.readFileSync("plugins/bifrost-agent/README.md", "utf8");
+assert.match(
+  pluginReadme,
+  /"command": "\/absolute\/path\/to\/plugin\/bin\/bifrost-launcher\.mjs"/u,
+  "Amp instructions must invoke the shared launcher",
+);
 
 const expectedAgents = [
   "./agents/architect-reviewer.md",
@@ -277,11 +248,6 @@ const expectedAgents = [
   "./agents/security-reviewer.md",
   "./agents/senior-dev-reviewer.md",
 ];
-assert.deepStrictEqual(
-  codexManifest.agents,
-  expectedAgents,
-  `${codexManifestPath} should expose workflow specialist agents`,
-);
 assert.deepStrictEqual(
   claudeManifest.agents,
   expectedAgents,
@@ -303,6 +269,42 @@ if (releaseMetadata.binaryVersion !== cargoVersion) {
     `${releaseMetadataPath} binaryVersion ${releaseMetadata.binaryVersion} does not match Cargo.toml version ${cargoVersion}`,
   );
 }
+const preferredParts = releaseMetadata.binaryVersion.split(".");
+const minimumParts = String(releaseMetadata.minimumBinaryVersion ?? "").split(".");
+if (
+  minimumParts.length !== 3 ||
+  minimumParts[0] !== preferredParts[0] ||
+  minimumParts[1] !== preferredParts[1]
+) {
+  throw new Error(
+    `${releaseMetadataPath} minimumBinaryVersion must be in the preferred binary's minor series`,
+  );
+}
+if (Number(minimumParts[2]) > Number(preferredParts[2])) {
+  throw new Error(
+    `${releaseMetadataPath} minimumBinaryVersion cannot exceed binaryVersion`,
+  );
+}
+assert.equal(
+  releaseMetadata.allowPrerelease,
+  false,
+  `${releaseMetadataPath} must explicitly reject prerelease fallback binaries`,
+);
+const vscodeManifestPath = "editors/vscode/package.json";
+const vscodeManifest = JSON.parse(fs.readFileSync(vscodeManifestPath, "utf8"));
+assert.deepStrictEqual(
+  {
+    binaryVersion: vscodeManifest.bifrost?.binaryVersion,
+    minimumBinaryVersion: vscodeManifest.bifrost?.minimumBinaryVersion,
+    allowPrerelease: vscodeManifest.bifrost?.allowPrerelease,
+  },
+  {
+    binaryVersion: releaseMetadata.binaryVersion,
+    minimumBinaryVersion: releaseMetadata.minimumBinaryVersion,
+    allowPrerelease: releaseMetadata.allowPrerelease,
+  },
+  `${vscodeManifestPath} must use the agent launcher's binary compatibility range`,
+);
 for (const target of SUPPORTED_TARGETS) {
   const hash = releaseMetadata.archiveSha256?.[target];
   if (!/^[a-f0-9]{64}$/.test(hash ?? "")) {

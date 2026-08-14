@@ -25,9 +25,11 @@ import {
 
 const CONNECT_TIMEOUT_MS = 60_000;
 const CALL_TIMEOUT_MS = 300_000;
+const MCP_INSTRUCTIONS_MAX_CHARS = 2_000;
 
 export interface BifrostSessionClient {
   connect(): Promise<void>;
+  getInstructions(): string | undefined;
   listTools(): Promise<Tool[]>;
   callTool(
     name: string,
@@ -51,6 +53,7 @@ export interface BifrostSessionStatus {
   workspace?: string;
   toolCount: number;
   capabilities: BifrostCapability[];
+  instructions?: string;
   lastOperationError?: Error;
 }
 
@@ -67,6 +70,7 @@ interface ConnectedSession {
   client: BifrostSessionClient;
   toolset: string;
   advertisedMcpToolNames: Set<string>;
+  instructions?: string;
   lastOperationError?: Error;
 }
 
@@ -124,6 +128,9 @@ class BifrostSession implements BifrostSessionController {
         ? this.effectiveActiveMcpToolNames(published).size
         : 0,
       capabilities: [...this.state.desiredCapabilities],
+      ...(published.kind === "connected" && published.instructions
+        ? { instructions: published.instructions }
+        : {}),
       ...(lastOperationError ? { lastOperationError } : {}),
     };
   }
@@ -351,6 +358,7 @@ class BifrostSession implements BifrostSessionController {
   ): void {
     const normalized = normalizeCapabilities(capabilities);
     const advertised = new Set(advertisedMcpToolNames);
+    const instructions = boundedMcpInstructions(client.getInstructions());
     this.applyPiToolSelection(selectedMcpToolNames(normalized, advertised));
     this.state.desiredCapabilities = normalized;
     this.state.published = {
@@ -358,6 +366,7 @@ class BifrostSession implements BifrostSessionController {
       client,
       toolset,
       advertisedMcpToolNames: advertised,
+      ...(instructions ? { instructions } : {}),
       ...(lastOperationError ? { lastOperationError } : {}),
     };
   }
@@ -572,6 +581,7 @@ export function createSdkSessionClient(launch: BifrostLaunch): BifrostSessionCli
 
   return {
     connect: () => client.connect(transport, { timeout: CONNECT_TIMEOUT_MS }),
+    getInstructions: () => client.getInstructions(),
     async listTools() {
       const response = await client.listTools(undefined, { timeout: CONNECT_TIMEOUT_MS });
       return response.tools;
@@ -584,6 +594,17 @@ export function createSdkSessionClient(launch: BifrostLaunch): BifrostSessionCli
     },
     close: () => client.close(),
   };
+}
+
+function boundedMcpInstructions(instructions: string | undefined): string | undefined {
+  if (!instructions) {
+    return undefined;
+  }
+  const sanitized = sanitizeTerminalText(instructions).trim();
+  if (!sanitized) {
+    return undefined;
+  }
+  return Array.from(sanitized).slice(0, MCP_INSTRUCTIONS_MAX_CHARS).join("");
 }
 
 function selectedMcpToolNames(

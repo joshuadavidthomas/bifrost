@@ -2,8 +2,8 @@ use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    cpp_export_macro_token, cpp_field_declaration_linkage, cpp_template_term, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -11,10 +11,12 @@ use crate::graph_support::CppSource;
 use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
 };
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm,
 };
+use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
@@ -26,6 +28,7 @@ use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::cell::OnceCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(any(test, feature = "test-support"))]
@@ -102,6 +105,19 @@ pub enum NamespaceValueResolution {
     Resolved,
     Ambiguous,
     Missing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrdinaryMacroReferenceResolution {
+    Resolved(CodeUnit),
+    Ambiguous,
+    Missing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveredCReferenceRanges {
+    Complete(Vec<Range>),
+    LimitExceeded,
 }
 
 pub fn resolve_namespace_value(
@@ -400,8 +416,7 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner_resolution = type_owner_resolution(analyzer, target)
-                .or_else(|| target_forward_owner_resolution(analyzer, target));
+            let owner_resolution = target_type_owner_resolution(analyzer, target);
             let owner_is_forward_declaration = owner_resolution
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
@@ -578,6 +593,8 @@ pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
 pub type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
+type MacroLocalBindingTemplateCache =
+    HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment {
@@ -612,7 +629,7 @@ impl MacroEnvironment {
 
     fn mark_unknown_names(&mut self, source: &ProjectFile, byte: usize) {
         for binding in self.bindings.values_mut() {
-            *binding = MacroBinding::ambiguous(source, byte);
+            *binding = MacroBinding::uncertain_from(binding, source, byte);
         }
         self.unknown_names = true;
     }
@@ -639,6 +656,7 @@ pub struct OrdinaryTypeImport {
     pub scope_start: usize,
     pub scope_end: usize,
     pub scope_depth: usize,
+    pub block_scope: bool,
     pub lexical_depth: usize,
     pub declaration_namespace: Vec<String>,
     pub namespace_scope: Option<Vec<String>>,
@@ -701,8 +719,9 @@ pub enum OrdinaryTypeImportResolution {
 }
 
 type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
-type ConditionalIncludeProjectionCache =
-    HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
+type ConditionalIncludeProjectionIndex = HashMap<ProjectFile, Arc<[ConditionalIncludeProjection]>>;
+type ConditionalIncludeProjectionCell = Arc<PoolSafeMemo<ConditionalIncludeProjectionIndex>>;
+type ConditionalIncludeProjectionCache = HashMap<ProjectFile, ConditionalIncludeProjectionCell>;
 type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
 type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
@@ -734,6 +753,10 @@ pub struct VisibilityIndex<'a> {
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
     #[cfg(any(test, feature = "test-support"))]
+    conditional_include_projection_index_build_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    conditional_include_projection_state_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
     include_activation_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     using_donor_activation_count: AtomicUsize,
@@ -741,8 +764,6 @@ pub struct VisibilityIndex<'a> {
     using_namespace_lookup_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     using_name_candidate_inspection_count: AtomicUsize,
-    #[cfg(any(test, feature = "test-support"))]
-    using_source_index_walk_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     callable_reference_spec_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -766,6 +787,7 @@ pub struct VisibilityIndex<'a> {
     pub macro_environment_cursors:
         Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
+    macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
     #[cfg(any(test, feature = "test-support"))]
     pub macro_replacement_parse_count: AtomicUsize,
@@ -838,6 +860,31 @@ enum ParsedMacroReplacement {
     Unsupported,
 }
 
+#[derive(Clone)]
+enum MacroLocalBindingTypeTemplate {
+    Parameter(usize),
+    Fixed(String),
+}
+
+#[derive(Clone)]
+struct MacroLocalBindingTemplate {
+    name: String,
+    declared_type: MacroLocalBindingTypeTemplate,
+    pointer_depth: i32,
+}
+
+/// A local declaration contributed by one structurally known function-like macro.
+///
+/// `type_node` points into the invocation syntax when the replacement's type
+/// is one of the macro parameters. Consumers can therefore use their normal
+/// lexical type resolver without parsing replacement text themselves.
+pub struct MacroLocalBinding<'tree> {
+    pub name: String,
+    pub type_name: String,
+    pub type_node: Option<Node<'tree>>,
+    pub pointer_depth: i32,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MacroBinding {
     source: ProjectFile,
@@ -858,6 +905,15 @@ impl MacroBinding {
 
     fn is_exact(&self) -> bool {
         self.exact
+    }
+
+    fn uncertain_from(current: &Self, source: &ProjectFile, declaration_byte: usize) -> Self {
+        Self {
+            source: source.clone(),
+            declaration_byte,
+            definition: current.definition.clone(),
+            exact: false,
+        }
     }
 }
 
@@ -1023,11 +1079,12 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
+            conditional_include_projection_index_build_count: AtomicUsize::new(0),
+            conditional_include_projection_state_count: AtomicUsize::new(0),
             include_activation_build_count: AtomicUsize::new(0),
             using_donor_activation_count: AtomicUsize::new(0),
             using_namespace_lookup_count: AtomicUsize::new(0),
             using_name_candidate_inspection_count: AtomicUsize::new(0),
-            using_source_index_walk_count: AtomicUsize::new(0),
             callable_reference_spec_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
@@ -1041,6 +1098,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            macro_local_binding_templates: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
@@ -1148,6 +1206,10 @@ impl<'a> VisibilityIndex<'a> {
             include_activation_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
+            conditional_include_projection_index_build_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            conditional_include_projection_state_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
             include_activation_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             using_donor_activation_count: AtomicUsize::new(0),
@@ -1155,8 +1217,6 @@ impl<'a> VisibilityIndex<'a> {
             using_namespace_lookup_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             using_name_candidate_inspection_count: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            using_source_index_walk_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             callable_reference_spec_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -1174,6 +1234,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            macro_local_binding_templates: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             macro_replacement_parse_count: AtomicUsize::new(0),
@@ -1281,6 +1342,9 @@ impl<'a> VisibilityIndex<'a> {
                 CallArityEvidence::Exact(1)
             };
         };
+        if !binding.is_exact() {
+            return CallArityEvidence::Unknown;
+        }
         match (&binding.definition, invocation_arguments, function_like) {
             (MacroDefinition::Object { replacement }, None, false) => self
                 .replacement_arity_evidence(
@@ -1420,6 +1484,140 @@ impl<'a> VisibilityIndex<'a> {
         let parsed = Arc::new(parsed);
         cache.insert(key, Arc::clone(&parsed));
         parsed
+    }
+
+    /// Recover a typed local declared by an active C function-like macro.
+    ///
+    /// This is intentionally narrower than macro expansion. The replacement
+    /// must parse as one declaration, and the invocation must bind every
+    /// formal parameter to one structured argument. That is sufficient for
+    /// declaration macros such as `THIS(StorageAzure)`. An unavailable include
+    /// can make the binding provisional without erasing its last known
+    /// definition; an explicit conflicting definition still replaces it with
+    /// Unsupported. Malformed and statement-producing macros also fail closed.
+    pub fn function_macro_local_binding<'tree>(
+        &self,
+        file: &ProjectFile,
+        statement: Node<'tree>,
+        source: &str,
+    ) -> Option<MacroLocalBinding<'tree>> {
+        if !is_c_source_file(file) {
+            return None;
+        }
+        let call = match statement.kind() {
+            "call_expression" => statement,
+            "expression_statement" if statement.named_child_count() == 1 => {
+                statement.named_child(0)?
+            }
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let actuals = argument_children(arguments).collect::<Vec<_>>();
+        let environment = self.macro_environment(file, call.start_byte());
+        let function_name = node_text(function, source);
+        let binding = environment.binding(function_name)?;
+        let MacroDefinition::Function {
+            parameters,
+            replacement,
+        } = &binding.definition
+        else {
+            return None;
+        };
+        if actuals.len() != parameters.len() {
+            return None;
+        }
+        let template = self.macro_local_binding_template(binding, parameters, replacement)?;
+        let (type_name, type_node) = match &template.declared_type {
+            MacroLocalBindingTypeTemplate::Parameter(index) => {
+                let actual = *actuals.get(*index)?;
+                if !macro_expansion_shape_is_safe(actual, source, &[], &environment) {
+                    return None;
+                }
+                (node_text(actual, source).trim().to_string(), Some(actual))
+            }
+            MacroLocalBindingTypeTemplate::Fixed(type_name) => (type_name.clone(), None),
+        };
+        if type_name.is_empty() {
+            return None;
+        }
+        Some(MacroLocalBinding {
+            name: template.name.clone(),
+            type_name,
+            type_node,
+            pointer_depth: template.pointer_depth,
+        })
+    }
+
+    fn macro_local_binding_template(
+        &self,
+        binding: &MacroBinding,
+        parameters: &[String],
+        replacement: &str,
+    ) -> Option<Arc<MacroLocalBindingTemplate>> {
+        let key = (binding.source.clone(), binding.declaration_byte);
+        let mut cache = self
+            .macro_local_binding_templates
+            .lock()
+            .expect("C++ macro local-binding cache poisoned");
+        if let Some(template) = cache.get(&key) {
+            return template.clone();
+        }
+        let sentinel = format!("void __bifrost_macro_local() {{ {replacement}; }}");
+        let template = (|| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(&sentinel, None)?;
+            if tree.root_node().has_error() {
+                return None;
+            }
+            let function = first_descendant_of_kind(tree.root_node(), "function_definition")?;
+            let body = function.child_by_field_name("body")?;
+            if body.named_child_count() != 1 {
+                return None;
+            }
+            let declaration = body.named_child(0)?;
+            if declaration.kind() != "declaration" {
+                return None;
+            }
+            let type_node = declaration
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(declaration))?;
+            let declarator = declaration.child_by_field_name("declarator").or_else(|| {
+                let mut cursor = declaration.walk();
+                declaration.named_children(&mut cursor).find_map(|child| {
+                    if child.kind() == "init_declarator" {
+                        child.child_by_field_name("declarator")
+                    } else {
+                        is_declarator_node(child).then_some(child)
+                    }
+                })
+            })?;
+            let name = extract_variable_name(declarator, &sentinel)?;
+            let pointer_depth =
+                declared_name_indirection(declaration, type_node, &name, &sentinel)?;
+            let type_text = node_text(type_node, &sentinel).trim();
+            let declared_type = parameters
+                .iter()
+                .position(|parameter| parameter == type_text)
+                .map(MacroLocalBindingTypeTemplate::Parameter)
+                .unwrap_or_else(|| MacroLocalBindingTypeTemplate::Fixed(type_text.to_string()));
+            Some(Arc::new(MacroLocalBindingTemplate {
+                name,
+                declared_type,
+                pointer_depth,
+            }))
+        })();
+        cache.insert(key, template.clone());
+        template
     }
 
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
@@ -1562,6 +1760,103 @@ impl<'a> VisibilityIndex<'a> {
         })
     }
 
+    /// Resolve an ordinary expression-position macro token at its exact byte.
+    ///
+    /// Calls and preprocessor-condition tokens have separate resolution
+    /// surfaces. Declaration names, macro parameters, and labels are not
+    /// references. Keeping that role policy here makes forward and both
+    /// inverse graph builders consume the same activation verdict (#2093).
+    pub fn resolve_ordinary_macro_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        node: Node<'_>,
+        source: &str,
+    ) -> OrdinaryMacroReferenceResolution {
+        if !is_ordinary_macro_reference_node(node) {
+            return OrdinaryMacroReferenceResolution::Missing;
+        }
+        let name = node_text(node, source);
+        if name.is_empty() {
+            return OrdinaryMacroReferenceResolution::Missing;
+        }
+        let visible = self
+            .visible_identifier_candidates(file, name)
+            .filter(|candidate| candidate.is_macro())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut exact = Vec::new();
+        for candidate in &visible {
+            if self.macro_binding_matches_target_at(
+                analyzer,
+                file,
+                name,
+                node.start_byte(),
+                candidate,
+            ) && !exact
+                .iter()
+                .any(|existing| same_visible_symbol(existing, candidate))
+            {
+                exact.push(candidate.clone());
+            }
+        }
+        match exact.len() {
+            1 => OrdinaryMacroReferenceResolution::Resolved(exact.pop().unwrap()),
+            2.. => OrdinaryMacroReferenceResolution::Ambiguous,
+            0 if !visible.is_empty()
+                && self.macro_name_may_be_bound_at(file, name, node.start_byte()) =>
+            {
+                OrdinaryMacroReferenceResolution::Ambiguous
+            }
+            0 => OrdinaryMacroReferenceResolution::Missing,
+        }
+    }
+
+    /// Collect reference-capable C tokens beneath tree-sitter recovery nodes.
+    ///
+    /// The ordinary census deliberately skips every `ERROR` subtree. This
+    /// separate, precision-only frontier admits only roles that retain enough
+    /// structure for the C usage graph to interpret independently (#2089).
+    /// Macro evidence comes from this visibility index at the exact byte; no
+    /// source-text parsing or terminal-name fallback is used.
+    pub fn recovered_c_reference_ranges(
+        &self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        limit: usize,
+    ) -> RecoveredCReferenceRanges {
+        if !is_c_source_file(file) {
+            return RecoveredCReferenceRanges::Complete(Vec::new());
+        }
+        let mut ranges = Vec::new();
+        let mut seen = HashSet::default();
+        let mut stack = vec![(root, root.is_error())];
+        while let Some((node, inside_error)) = stack.pop() {
+            let inside_error = inside_error || node.is_error();
+            if inside_error
+                && recovered_c_reference_node(self, file, node, source)
+                && seen.insert((node.start_byte(), node.end_byte()))
+            {
+                if ranges.len() == limit {
+                    return RecoveredCReferenceRanges::LimitExceeded;
+                }
+                ranges.push(Range {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    start_line: node.start_position().row,
+                    end_line: node.end_position().row,
+                });
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push((child, inside_error));
+            }
+        }
+        ranges.sort_unstable();
+        RecoveredCReferenceRanges::Complete(ranges)
+    }
+
     /// Whether this target is an indexed macro visible from this file.
     ///
     /// An unresolved conditional can make more than one same-name macro a
@@ -1694,14 +1989,17 @@ impl<'a> VisibilityIndex<'a> {
                 conditional,
                 byte,
             } => {
-                environment.insert(
-                    name.clone(),
-                    if *conditional {
-                        MacroBinding::ambiguous(file, *byte)
-                    } else {
-                        binding.clone()
-                    },
-                );
+                if *conditional {
+                    Self::merge_conditional_macro_definition(
+                        environment,
+                        name,
+                        binding,
+                        file,
+                        *byte,
+                    );
+                } else {
+                    environment.insert(name.clone(), binding.clone());
+                }
             }
             MacroEvent::Undef {
                 name,
@@ -1742,7 +2040,7 @@ impl<'a> VisibilityIndex<'a> {
             }
             MacroEvent::Invalidate { byte } => {
                 for binding in environment.bindings.values_mut() {
-                    *binding = MacroBinding::ambiguous(file, *byte);
+                    *binding = MacroBinding::uncertain_from(binding, file, *byte);
                 }
             }
         }
@@ -1789,10 +2087,13 @@ impl<'a> VisibilityIndex<'a> {
             self.macro_event_application_count
                 .fetch_add(1, Ordering::Relaxed);
             match event {
-                MacroEvent::Define { name, .. } => {
-                    environment.insert(
-                        name.clone(),
-                        MacroBinding::ambiguous(conditional_file, conditional_byte),
+                MacroEvent::Define { name, binding, .. } => {
+                    Self::merge_conditional_macro_definition(
+                        environment,
+                        name,
+                        binding,
+                        conditional_file,
+                        conditional_byte,
                     );
                 }
                 MacroEvent::Undef { name, .. } => {
@@ -1820,11 +2121,38 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 MacroEvent::Invalidate { .. } => {
                     for binding in environment.bindings.values_mut() {
-                        *binding = MacroBinding::ambiguous(conditional_file, conditional_byte);
+                        *binding = MacroBinding::uncertain_from(
+                            binding,
+                            conditional_file,
+                            conditional_byte,
+                        );
                     }
                 }
             }
         }
+    }
+
+    fn merge_conditional_macro_definition(
+        environment: &mut MacroEnvironment,
+        name: &str,
+        possible_binding: &MacroBinding,
+        conditional_file: &ProjectFile,
+        conditional_byte: usize,
+    ) {
+        // A conditional include can revisit an already-active guarded header.
+        // If the possible branch defines the exact same macro, both outcomes
+        // leave the binding unchanged; degrading it to Unknown would discard
+        // proof because of an unrelated unresolved macro name (#2092).
+        if environment.binding(name).is_some_and(|current| {
+            current.definition != MacroDefinition::Unsupported
+                && current.definition == possible_binding.definition
+        }) {
+            return;
+        }
+        environment.insert(
+            name.to_string(),
+            MacroBinding::ambiguous(conditional_file, conditional_byte),
+        );
     }
 
     pub fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {
@@ -2293,24 +2621,38 @@ impl<'a> VisibilityIndex<'a> {
         prepared: &PreparedSyntaxTree,
         donor_source: &ProjectFile,
     ) -> Arc<[ConditionalIncludeProjection]> {
-        let key = (file.clone(), donor_source.clone());
-        if let Some(cached) = self
+        static EMPTY: OnceLock<Arc<[ConditionalIncludeProjection]>> = OnceLock::new();
+        let cell = self
             .conditional_include_projection_cells
             .lock()
             .expect("C++ conditional include projection cache poisoned")
-            .get(&key)
+            .entry(file.clone())
+            .or_insert_with(|| Arc::new(PoolSafeMemo::new()))
+            .clone();
+        let index = cell.get_or_build_pool_independent(|| {
+            #[cfg(any(test, feature = "test-support"))]
+            self.conditional_include_projection_index_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            find_conditional_include_projection_index(self.cpp, file, prepared, &|| {
+                #[cfg(any(test, feature = "test-support"))]
+                self.conditional_include_projection_state_count
+                    .fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        index
+            .get(donor_source)
             .cloned()
-        {
-            return cached;
-        }
-        let projections: Arc<[ConditionalIncludeProjection]> =
-            find_conditional_include_projections(self.cpp, file, prepared, donor_source).into();
-        self.conditional_include_projection_cells
-            .lock()
-            .expect("C++ conditional include projection cache poisoned")
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&projections))
-            .clone()
+            .unwrap_or_else(|| Arc::clone(EMPTY.get_or_init(|| Arc::from([]))))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn conditional_include_projection_work_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.conditional_include_projection_index_build_count
+                .load(Ordering::Relaxed),
+            self.conditional_include_projection_state_count
+                .load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2346,18 +2688,8 @@ impl<'a> VisibilityIndex<'a> {
     pub fn note_using_name_candidate_inspection_for_test(&self) {}
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn note_using_source_index_walk_for_test(&self) {
-        self.using_source_index_walk_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
-    pub fn note_using_source_index_walk_for_test(&self) {}
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize, usize) {
+    pub fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize) {
         (
-            self.using_source_index_walk_count.load(Ordering::Relaxed),
             self.using_donor_activation_count.load(Ordering::Relaxed),
             self.using_namespace_lookup_count.load(Ordering::Relaxed),
             self.callable_reference_spec_build_count
@@ -3561,6 +3893,46 @@ impl<'a> VisibilityIndex<'a> {
             frontier = next_frontier;
         }
         LexicalTypeResolution::Missing
+    }
+
+    /// Resolve a base class through its injected class name at the nearest
+    /// inheritance tier. Distinct same-named bases at that tier are ambiguous.
+    pub fn inherited_injected_class_owner(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        enclosing_owner: &CodeUnit,
+        injected_name: &str,
+    ) -> Option<CodeUnit> {
+        let hierarchy = analyzer.type_hierarchy_provider()?;
+        let mut frontier = hierarchy.get_direct_ancestors(enclosing_owner);
+        let mut visited = HashSet::default();
+        while !frontier.is_empty() {
+            let mut level_matches = Vec::new();
+            let mut next_frontier = Vec::new();
+            for raw_owner in frontier {
+                let owner = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)?;
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                if owner.identifier() == injected_name
+                    && !level_matches
+                        .iter()
+                        .any(|existing| same_logical_symbol(existing, &owner))
+                {
+                    level_matches.push(owner.clone());
+                }
+                next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+            if let Some(first) = level_matches.first() {
+                return level_matches
+                    .iter()
+                    .all(|candidate| same_logical_symbol(candidate, first))
+                    .then(|| first.clone());
+            }
+            frontier = next_frontier;
+        }
+        None
     }
 
     /// The one type the candidates name under `resolution`, or why they do not
@@ -5640,7 +6012,41 @@ fn sort_lookup_units(units: &mut [CodeUnit]) {
             .cmp(&right.fq_name())
             .then_with(|| left.signature().cmp(&right.signature()))
             .then_with(|| left.source().cmp(right.source()))
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| {
+                left.package_segment_count()
+                    .cmp(&right.package_segment_count())
+            })
+            .then_with(|| left.is_synthetic().cmp(&right.is_synthetic()))
+            .then_with(|| stable_fq_name_cmp(left.fq(), right.fq()))
     });
+}
+
+fn stable_fq_name_cmp(left: &FqName, right: &FqName) -> CmpOrdering {
+    let interner = segment_interner();
+    for (&left_id, &right_id) in left.segments().iter().zip(right.segments()) {
+        let (left_text, left_kind) = interner.resolve(left_id);
+        let (right_text, right_kind) = interner.resolve(right_id);
+        let order = left_text
+            .cmp(right_text)
+            .then_with(|| segment_kind_order(left_kind).cmp(&segment_kind_order(right_kind)));
+        if order != CmpOrdering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+const fn segment_kind_order(kind: SegmentKind) -> u8 {
+    match kind {
+        SegmentKind::Path => 0,
+        SegmentKind::Package => 1,
+        SegmentKind::Type => 2,
+        SegmentKind::Companion => 3,
+        SegmentKind::Nested => 4,
+        SegmentKind::Member => 5,
+        SegmentKind::Unknown => 6,
+    }
 }
 
 fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
@@ -6224,14 +6630,16 @@ fn find_include_activation(
         .map(|(activation, _)| activation)
 }
 
-fn find_conditional_include_projections(
+fn find_conditional_include_projection_index(
     cpp: &dyn CppSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
-    donor_source: &ProjectFile,
-) -> Vec<ConditionalIncludeProjection> {
+    on_state: &dyn Fn(),
+) -> ConditionalIncludeProjectionIndex {
     let include_targets = cpp.include_target_index();
-    let mut projections = Vec::new();
+    let mut projections_by_source: HashMap<ProjectFile, Vec<ConditionalIncludeProjection>> =
+        HashMap::default();
+    let mut pending = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
@@ -6248,26 +6656,7 @@ fn find_conditional_include_projections(
                 )) else {
                     continue;
                 };
-                let paths = conditional_include_requirement_paths(
-                    cpp,
-                    &target,
-                    donor_source,
-                    required_guards.clone(),
-                );
-                for required_guards in paths {
-                    if !projections
-                        .iter()
-                        .any(|projection: &ConditionalIncludeProjection| {
-                            projection.activation_byte == node.end_byte()
-                                && projection.required_guards == required_guards
-                        })
-                    {
-                        projections.push(ConditionalIncludeProjection {
-                            activation_byte: node.end_byte(),
-                            required_guards,
-                        });
-                    }
-                }
+                pending.push((target, node.end_byte(), required_guards.clone()));
             }
             continue;
         }
@@ -6277,37 +6666,43 @@ fn find_conditional_include_projections(
             }
         }
     }
-    projections.sort_by_key(|projection| projection.activation_byte);
-    projections
-}
 
-fn conditional_include_requirement_paths(
-    cpp: &dyn CppSource,
-    first: &ProjectFile,
-    donor_source: &ProjectFile,
-    required_guards: HashSet<PreprocessorGuard>,
-) -> Vec<HashSet<PreprocessorGuard>> {
-    let include_targets = cpp.include_target_index();
-    let mut paths = Vec::new();
-    let mut stack = vec![(
-        first.clone(),
-        required_guards,
-        HashSet::from_iter([first.clone()]),
-    )];
-    while let Some((file, required_guards, visited)) = stack.pop() {
-        if file == *donor_source {
-            if !paths.contains(&required_guards) {
-                paths.push(required_guards);
-            }
+    // One reached file can have several distinct compatible guard paths. A
+    // state is expanded once for each exact guard set and top-level activation
+    // byte; this preserves those paths while terminating include cycles.
+    let mut expanded: HashMap<(ProjectFile, usize), Vec<HashSet<PreprocessorGuard>>> =
+        HashMap::default();
+    while let Some((current_file, activation_byte, required_guards)) = pending.pop() {
+        let guard_sets = expanded
+            .entry((current_file.clone(), activation_byte))
+            .or_default();
+        if guard_sets.contains(&required_guards) {
             continue;
         }
-        let Some(prepared) = cpp.prepared_syntax(&file) else {
+        guard_sets.push(required_guards.clone());
+        on_state();
+
+        let projections = projections_by_source
+            .entry(current_file.clone())
+            .or_default();
+        if !projections.iter().any(|projection| {
+            projection.activation_byte == activation_byte
+                && projection.required_guards == required_guards
+        }) {
+            projections.push(ConditionalIncludeProjection {
+                activation_byte,
+                required_guards: required_guards.clone(),
+            });
+        }
+
+        let Some(current_prepared) = cpp.prepared_syntax(&current_file) else {
             continue;
         };
-        let mut nodes = vec![prepared.tree().root_node()];
+        let mut nodes = vec![current_prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                let Some(include_guards) = preprocessor_guard_environment(node, prepared.source())
+                let Some(include_guards) =
+                    preprocessor_guard_environment(node, current_prepared.source())
                 else {
                     continue;
                 };
@@ -6316,21 +6711,16 @@ fn conditional_include_requirement_paths(
                 else {
                     continue;
                 };
-                let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+                let raw = normalize_cpp_whitespace(node_text(node, current_prepared.source()));
                 for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                     let Some(target) = unique_include_target(resolve_include_targets_with_index(
-                        &file,
+                        &current_file,
                         &include,
                         include_targets,
                     )) else {
                         continue;
                     };
-                    if visited.contains(&target) {
-                        continue;
-                    }
-                    let mut next_visited = visited.clone();
-                    next_visited.insert(target.clone());
-                    stack.push((target, path_guards.clone(), next_visited));
+                    pending.push((target, activation_byte, path_guards.clone()));
                 }
                 continue;
             }
@@ -6341,7 +6731,14 @@ fn conditional_include_requirement_paths(
             }
         }
     }
-    paths
+
+    projections_by_source
+        .into_iter()
+        .map(|(source, mut projections)| {
+            projections.sort_by_key(|projection| projection.activation_byte);
+            (source, Arc::from(projections))
+        })
+        .collect()
 }
 
 fn unconditional_include_reaches(
@@ -6483,7 +6880,9 @@ pub fn preprocessor_conditional_family_range(
     let node = root.descendant_for_byte_range(start_byte, end_byte)?;
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             return Some((family.start_byte(), family.end_byte()));
         }
@@ -6495,7 +6894,9 @@ pub fn preprocessor_conditional_family_range(
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             if preprocessor_conditional_family_has_terminal_else(family) {
                 return Some(family);
@@ -6546,6 +6947,7 @@ pub fn preprocessor_guard_environment(
             conditional.kind(),
             "preproc_if" | "preproc_ifdef" | "preproc_elif"
         ) && !is_file_covering_include_guard(conditional, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
@@ -6589,6 +6991,14 @@ fn preprocessor_guard_for_descendant(
         guard = guard.negated();
     }
     Some(guard)
+}
+
+fn preprocessor_conditional_contains_descendant(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+) -> bool {
+    cpp_displaced_preprocessor_terminator(conditional)
+        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
 }
 
 pub fn merge_preprocessor_guards(
@@ -6812,6 +7222,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
             && !is_file_covering_include_guard(conditional, source)
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
                 return false;
@@ -8042,8 +8453,12 @@ fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a st
 }
 
 fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    let descendant = node;
     while let Some(parent) = node.parent() {
-        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+        if is_preprocessor_conditional(parent)
+            && !is_file_covering_include_guard(parent, source)
+            && preprocessor_conditional_contains_descendant(parent, descendant)
+        {
             return true;
         }
         node = parent;
@@ -8171,6 +8586,19 @@ pub fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
             .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))
             .and_then(|child| extract_variable_name(child, source)),
     }
+}
+
+/// Whether `file` is proven to use plain-C source semantics.
+///
+/// `Language::Cpp` intentionally serves both C and C++. Headers do not carry a
+/// compilation dialect on their own, so only an exact `.c` source extension is
+/// sufficient to reinterpret C++-grammar keyword nodes such as `this` as C
+/// identifiers.
+pub fn is_c_source_file(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c")
 }
 
 pub fn is_declarator_node(node: Node<'_>) -> bool {
@@ -8602,6 +9030,135 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     false
 }
 
+pub fn is_ordinary_macro_reference_node(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "field_identifier") || is_declaration_name(node) {
+        return false;
+    }
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(node)
+        {
+            return false;
+        }
+        if matches!(parent.kind(), "labeled_statement" | "goto_statement")
+            && parent.child_by_field_name("label") == Some(node)
+        {
+            return false;
+        }
+    }
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind().starts_with("preproc_") {
+            return false;
+        }
+        if matches!(
+            ancestor.kind(),
+            "translation_unit" | "function_definition" | "compound_statement"
+        ) {
+            break;
+        }
+        current = ancestor.parent();
+    }
+    true
+}
+
+fn recovered_c_reference_node(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    if node.start_byte() >= node.end_byte()
+        || node.is_error()
+        || node.is_missing()
+        || !matches!(
+            node.kind(),
+            "identifier" | "field_identifier" | "type_identifier" | "namespace_identifier"
+        )
+        || recovered_c_macro_binding_role(node)
+        || recovered_c_label_role(node)
+    {
+        return false;
+    }
+
+    let name = node_text(node, source);
+    if !name.is_empty() && visibility.macro_name_may_be_bound_at(file, name, node.start_byte()) {
+        return true;
+    }
+    if is_declaration_name(node) {
+        return false;
+    }
+    if matches!(node.kind(), "type_identifier" | "namespace_identifier") {
+        return true;
+    }
+    recovered_c_reference_anchor(node)
+}
+
+fn recovered_c_macro_binding_role(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "preproc_def" | "preproc_function_def" | "preproc_params"
+        ) {
+            return true;
+        }
+        if parent.is_error()
+            || matches!(
+                parent.kind(),
+                "translation_unit" | "function_definition" | "compound_statement"
+            )
+        {
+            return false;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn recovered_c_label_role(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "labeled_statement" | "goto_statement")
+            && parent.child_by_field_name("label") == Some(node)
+    })
+}
+
+fn recovered_c_reference_anchor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() {
+            return false;
+        }
+        if parent.kind().ends_with("_expression")
+            || matches!(
+                parent.kind(),
+                "argument_list"
+                    | "return_statement"
+                    | "expression_statement"
+                    | "case_statement"
+                    | "initializer_list"
+                    | "init_declarator"
+                    | "array_declarator"
+                    | "field_designator"
+                    | "enumerator"
+            )
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "translation_unit"
+                | "function_definition"
+                | "compound_statement"
+                | "declaration"
+                | "field_declaration"
+                | "parameter_declaration"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
+}
+
 /// Whether a parameter declaration belongs to the callable scope whose body can
 /// contain references to it.
 ///
@@ -8744,10 +9301,57 @@ pub struct QualifiedOwnerComponents<'tree> {
     pub global: bool,
 }
 
+/// True when each structured qualifier on the callable-name path has a real
+/// `::` token. A macro-prefixed return type can make tree-sitter insert a
+/// zero-width missing separator and parse `TYPE Result<T> method()` as the
+/// false qualified declarator `Result<T>::method`.
+pub fn qualified_name_has_concrete_scope_separators(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    let mut found_separator = false;
+    while let Some(current) = stack.pop() {
+        if !matches!(
+            current.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            continue;
+        }
+        let mut current_has_separator = false;
+        for index in 0..current.child_count() {
+            let Some(child) = current.child(index) else {
+                continue;
+            };
+            if child.kind() == "::" {
+                if child.is_missing() {
+                    return false;
+                }
+                current_has_separator = true;
+                found_separator = true;
+            }
+        }
+        if !current_has_separator {
+            return false;
+        }
+        for field in ["scope", "name"] {
+            if let Some(child) = current.child_by_field_name(field)
+                && matches!(
+                    child.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                )
+            {
+                stack.push(child);
+            }
+        }
+    }
+    found_separator
+}
+
 pub fn qualified_owner_components<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<QualifiedOwnerComponents<'tree>> {
+    if !qualified_name_has_concrete_scope_separators(node) {
+        return None;
+    }
     let mut nodes = cpp_name_component_nodes(node)?;
     nodes.pop()?;
     if nodes.is_empty() {
@@ -10034,6 +10638,16 @@ fn type_owner_resolution(
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
 }
 
+fn target_type_owner_resolution(
+    analyzer: &CppGraphSource<'_>,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    match type_owner_resolution(analyzer, code_unit) {
+        Some(owner) if !owner.is_forward_declaration => Some(owner),
+        Some(_) | None => target_forward_owner_resolution(analyzer, code_unit),
+    }
+}
+
 /// Recover method identity for an indexed out-of-line definition when the
 /// analyzer has retained only its unique include-visible class forward
 /// declaration. This is deliberately target-only: canonical declaration
@@ -10144,13 +10758,13 @@ fn precise_parent_resolution(
                     unit: owner,
                     is_forward_declaration: false,
                 }),
-                FullOwnerResolution::None if forwards.len() == 1 => {
-                    forwards.into_iter().next().map(|unit| ResolvedTypeOwner {
+                FullOwnerResolution::None => {
+                    unique_logical_forward_owner(forwards).map(|unit| ResolvedTypeOwner {
                         unit,
                         is_forward_declaration: true,
                     })
                 }
-                FullOwnerResolution::None | FullOwnerResolution::Ambiguous => None,
+                FullOwnerResolution::Ambiguous => None,
             }
         }
         DirectOwnerResolution::None => {
@@ -10377,6 +10991,19 @@ pub fn collapse_owner_candidates(
     } else {
         DirectOwnerResolution::None
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn unique_logical_forward_owner_for_test(forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    unique_logical_forward_owner(forwards)
+}
+
+fn unique_logical_forward_owner(mut forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    let first = forwards.pop()?;
+    forwards
+        .iter()
+        .all(|forward| same_logical_symbol(forward, &first))
+        .then_some(first)
 }
 
 pub fn cpp_class_declaration_strength(
@@ -10695,6 +11322,162 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_lookup_units_totally_orders_every_identity_field() {
+        let file = ProjectFile::new(std::env::temp_dir(), "issue_1876.cpp");
+        let base = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let different_kind = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Field,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let synthetic = base.with_synthetic(true);
+
+        let interner = segment_interner();
+        let mut member_fq = FqName::new();
+        member_fq.push(interner.intern("scope", SegmentKind::Package));
+        member_fq.push(interner.intern("value", SegmentKind::Member));
+        let different_package_boundary = CodeUnit::from_fq(
+            file.clone(),
+            CodeUnitType::Function,
+            member_fq,
+            0,
+            Some("()".to_string()),
+            false,
+        );
+
+        let mut unknown_fq = FqName::new();
+        unknown_fq.push(interner.intern("scope", SegmentKind::Package));
+        unknown_fq.push(interner.intern("value", SegmentKind::Unknown));
+        let different_segment_kind = CodeUnit::from_fq(
+            file,
+            CodeUnitType::Function,
+            unknown_fq,
+            1,
+            Some("()".to_string()),
+            false,
+        );
+
+        let input = vec![
+            base,
+            different_kind,
+            synthetic,
+            different_package_boundary,
+            different_segment_kind,
+        ];
+        let mut expected = input.clone();
+        sort_lookup_units(&mut expected);
+        assert!(expected.windows(2).all(|pair| {
+            let mut ordered = pair.to_vec();
+            sort_lookup_units(&mut ordered);
+            ordered == pair && pair[0] != pair[1]
+        }));
+
+        let mut reversed = input.clone();
+        reversed.reverse();
+        sort_lookup_units(&mut reversed);
+        assert_eq!(reversed, expected);
+
+        let mut rotated = input;
+        rotated.rotate_left(2);
+        sort_lookup_units(&mut rotated);
+        assert_eq!(rotated, expected);
+    }
+
+    #[test]
+    fn displaced_preprocessor_terminator_bounds_the_real_guard() {
+        let damaged = "#ifndef API_H\n#define API_H\nextern char option_buffer[\n#ifdef FEATURE_X\n    16 +\n#endif\n    1];\n\nvoid target(void);\n#endif\n";
+        let guarded = "#ifdef FEATURE_X\nvoid target(void);\n#endif\n";
+        let parse = |source: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("C++ grammar");
+            parser.parse(source, None).expect("fixture tree")
+        };
+
+        let tree = parse(damaged);
+        let root = tree.root_node();
+        let target = damaged.find("target").expect("target byte");
+        let declaration = root
+            .descendant_for_byte_range(target, target + "target".len())
+            .and_then(|mut node| {
+                loop {
+                    if node.kind() == "declaration" {
+                        break Some(node);
+                    }
+                    node = node.parent()?;
+                }
+            })
+            .expect("declaration after the displaced terminator");
+        let conditional = declaration
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("damaged inner conditional");
+        let outer = conditional
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary outer include guard");
+        let terminator = cpp_displaced_preprocessor_terminator(conditional)
+            .expect("structured displaced #endif");
+        assert_eq!(node_text(terminator, damaged), "#endif");
+        assert!(terminator.end_byte() <= declaration.start_byte());
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+        assert!(cpp_displaced_preprocessor_terminator(outer).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            outer,
+            declaration
+        ));
+
+        let tree = parse(guarded);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary conditional");
+        let declaration = conditional
+            .named_children(&mut conditional.walk())
+            .find(|node| node.kind() == "declaration")
+            .expect("guarded declaration");
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+
+        let damaged_alternative = format!(
+            "#ifndef NO_FEATURE\nvoid enabled(void) {{}}\n#else\nvoid disabled(void) {{\n{}\n}}\n#endif\n",
+            "UNUSED(value)\n".repeat(64)
+        );
+        let tree = parse(&damaged_alternative);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("outer conditional with an alternative");
+        assert!(conditional.has_error());
+        assert!(conditional.child_by_field_name("alternative").is_some());
+        assert!(
+            conditional
+                .child(conditional.child_count() - 1)
+                .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
+        );
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+    }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
         let mut parser = Parser::new();

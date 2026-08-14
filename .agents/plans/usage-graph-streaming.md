@@ -41,6 +41,7 @@ measurement is a separate task run after review; it is not part of this plan's a
 
 ## Progress
 
+- [x] (2026-08-13) Re-ported the completed D1-D3 lazy-reference-context and D2 cap-streaming behavior after crate-split merge `f34ce17f` selected the eager upstream Rust usage cluster and later UsageIndex v2 work did not restore this overlay. The #2087 implementation adapts the behavior to the nine-crate topology rather than replaying old commits verbatim. The frozen eager-closure equivalence matrix, namespace-export cost/cancellation pins, 24-file cap pin, overload-union dedup pin, and cap-zero recursive-call pin all pass; focused all-target checks and Clippy pass.
 - [x] (2026-08-08 12:00Z) Read the approved design, the investigation, and the code it cites.
 - [x] (2026-08-08 12:40Z) Wrote this ExecPlan; set the design document's status to
       `APPROVED, IMPLEMENTING`.
@@ -148,6 +149,8 @@ measurement is a separate task run after review; it is not part of this plan's a
 
 ## Surprises & Discoveries
 
+- Observation: Merge `f34ce17f` explicitly kept the eager upstream Rust usage cluster even though its first parent already contained completed D1-D3 (`48e6e9f1`) and D2 (`5cb4f4c2`). Later UsageIndex v2 commits restored fact-backed query infrastructure but not the lazy resolver overlay, so current master again builds five unbounded per-file reference maps and caches them behind `Arc`.
+  Evidence: current `crates/bifrost-rust/src/graph_support.rs` contains `named`, `namespace`, `scoped`, `glob`, and `same_file` maps plus eager export-surface builders; `crates/bifrost-analysis/src/analyzer/rust/graph_support.rs` and `rust/mod.rs` own the per-generation caches. The rank-31+ OpenDAL corpus spent 8,144 seconds in one repository with eight inverse workers active on this path.
 - Observation: the forward reference context is built *during a scan*, not only by
   `get_definition`. `resolver.rs::lexical_import_fqn` calls
   `support.forward_reference_context(rust, file)` and is reached from macro token-tree resolution
@@ -247,6 +250,9 @@ measurement is a separate task run after review; it is not part of this plan's a
 
 ## Decision Log
 
+- Decision: Re-port the final lazy algorithm semantically into `brokk-bifrost-rust` over `&dyn RustFactSource`; do not cherry-pick or mechanically replay the pre-crate-split files.
+  Rationale: crate ownership and the fact-backed v2 surfaces changed after the original commits. The reference context now belongs in the Rust language crate, while analyzer caches and construction shims belong in analysis. A semantic overlay preserves current export-index, exact-site, include-route, diagnostics, and UsageIndex v2 behavior without resurrecting obsolete topology.
+  Date/Author: 2026-08-13, Codex.
 - Decision: keep the public type name `RustReferenceContext` and its four resolution methods
   (`resolve_bare`, `resolve_scoped`, `resolve_scoped_owner`, `bare_names_resolving_to`), and change
   the type from an eagerly filled bundle of maps into a lazy per-file resolver that borrows the
@@ -321,6 +327,15 @@ measurement is a separate task run after review; it is not part of this plan's a
   Date/Author: 2026-08-08, Opus.
 
 ## Outcomes & Retrospective
+
+The 2026-08-13 #2087 re-port restores these outcomes on the post-split architecture. The lazy
+resolver now lives in `brokk-bifrost-rust` over `&dyn RustFactSource`; analyzer-owned eager context
+caches and their incomplete weigher are again absent. The current fact-backed export index remains
+shared, while per-question resolution and cancellation state die with each query. D2 now counts
+only deduplicated external hits after recursive calls are classified, bounds the retained sample,
+and stops both later files and later overload candidates when the limit is proved. The restored
+frozen oracle and cost pins prevent another crate-topology merge from silently selecting the eager
+implementation.
 
 All four design components landed. The usage-graph phase no longer precomputes what a file could
 mean; it answers what a site wrote. The reference context went from a bundle of eagerly filled maps

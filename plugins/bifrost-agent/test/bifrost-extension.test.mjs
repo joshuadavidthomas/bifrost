@@ -91,9 +91,16 @@ const theme = {
   bold: (text) => text,
 };
 
-test("restores workspace settings and injects only the short Pi namespace note", async () => {
+test("restores workspace settings and injects MCP instructions before the Pi note", async () => {
   const pi = fakePi();
   const session = fakeSession();
+  session.setStatus({
+    state: "connected",
+    workspace: "/workspace",
+    toolCount: 3,
+    capabilities: ["symbols", "query", "files"],
+    instructions: "Search Bifrost for semantic code structure.",
+  });
   configureBifrostExtension(pi, dependencies(session, ["symbols", "quality"]));
 
   await pi.handlers.get("session_start")({}, {
@@ -104,12 +111,24 @@ test("restores workspace settings and injects only the short Pi namespace note",
   assert.deepEqual(session.starts, [{ workspace: "/workspace", capabilities: ["symbols", "quality"] }]);
 
   const result = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
-  assert.equal(result.systemPrompt, `base\n\n${BIFROST_PROMPT_NOTE}`);
+  assert.equal(
+    result.systemPrompt,
+    `base\n\nSearch Bifrost for semantic code structure.\n\n${BIFROST_PROMPT_NOTE}`,
+  );
 
   session.setStatus({ state: "disconnected", workspace: "/workspace", toolCount: 0, capabilities: [] });
   assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
   session.setStatus({ state: "connected", workspace: "/workspace", toolCount: 0, capabilities: ["symbols"] });
   assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
+});
+
+test("injects the Pi note when MCP instructions are absent", async () => {
+  const pi = fakePi();
+  const session = fakeSession();
+  configureBifrostExtension(pi, dependencies(session));
+
+  const result = await pi.handlers.get("before_agent_start")({ systemPrompt: "base" });
+  assert.equal(result.systemPrompt, `base\n\n${BIFROST_PROMPT_NOTE}`);
 });
 
 test("malformed settings fail closed with a TUI diagnostic", async () => {

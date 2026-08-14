@@ -840,7 +840,7 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
     match assertion {
         PolicyAssert::Occurrence(assertion) => occurrence_assert_to_json(assertion),
         PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
-        PolicyAssert::Reaching(assertion) => reaching_assert_to_json(assertion),
+        PolicyAssert::BindingScope(assertion) => binding_scope_assert_to_json(assertion),
         PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
         PolicyAssert::Generation(assertion) => generation_assert_to_json(assertion),
         PolicyAssert::DeclarationState(assertion) => declaration_state_assert_to_json(assertion),
@@ -849,7 +849,42 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
         PolicyAssert::Canonical(assertion) => canonical_assert_to_json(assertion),
         PolicyAssert::Route(assertion) => route_assert_to_json(assertion),
         PolicyAssert::RoundTrip(assertion) => round_trip_assert_to_json(assertion),
+        PolicyAssert::FlowEstablishment(assertion) => flow_establishment_assert_to_json(assertion),
+        PolicyAssert::RewriteTermination(assertion) => {
+            rewrite_termination_assert_to_json(assertion)
+        }
     }
+}
+
+fn flow_establishment_assert_to_json(assertion: &FlowEstablishmentAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("flow_establishment"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "require", json!(assertion.require.label()));
+    insert(
+        &mut object,
+        "forbid_same_evaluation",
+        json!(assertion.forbid_same_evaluation),
+    );
+    Value::Object(object)
+}
+
+fn rewrite_termination_assert_to_json(assertion: &RewriteTerminationAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("rewrite_termination"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "domain", json!(assertion.domain.label()));
+    insert(
+        &mut object,
+        "scope",
+        match &assertion.scope {
+            Some(scope) => json!(scope),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
 }
 
 fn generation_assert_to_json(assertion: &GenerationAssert) -> Value {
@@ -1068,9 +1103,9 @@ fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {
     Value::Object(object)
 }
 
-fn reaching_assert_to_json(assertion: &ReachingAssert) -> Value {
+fn binding_scope_assert_to_json(assertion: &BindingScopeAssert) -> Value {
     let mut object = serde_json::Map::new();
-    insert(&mut object, "kind", json!("reaching"));
+    insert(&mut object, "kind", json!("binding_scope"));
     insert(&mut object, "id", json!(assertion.id.as_str()));
     insert(&mut object, "at", json!(assertion.at));
     insert(&mut object, "role", json!(assertion.role.label()));

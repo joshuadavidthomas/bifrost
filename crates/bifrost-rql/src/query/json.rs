@@ -1,12 +1,14 @@
 use super::ir::{
     ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
     CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter,
-    ExportFilter, ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed,
-    StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
+    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep,
+    RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter, StringPredicate,
+    UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
-    CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
+    CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
+    usage_surface_label,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
@@ -239,6 +241,93 @@ pub(super) fn binding_filter_to_json(filter: &BindingFilter) -> Map<String, Valu
                     .hoisting
                     .iter()
                     .map(|class| json!(class.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn state_event_filter_to_json(filter: &StateEventFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.classes.is_empty() {
+        object.insert(
+            QueryStepField::StateEventClasses.label().to_string(),
+            Value::Array(
+                filter
+                    .classes
+                    .iter()
+                    .map(|class| json!(class.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.subjects.is_empty() {
+        object.insert(
+            QueryStepField::StateEventSubjects.label().to_string(),
+            Value::Array(
+                filter
+                    .subjects
+                    .iter()
+                    .map(|subject| json!(subject.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn flow_relation_filter_to_json(filter: &FlowRelationFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.relations.is_empty() {
+        object.insert(
+            QueryStepField::FlowRelations.label().to_string(),
+            Value::Array(
+                filter
+                    .relations
+                    .iter()
+                    .map(|relation| json!(relation.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.certainties.is_empty() {
+        object.insert(
+            QueryStepField::FlowCertainties.label().to_string(),
+            Value::Array(
+                filter
+                    .certainties
+                    .iter()
+                    .map(|certainty| json!(certainty.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn rewrite_path_filter_to_json(filter: &RewritePathFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.domains.is_empty() {
+        object.insert(
+            QueryStepField::RewriteDomains.label().to_string(),
+            Value::Array(
+                filter
+                    .domains
+                    .iter()
+                    .map(|domain| json!(domain.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.outcomes.is_empty() {
+        object.insert(
+            QueryStepField::RewriteOutcomes.label().to_string(),
+            Value::Array(
+                filter
+                    .outcomes
+                    .iter()
+                    .map(|outcome| json!(outcome.label()))
                     .collect(),
             ),
         );
@@ -605,8 +694,11 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::Generates
         | QueryStep::GeneratedBy
         | QueryStep::ImplementationOf
+        | QueryStep::StubsOf
         | QueryStep::ExportTarget
         | QueryStep::EdgeTarget
+        | QueryStep::FlowSource
+        | QueryStep::FlowTarget
         | QueryStep::SegmentTarget
         | QueryStep::ReceiverOutcome
         | QueryStep::ReceiverEvidence
@@ -629,6 +721,15 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
             object.extend(edge_filter_to_json(filter));
         }
+        QueryStep::StateEventsOf(filter) => {
+            object.extend(state_event_filter_to_json(filter));
+        }
+        QueryStep::FlowRelationsOf(filter) => {
+            object.extend(flow_relation_filter_to_json(filter));
+        }
+        QueryStep::RewritePathsOf(filter) => {
+            object.extend(rewrite_path_filter_to_json(filter));
+        }
         QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
             object.extend(occurrence_filter_to_json(filter));
         }
@@ -638,7 +739,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::CandidatesOf(filter) => {
             object.extend(candidate_filter_to_json(filter));
         }
-        QueryStep::ReachingBinding(options) => {
+        QueryStep::BindingOf(options) => {
             if options.include_shadowed {
                 object.insert("include_shadowed".to_string(), Value::Bool(true));
             }

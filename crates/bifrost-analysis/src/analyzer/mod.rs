@@ -200,8 +200,10 @@ pub use ruby::{
 pub(crate) use rust::is_rust_public_like_declaration;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
-    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
-    resolve_rust_semantic_pack_dependencies,
+    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustReferenceNamespace,
+    RustdocJsonPackProducer, resolve_rust_semantic_pack_dependencies,
+    rust_declaration_is_enum_variant, rust_declaration_matches_reference_namespace,
+    rust_reference_namespace,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use rust::{

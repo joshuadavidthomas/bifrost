@@ -7127,8 +7127,16 @@ struct Reg *registers(struct Port *port) {
         },
     );
     assert_eq!(
-        "no_definition", macro_forward.results[0].status,
-        "declaration macro must not be a field reference: {:#?}",
+        "resolved", macro_forward.results[0].status,
+        "declaration macro should resolve to its macro definition: {:#?}",
+        macro_forward.results[0]
+    );
+    assert!(
+        macro_forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.name == macro_token && definition.kind == "macro"),
+        "declaration macro must resolve as a macro, not as a field: {:#?}",
         macro_forward.results[0]
     );
 

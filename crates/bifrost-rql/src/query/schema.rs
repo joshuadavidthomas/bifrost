@@ -6,6 +6,10 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
+    FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+};
 use brokk_bifrost_core::analyzer::structural::materialization::ALL_DECLARATION_ORIGINS;
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
@@ -13,6 +17,9 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
 use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
     ALL_REJECTION_REASONS,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    ALL_REWRITE_DOMAIN_KINDS, ALL_REWRITE_OUTCOME_KINDS, RewriteDomainKind, RewriteOutcomeKind,
 };
 use brokk_bifrost_core::analyzer::usages::model::{
     ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
@@ -115,6 +122,12 @@ pub enum ValueShape {
     UsageKindList,
     OwnerRelationList,
     SiteClassList,
+    StateEventClassList,
+    FlowSubjectKindList,
+    FlowRelationList,
+    FlowCertaintyList,
+    RewriteDomainList,
+    RewriteOutcomeList,
 }
 
 impl ValueShape {
@@ -177,6 +190,12 @@ impl ValueShape {
             Self::UsageKindList => "one or more usage kinds",
             Self::OwnerRelationList => "one or more owner relations",
             Self::SiteClassList => "use_site or declaration_site",
+            Self::StateEventClassList => "one or more state-event classes",
+            Self::FlowSubjectKindList => "binding or property",
+            Self::FlowRelationList => "one or more flow relations",
+            Self::FlowCertaintyList => "exact or may",
+            Self::RewriteDomainList => "one or more rewrite domains",
+            Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
         }
     }
 
@@ -372,8 +391,20 @@ macro_rules! query_step_ops {
                 matches!(self, Self::EdgesOf | Self::EdgesFrom)
             }
 
-            pub fn allows_reaching_binding_options(self) -> bool {
-                matches!(self, Self::ReachingBinding)
+            pub fn allows_state_event_options(self) -> bool {
+                matches!(self, Self::StateEventsOf)
+            }
+
+            pub fn allows_flow_relation_options(self) -> bool {
+                matches!(self, Self::FlowRelationsOf)
+            }
+
+            pub fn allows_rewrite_path_options(self) -> bool {
+                matches!(self, Self::RewritePathsOf)
+            }
+
+            pub fn allows_binding_of_options(self) -> bool {
+                matches!(self, Self::BindingOf)
             }
 
             pub fn allows_segment_options(self) -> bool {
@@ -407,7 +438,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, or method-family rows to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -445,7 +476,7 @@ query_step_ops! {
     ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
     ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
     BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
-    ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
+    BindingOf { label: "binding_of", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
     CandidateHierarchy { label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
@@ -453,12 +484,18 @@ query_step_ops! {
     EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
     EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
     EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
+    StateEventsOf { label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive the flow-sensitive state events of each procedure from the production semantic IR: every establishment, kill, and read of a binding or of a property of a canonical binding base, anchored to a program point of that procedure's control-flow graph. Source order and containment are never evidence; an axis the lowering does not model is reported incomplete rather than approximated.", semantic: [Procedures, ProgramPoints] }
+    FlowRelationsOf { label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    FlowSource { label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
+    FlowTarget { label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
+    RewritePathsOf { label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
     SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
     SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
     Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes." }
     GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
     DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
     ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
     ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
 }
 
@@ -624,7 +661,7 @@ macro_rules! rql_forms {
                     | Self::ScopeOf
                     | Self::ScopeAncestors
                     | Self::BindingsIn
-                    | Self::ReachingBinding
+                    | Self::BindingOf
                     | Self::BindingOccurrence
                     | Self::CandidatesOf
                     | Self::CandidateHierarchy
@@ -634,11 +671,17 @@ macro_rules! rql_forms {
                     | Self::GeneratedBy
                     | Self::DeclarationStateOf
                     | Self::ImplementationOf
+                    | Self::StubsOf
                     | Self::ExportTarget
                     | Self::CandidateTarget
                     | Self::EdgesOf
                     | Self::EdgesFrom
-                    | Self::EdgeTarget => None,
+                    | Self::EdgeTarget
+                    | Self::StateEventsOf
+                    | Self::FlowRelationsOf
+                    | Self::FlowSource
+                    | Self::FlowTarget
+                    | Self::RewritePathsOf => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -1182,13 +1225,13 @@ rql_forms! {
         description: (QueryStepOp::BindingsIn),
         step: BindingsIn,
     }
-    ReachingBinding {
-        labels: ["reaching-binding", "reaching_binding"],
+    BindingOf {
+        labels: ["binding-of", "binding_of"],
         class: Wrapper,
         shape: Query,
-        signature: "(reaching-binding [:include-shadowed true] query)",
-        description: (QueryStepOp::ReachingBinding),
-        step: ReachingBinding,
+        signature: "(binding-of [:include-shadowed true] query)",
+        description: (QueryStepOp::BindingOf),
+        step: BindingOf,
     }
     BindingOccurrence {
         labels: ["binding-occurrence", "binding_occurrence"],
@@ -1268,6 +1311,14 @@ rql_forms! {
         description: (QueryStepOp::ImplementationOf),
         step: ImplementationOf,
     }
+    StubsOf {
+        labels: ["stubs-of", "stubs_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(stubs-of query)",
+        description: (QueryStepOp::StubsOf),
+        step: StubsOf,
+    }
     ExportTarget {
         labels: ["export-target", "export_target"],
         class: Wrapper,
@@ -1299,6 +1350,46 @@ rql_forms! {
         signature: "(edge-target query)",
         description: (QueryStepOp::EdgeTarget),
         step: EdgeTarget,
+    }
+    StateEventsOf {
+        labels: ["state-events-of", "state_events_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(state-events-of [:class [establish|kill|read ...]] [:subject [binding|property ...]] query)",
+        description: (QueryStepOp::StateEventsOf),
+        step: StateEventsOf,
+    }
+    FlowRelationsOf {
+        labels: ["flow-relations-of", "flow_relations_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-relations-of [:relation [reaching|dominates|same-evaluation ...]] [:certainty [exact|may ...]] query)",
+        description: (QueryStepOp::FlowRelationsOf),
+        step: FlowRelationsOf,
+    }
+    FlowSource {
+        labels: ["flow-source", "flow_source"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-source query)",
+        description: (QueryStepOp::FlowSource),
+        step: FlowSource,
+    }
+    FlowTarget {
+        labels: ["flow-target", "flow_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-target query)",
+        description: (QueryStepOp::FlowTarget),
+        step: FlowTarget,
+    }
+    RewritePathsOf {
+        labels: ["rewrite-paths-of", "rewrite_paths_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(rewrite-paths-of [:domain [rust-import-alias ...]] [:outcome [converged|cycle|exceeded-budget ...]] query)",
+        description: (QueryStepOp::RewritePathsOf),
+        step: RewritePathsOf,
     }
     Name {
         labels: ["name"],
@@ -1567,7 +1658,7 @@ json_fields! {
     BindingKinds { label: "kind", shape: BindingKindList, signature: "\"kind\": [\"local\", ...]", description: "Restrict binding rows to one or more binder kinds." }
     BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
     BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
-    IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the reaching binding shadows, instead of the winner alone." }
+    IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the binding-of answer shadows, instead of the winner alone." }
     Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
     CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
@@ -1578,6 +1669,12 @@ json_fields! {
     EdgeUsageKinds { label: "usage", shape: UsageKindList, signature: "\"usage\": [\"reference\", \"self_receiver\", ...]", description: "Restrict edge rows to one or more usage kinds." }
     EdgeRelations { label: "relation", shape: OwnerRelationList, signature: "\"relation\": [\"same_owner\", ...]", description: "Restrict edge rows to one or more owner relations between the site's encloser and the target." }
     EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
+    StateEventClasses { label: "event_class", shape: StateEventClassList, signature: "\"event_class\": [\"establish\", \"read\", ...]", description: "Restrict state-event rows to one or more event classes." }
+    StateEventSubjects { label: "subject", shape: FlowSubjectKindList, signature: "\"subject\": [\"binding\", \"property\"]", description: "Restrict state-event rows to binding subjects or property subjects." }
+    FlowRelations { label: "flow_relation", shape: FlowRelationList, signature: "\"flow_relation\": [\"reaching\", ...]", description: "Restrict flow-relation rows to one or more relations." }
+    RewriteDomains { label: "domain", shape: RewriteDomainList, signature: "\"domain\": [\"rust_import_alias\"]", description: "Restrict rewrite-path rows to one or more declared rewrite domains." }
+    RewriteOutcomes { label: "rewrite_outcome", shape: RewriteOutcomeList, signature: "\"rewrite_outcome\": [\"converged\", \"cycle\", \"exceeded_budget\"]", description: "Restrict rewrite-path rows to one or more terminal outcomes." }
+    FlowCertainties { label: "certainty", shape: FlowCertaintyList, signature: "\"certainty\": [\"exact\", \"may\"]", description: "Restrict flow-relation rows to one or more certainties." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -1706,8 +1803,39 @@ pub const CANDIDATE_STEP_OPTIONS: &[QueryStepOption] = &[
     ),
 ];
 
-/// Options of the `reaching-binding` step (#1474).
-pub const REACHING_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+/// Options of the `state-events-of` step (#1480).
+pub const STATE_EVENT_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::StateEventClasses, &[":class", ":classes"]),
+    QueryStepOption::optional(
+        QueryStepField::StateEventSubjects,
+        &[":subject", ":subjects"],
+    ),
+];
+
+/// Options of the `flow-relations-of` step (#1480).
+pub const FLOW_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::FlowRelations, &[":relation", ":relations"]),
+    QueryStepOption::optional(
+        QueryStepField::FlowCertainties,
+        &[":certainty", ":certainties"],
+    ),
+];
+
+pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<QueryStepOption> {
+    op.options()
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// Options of the `rewrite-paths-of` step (#1480).
+pub const REWRITE_PATH_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::RewriteDomains, &[":domain", ":domains"]),
+    QueryStepOption::optional(QueryStepField::RewriteOutcomes, &[":outcome", ":outcomes"]),
+];
+
+/// Options of the `binding-of` step (#1474).
+pub const BINDING_OF_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
     QueryStepField::IncludeShadowed,
     &[":include-shadowed", ":include_shadowed"],
 )];
@@ -1779,8 +1907,11 @@ impl QueryStepOp {
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,
             Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
-            Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS,
+            Self::BindingOf => BINDING_OF_STEP_OPTIONS,
             Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
+            Self::StateEventsOf => STATE_EVENT_STEP_OPTIONS,
+            Self::FlowRelationsOf => FLOW_RELATION_STEP_OPTIONS,
+            Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -1880,6 +2011,83 @@ pub fn environment_filter_labels(field: QueryStepField) -> Vec<&'static str> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The constrained-value vocabulary each flow-state filter axis accepts, in
+/// canonical registry order, so parser, validator, hover and completion all
+/// read one table (#1480, the `occurrence_filter_labels` shape).
+pub fn flow_state_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::StateEventClasses => ALL_STATE_EVENT_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::StateEventSubjects => ALL_FLOW_SUBJECT_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect(),
+        QueryStepField::FlowRelations => ALL_FLOW_RELATIONS
+            .iter()
+            .map(|relation| relation.label())
+            .collect(),
+        QueryStepField::FlowCertainties => ALL_FLOW_CERTAINTIES
+            .iter()
+            .map(|certainty| certainty.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The constrained-value vocabulary one *step option* axis accepts, whichever
+/// row family owns it. Parser, validator, hover and completion all read this
+/// one entry point, so a new constrained axis is spelled once (#1480).
+pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str> {
+    let flow_state = flow_state_filter_labels(field);
+    if !flow_state.is_empty() {
+        return flow_state;
+    }
+    rewrite_path_filter_labels(field)
+}
+
+/// The constrained-value vocabulary each rewrite-path filter axis accepts, in
+/// canonical registry order, so parser, validator, hover and completion all
+/// read one table (#1480).
+pub fn rewrite_path_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::RewriteDomains => ALL_REWRITE_DOMAIN_KINDS
+            .iter()
+            .map(|domain| domain.label())
+            .collect(),
+        QueryStepField::RewriteOutcomes => ALL_REWRITE_OUTCOME_KINDS
+            .iter()
+            .map(|outcome| outcome.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn rewrite_domain_from_label(label: &str) -> Option<RewriteDomainKind> {
+    RewriteDomainKind::from_label(label)
+}
+
+pub fn rewrite_outcome_from_label(label: &str) -> Option<RewriteOutcomeKind> {
+    RewriteOutcomeKind::from_label(label)
+}
+
+pub fn state_event_class_from_label(label: &str) -> Option<StateEventClass> {
+    StateEventClass::from_label(label)
+}
+
+pub fn flow_subject_kind_from_label(label: &str) -> Option<FlowSubjectKind> {
+    FlowSubjectKind::from_label(label)
+}
+
+pub fn flow_relation_from_label(label: &str) -> Option<FlowRelation> {
+    FlowRelation::from_label(label)
+}
+
+pub fn flow_certainty_from_label(label: &str) -> Option<FlowCertainty> {
+    FlowCertainty::from_label(label)
 }
 
 pub fn usage_proof_label(proof: UsageProof) -> &'static str {

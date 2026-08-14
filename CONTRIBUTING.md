@@ -1,5 +1,9 @@
 # Contributing
 
+## Contribution Policy
+
+Bifrost no longer accepts pull requests. We accept open source contributions only through [GitHub Issues](https://github.com/BrokkAi/bifrost/issues) and [GitHub Discussions](https://github.com/BrokkAi/bifrost/discussions). Please use those channels to report bugs, propose improvements, share use cases, or discuss potential changes.
+
 ## Development Setup
 
 Rust build:
@@ -121,9 +125,10 @@ node scripts/release-version.mjs sync
 
 That script updates these committed version fields:
 
-- `plugins/bifrost-agent/.codex-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
 - `editors/vscode/package.json`
 - `editors/vscode/package-lock.json`
@@ -141,8 +146,9 @@ currently do not carry version fields:
 - `.agents/plugins/marketplace.json`
 - `.claude-plugin/marketplace.json`
 
-The VS Code extension and bundled agent plugin also pin the Bifrost release
-archive checksums:
+The VS Code extension and bundled agent plugin also share the preferred,
+minimum, and prerelease compatibility fields and pin the preferred Bifrost
+release archive checksums:
 
 - `editors/vscode/package.json`
 - `plugins/bifrost-agent/bifrost-release.json`
@@ -180,22 +186,61 @@ To cut a release:
 
    ```bash
    node scripts/release-version.mjs check
+   node scripts/check-agent-plugins-v1.mjs
    node scripts/check-codex-plugin-manifest.mjs
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-codex-plugin-manifest.mjs` checks the Codex, Claude, Cursor, and Pi
-   manifests, the Cursor marketplace versions, the generated Codex and Amp
-   bundles, and parseability of the Codex and Claude marketplace files. It also
-   checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
-   release metadata has been prepared for the version being validated.
-5. Sync the release version projection and every stabilization fix from the RC
+   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
+   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
+   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
+   release metadata. Run both after
+   the release metadata has been prepared for the version being validated.
+5. Before you create the final tag, treat the RC commit as green only after its
+   required branch checks and these release-specific checks pass:
+
+   ```bash
+   scripts/pre-push-gate.sh
+   cargo build --release --locked --bin bifrost
+   plugin_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-agent-pretag.XXXXXX")"
+   mkdir -p "$plugin_smoke_root/package" "$plugin_smoke_root/extracted"
+   git archive HEAD plugins/bifrost-agent | tar -C "$plugin_smoke_root/package" -xf -
+   cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "$plugin_smoke_root/package/plugins/bifrost-agent/"
+   tar -C "$plugin_smoke_root/package/plugins" -czf "$plugin_smoke_root/bifrost-agent.tar.gz" bifrost-agent
+   tar -C "$plugin_smoke_root/extracted" -xzf "$plugin_smoke_root/bifrost-agent.tar.gz"
+   plugin_smoke_dir="$(cd "$plugin_smoke_root/extracted/bifrost-agent" && pwd -P)"
+   node scripts/smoke-agent-plugin-release.mjs \
+     --plugin-dir "$plugin_smoke_dir" \
+     --cache-dir "$plugin_smoke_root/cache" \
+     --binary-path "$(pwd)/target/release/bifrost"
+   rm -rf "$plugin_smoke_root"
+   target/release/bifrost \
+     --root . \
+     --format sarif \
+     --output target/release-rc-policy.sarif \
+     --fail-on never \
+     --policy-pack bifrost.code-smells
+   ```
+
+   The staged-agent command reproduces the prepublication plugin boundary: it
+   packages the portable plugin, extracts it away from the checkout, launches
+   that package with the exact optimized binary to be tagged, and exercises
+   both Codex metadata and MCP roots workspace binding plus policy discovery
+   and execution. Do not substitute the plugin unit tests or manifest checks
+   for this end-to-end smoke.
+
+   The policy command is a release-artifact smoke test. Existing findings do
+   not fail it. An unreliable scan still exits with status 2 and blocks the
+   release. Do not tag the RC commit only because its ordinary branch CI is
+   green. Confirm that each release-only promotion gate has an equivalent
+   pre-tag check, and run it on the frozen RC commit.
+6. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-6. After the RC branch is frozen and validated, tag the validated RC commit -
+7. After the RC branch is frozen and validated, tag the validated RC commit -
    not the current `master` tip - and push the tag:
 
    ```bash
@@ -291,12 +336,28 @@ from a clean, reviewed commit. Then set the crate owners and configure the
 trusted publisher per the checklist above, and verify that configuration
 before you tag.
 
-Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
-use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its
-validated artifacts. If a new run is necessary, dispatch the same tag again; never
-recover a partial release from a different branch, commit, or tag. The release
-summary records completed and pending publication targets, including the VS Code
-release attachment and Marketplace publication separately.
+Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual
+release. Dispatch it from `master`. The workflow definition comes from
+`master`, but every build and publication input comes from the immutable tag.
+This separation permits a workflow-only recovery without moving the tag or
+changing the released source.
+
+If a target fails, first use GitHub Actions' **Re-run failed jobs** for that
+workflow run. This action reuses its validated artifacts. If a new run is
+necessary, dispatch the same tag again. Never recover a partial release from a
+different branch, commit, or tag.
+
+Registry visibility can lag after a successful upload. For example, Open VSX
+can accept a VSIX before its version API returns it. If the upload succeeded
+but the visibility check timed out, confirm that the public artifact has the
+expected version and checksum. Then rerun the failed job. Do not upload a
+different artifact for the same version.
+
+The npm publication workflow starts only after the parent Release workflow
+succeeds. After recovery, confirm both workflows are green. Also confirm the
+root npm package and all platform packages expose the released version. The
+release summary records completed and pending publication targets, including
+the VS Code release attachment and Marketplace publication separately.
 
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's

@@ -649,7 +649,9 @@ fn provider_listed_seed_files_with_unavailable_source_or_facts_are_incomplete() 
 fn formerly_unsupported_languages_are_searched_after_adapter_registration() {
     let project = InlineTestProject::new()
         .file("src/app.py", USES_EVAL_PY)
-        .file("src/tool.rb", "def run\n  eval(input)\nend\n")
+        // `input` is a parameter so the argument stays a local-variable read;
+        // an unbound identifier there would be a second bare-call row (#1956).
+        .file("src/tool.rb", "def run(input)\n  eval(input)\nend\n")
         .build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let analyzer = workspace.analyzer();

@@ -450,6 +450,14 @@ pub struct SignatureMetadata {
     return_type_text: Option<String>,
     #[serde(default)]
     return_type_identity: Option<StructuredTypeIdentity>,
+    /// The declared type's structured right-hand side, such as the
+    /// `[256]*operation` in `type JumpTable [256]*operation`.
+    ///
+    /// This is distinct from a callable or field return type and from an
+    /// embedded supertype. Consumers use it to retain container shape through
+    /// a named type without accidentally treating its element as inheritance.
+    #[serde(default)]
+    underlying_type_identity: Option<StructuredTypeIdentity>,
     #[serde(default)]
     declaration_only: bool,
     #[serde(default)]
@@ -1428,6 +1436,19 @@ impl StructuredTypeIdentity {
         Some(self)
     }
 
+    /// Consumes a map identity and selects its key node without cloning the
+    /// arena.
+    pub fn into_map_key_with(mut self, mut visit: impl FnMut() -> bool) -> Option<Self> {
+        if !visit() {
+            return None;
+        }
+        self.root = match self.node(self.root)? {
+            StructuredTypeNode::Map { key, .. } => *key,
+            _ => return None,
+        };
+        Some(self)
+    }
+
     /// Compares only the reachable type shapes, charging once for each node
     /// inspected in both identities.
     pub fn structurally_eq_with(
@@ -1700,6 +1721,7 @@ impl SignatureMetadata {
             parameters,
             return_type_text: None,
             return_type_identity: None,
+            underlying_type_identity: None,
             declaration_only: false,
             callable_arity: None,
             type_parameters: Vec::new(),
@@ -1862,6 +1884,14 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_underlying_type_identity(
+        mut self,
+        underlying_type_identity: Option<StructuredTypeIdentity>,
+    ) -> Self {
+        self.underlying_type_identity = underlying_type_identity;
+        self
+    }
+
     pub fn with_declaration_only(mut self, declaration_only: bool) -> Self {
         self.declaration_only = declaration_only;
         self
@@ -1971,8 +2001,27 @@ impl SignatureMetadata {
         self.return_type_identity
     }
 
+    pub fn underlying_type_identity(&self) -> Option<&StructuredTypeIdentity> {
+        self.underlying_type_identity.as_ref()
+    }
+
+    pub fn into_underlying_type_identity(self) -> Option<StructuredTypeIdentity> {
+        self.underlying_type_identity
+    }
+
     pub fn is_declaration_only(&self) -> bool {
         self.declaration_only
+    }
+
+    /// Whether a unit whose signature rows are `metadata` is declaration-only
+    /// as a whole: it has signature rows and none of them is runnable.
+    ///
+    /// Python keeps each `@overload` stub as its own unit, so its one row
+    /// decides alone. TypeScript merges every overload signature and the
+    /// implementation of one callable into a single unit, so a unit with any
+    /// runnable row is runnable even though its stub rows are not.
+    pub fn unit_is_declaration_only(metadata: &[Self]) -> bool {
+        !metadata.is_empty() && metadata.iter().all(Self::is_declaration_only)
     }
 
     pub fn callable_arity(&self) -> Option<CallableArity> {
@@ -2121,6 +2170,16 @@ struct ProjectFileInner {
     /// Computed once, at construction. `Hash` writes it rather than re-walking
     /// both paths on every `HashMap` / `moka` touch.
     path_hash: u64,
+    /// The language the extension registry gives this path, and whether no
+    /// language claims the extension at all. Both are pure functions of
+    /// `rel_path`, and both are asked repeatedly per file -- once per
+    /// `CodeUnit` rendered from it, once per candidate row filtered by its
+    /// storage key -- so they are answered once here rather than by walking
+    /// the path backwards to its extension on every question (issue #1928
+    /// measured 4.08% of a chromium probe phase inside
+    /// `Components::parse_next_component_back`).
+    language: Language,
+    unclaimed_extension: bool,
 }
 
 #[derive(Clone)]
@@ -2156,15 +2215,47 @@ impl ProjectFile {
 
     fn from_interned_root(root: Arc<Path>, rel_path: PathBuf) -> Self {
         let path_hash = project_file_path_hash(&root, &rel_path);
+        let extension = rel_path.extension().and_then(|ext| ext.to_str());
+        let language = extension.map_or(Language::None, Language::from_extension);
+        // A file with no extension qualifies: no extension list can name it.
+        let unclaimed_extension = extension.is_none_or(|ext| !Language::is_source_extension(ext));
         Self(Arc::new(ProjectFileInner {
             root,
             rel_path,
             path_hash,
+            language,
+            unclaimed_extension,
         }))
     }
 
     pub fn root(&self) -> &Path {
         &self.0.root
+    }
+
+    /// The language whose extension registry owns this path, decided once at
+    /// construction. `analyzer::common::language_for_file` is the same answer
+    /// reached through the free function every caller already uses.
+    pub fn language(&self) -> Language {
+        self.0.language
+    }
+
+    /// Whether no analyzable language claims this path's extension -- the
+    /// eligibility rule for include-driven language inference (#1837). See
+    /// `analyzer::common::has_unclaimed_extension` for what rests on it.
+    pub fn has_unclaimed_extension(&self) -> bool {
+        self.0.unclaimed_extension
+    }
+
+    /// The language whose spelling rules name a declaration found in this file.
+    /// See `analyzer::common::declaration_language_for_file`, which is where
+    /// the rule is explained and which delegates here.
+    pub fn declaration_language(&self) -> Language {
+        match self.0.language {
+            Language::None if self.0.unclaimed_extension => {
+                crate::analyzer::common::INCLUDE_CLAIMING_LANGUAGE
+            }
+            language => language,
+        }
     }
 
     /// Whether two files sit under the same workspace root. Interning makes the
@@ -2319,48 +2410,44 @@ struct RenderedCodeUnitName {
 }
 
 impl RenderedCodeUnitName {
+    /// Render the name ONCE and take every projection as a span of it.
+    ///
+    /// Each projection this records -- the package prefix, the declaration
+    /// tail, the terminal identifier, the owner's terminal identifier -- is a
+    /// contiguous span of the full rendering, which is why they can be stored
+    /// as offsets at all. `FqName::render_native` reports those spans directly,
+    /// so a unit costs one string and one pass over its segments instead of
+    /// four to six renderings of overlapping prefixes and suffixes. Hydrating a
+    /// candidate row builds one of these per row, which is what put
+    /// `SegmentInterner::resolve` and `malloc` at the top of issue #1928's
+    /// chromium probe profile.
     fn new(source: &ProjectFile, fq: &FqName, package_segment_count: usize) -> Self {
-        let language = crate::analyzer::common::declaration_language_for_file(source);
-        let interner = segment_interner();
-        let package = fq
-            .prefix(package_segment_count)
-            .display_native(language, interner);
-        let short = fq
-            .suffix_from(package_segment_count)
-            .display_native(language, interner);
-        let identifier = fq
-            .suffix_from(fq.len() - 1)
-            .display_native(language, interner);
-        let display = fq.display_native(language, interner);
+        let language = source.declaration_language();
+        let rendered = fq.render_native(language, segment_interner());
         let owner_identifier = (fq.len() >= 2).then(|| {
-            let owner_prefix = fq.prefix(fq.len() - 1);
-            let owner_display = owner_prefix.display_native(language, interner);
-            let owner_terminal = owner_prefix
-                .suffix_from(owner_prefix.len() - 1)
-                .display_native(language, interner);
-            assert!(
-                display.starts_with(&owner_display) && owner_display.ends_with(&owner_terminal),
-                "structured CodeUnit owner identifier must be a slice of its rendered FqName"
-            );
             (
-                owner_display.len() - owner_terminal.len(),
-                owner_display.len(),
+                rendered.segment_start(fq.len() - 2),
+                rendered.segment_end(fq.len() - 2),
             )
         });
-        assert!(
-            display.starts_with(&package) && display.ends_with(&short),
-            "structured CodeUnit projections must be slices of its rendered FqName"
-        );
-        assert!(
-            display.ends_with(&identifier),
-            "structured CodeUnit identifier must be the rendered terminal segment"
+        let package_end = rendered.prefix_end(package_segment_count);
+        let short_start = rendered.suffix_start(package_segment_count);
+        let identifier_start = rendered.segment_start(fq.len() - 1);
+        debug_assert!(
+            package_end <= short_start
+                && short_start <= identifier_start
+                && identifier_start < rendered.text().len(),
+            "CodeUnit projections must nest inside its rendering \
+             (package_end={package_end}, short_start={short_start}, \
+             identifier_start={identifier_start}, display={:?})",
+            rendered.text()
         );
         Self {
-            package_end: package.len(),
-            short_start: display.len() - short.len(),
-            identifier_start: display.len() - identifier.len(),
+            package_end,
+            short_start,
+            identifier_start,
             owner_identifier,
-            display,
+            display: rendered.into_text(),
         }
     }
 }
@@ -2430,22 +2517,22 @@ impl CodeUnit {
             !fq.is_empty() && !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
-        let language = crate::analyzer::common::declaration_language_for_file(&source);
-        let interner = segment_interner();
+        let language = source.declaration_language();
+        // One rendering answers every candidate boundary: the prefix and suffix
+        // renderings the boundary search compares are spans of it, so this is a
+        // scan over offsets rather than 2*(len+1) renderings of one name.
+        let rendered = fq.render_native(language, segment_interner());
         let package_segment_count = (0..=fq.len())
             .find(|&prefix_len| {
-                fq.prefix(prefix_len).display_native(language, interner) == package_name
-                    && fq
-                        .suffix_from(prefix_len)
-                        .display_native(language, interner)
-                        == short_name
+                rendered.text()[..rendered.prefix_end(prefix_len)] == *package_name
+                    && rendered.text()[rendered.suffix_start(prefix_len)..] == *short_name
             })
             .unwrap_or_else(|| {
                 panic!(
                     "FqName does not contain the supplied package/short boundary \
                      (kind={kind:?}, language={language:?}, package_name={package_name:?}, \
                      short_name={short_name:?}, fq={:?})",
-                    fq.display_native(language, interner),
+                    rendered.text(),
                 )
             });
         Self::from_fq(
@@ -2547,6 +2634,25 @@ impl CodeUnit {
 
     pub fn package_fq(&self) -> FqName {
         self.0.fq.prefix(self.0.package_segment_count)
+    }
+
+    /// This declaration's qualified name as its recorded segment texts, root to
+    /// leaf.
+    ///
+    /// These are the boundaries the language extractor recorded, which the
+    /// rendered `fq_name()` cannot always be split back into: a segment may
+    /// itself contain `.`, `/` or `::` (a JS/TS object-literal key such as
+    /// `"data/web-interface.csv"`, a Go import-path head such as `github.com`).
+    /// Any consumer that needs the segments must read them here rather than
+    /// re-split the rendered string (#2111).
+    pub fn fq_segment_texts(&self) -> Vec<String> {
+        let interner = segment_interner();
+        self.0
+            .fq
+            .segments()
+            .iter()
+            .map(|&id| interner.resolve(id).0.to_string())
+            .collect()
     }
 
     /// Debug/test-only view of the structured `fq` as ordered `(kind_name,
@@ -3870,20 +3976,17 @@ mod structured_type_identity_tests {
     }
 
     #[test]
-    fn rerooted_container_identity_compares_by_reachable_shape() {
+    fn rerooted_map_identities_compare_by_reachable_shape() {
         let service =
             StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
         let key = StructuredTypeName::new(vec!["string".to_string()], Vec::new(), false).unwrap();
 
         let mut map_builder = StructuredTypeIdentityBuilder::default();
-        let key_id = map_builder.named(key).unwrap();
+        let key_id = map_builder.named(key.clone()).unwrap();
         let value_id = map_builder.named(service.clone()).unwrap();
         let map_id = map_builder.map(key_id, value_id).unwrap();
-        let value = map_builder
-            .finish(map_id)
-            .unwrap()
-            .into_container_element_with(|| true)
-            .unwrap();
+        let map = map_builder.finish(map_id).unwrap();
+        let value = map.clone().into_container_element_with(|| true).unwrap();
 
         let mut named_builder = StructuredTypeIdentityBuilder::default();
         let named_id = named_builder.named(service).unwrap();
@@ -3891,6 +3994,14 @@ mod structured_type_identity_tests {
 
         assert_eq!(value, named);
         assert_eq!(hash(&value), hash(&named));
+
+        let key_identity = map.into_map_key_with(|| true).unwrap();
+        let mut named_builder = StructuredTypeIdentityBuilder::default();
+        let named_id = named_builder.named(key).unwrap();
+        let named = named_builder.finish(named_id).unwrap();
+
+        assert_eq!(key_identity, named);
+        assert_eq!(hash(&key_identity), hash(&named));
     }
 }
 
@@ -4175,5 +4286,135 @@ mod project_file_identity_tests {
         assert_eq!(left.cmp(&right), reference_cmp(&left, &right));
         assert_eq!(right.cmp(&left), reference_cmp(&right, &left));
         assert_ne!(hash_of(&left), hash_of(&right));
+    }
+}
+
+/// Cost pins for the per-declaration identity work issue #1928 profiled.
+///
+/// These count operations, never wall-clock time. A regression here is a
+/// construction path that renders one name several times over, or that walks a
+/// path back to its extension per declaration instead of per file -- exactly
+/// the shapes that put `SegmentInterner::resolve`, `malloc`, and
+/// `Components::parse_next_component_back` at the top of the chromium probe
+/// profile.
+#[cfg(test)]
+mod identity_cost_tests {
+    use super::*;
+    use crate::analyzer::fq_name::{SegmentInterner, SegmentKind, counters};
+
+    fn absolute_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\identity-cost")
+        } else {
+            PathBuf::from("/identity-cost")
+        }
+    }
+
+    /// A C++-shaped name with a `::`-joined namespace head, a type, and a
+    /// member: four segments, the shape a chromium candidate row hydrates to.
+    fn cpp_unit_fq(interner: &SegmentInterner) -> (FqName, usize) {
+        let mut fq = FqName::new();
+        fq.push(interner.intern("blink", SegmentKind::Package));
+        fq.push(interner.intern("scheduler", SegmentKind::Package));
+        fq.push(interner.intern("MainThreadTaskQueue", SegmentKind::Type));
+        fq.push(interner.intern("ShutdownTaskQueue", SegmentKind::Member));
+        (fq, 2)
+    }
+
+    /// Building a `CodeUnit` from an already-interned name resolves each
+    /// segment exactly once and interns nothing.
+    ///
+    /// It used to render the name six times over -- the full display, the
+    /// package prefix, the declaration tail, the terminal identifier, and for a
+    /// name with an owner the owner prefix and the owner's terminal --
+    /// resolving every segment again for each, and allocating a `String` and a
+    /// segment `SmallVec` per rendering. For this four-segment name that was
+    /// 4+2+2+1+3+1 = 13 resolves and six strings; it is now 4 and one.
+    #[test]
+    fn building_a_code_unit_resolves_each_segment_once() {
+        let interner = segment_interner();
+        let file = ProjectFile::new(absolute_root(), "third_party/blink/task_queue.cc");
+        let (fq, package_segment_count) = cpp_unit_fq(interner);
+        let segments = fq.len();
+
+        counters::reset();
+        let unit = CodeUnit::from_fq(
+            file,
+            CodeUnitType::Function,
+            fq,
+            package_segment_count,
+            None,
+            false,
+        );
+        let (resolves, interns) = counters::counts();
+
+        assert_eq!(
+            resolves, segments as u64,
+            "one rendering of the name, not one per projection"
+        );
+        assert_eq!(interns, 0, "an already-interned name re-interns nothing");
+        // The projections the single rendering is sliced into are unchanged.
+        assert_eq!(
+            unit.fq_name(),
+            "blink::scheduler.MainThreadTaskQueue.ShutdownTaskQueue"
+        );
+        assert_eq!(unit.package_name(), "blink::scheduler");
+        assert_eq!(unit.short_name(), "MainThreadTaskQueue.ShutdownTaskQueue");
+        assert_eq!(unit.identifier(), "ShutdownTaskQueue");
+        assert_eq!(unit.owner_identifier(), Some("MainThreadTaskQueue"));
+    }
+
+    /// Hydrating many rows of one file -- the candidate-loading shape -- pays
+    /// the per-segment interner cost once per declaration, with no per-row
+    /// multiplier from the projections each `CodeUnit` exposes.
+    #[test]
+    fn hydrating_rows_of_one_file_scales_by_segment_not_by_projection() {
+        const ROWS: usize = 64;
+        let interner = segment_interner();
+        let file = ProjectFile::new(absolute_root(), "third_party/blink/renderer.cc");
+        let (base, package_segment_count) = cpp_unit_fq(interner);
+
+        let names: Vec<FqName> = (0..ROWS)
+            .map(|row| {
+                base.prefix(3)
+                    .with_pushed(interner.intern(&format!("Method{row}"), SegmentKind::Member))
+            })
+            .collect();
+
+        counters::reset();
+        for fq in names {
+            CodeUnit::from_fq(
+                file.clone(),
+                CodeUnitType::Function,
+                fq,
+                package_segment_count,
+                None,
+                false,
+            );
+        }
+        let (resolves, interns) = counters::counts();
+
+        assert_eq!(resolves, (ROWS * 4) as u64);
+        assert_eq!(interns, 0);
+    }
+
+    /// A file answers its language from the value it computed at construction,
+    /// so a declaration never re-derives it from the path.
+    #[test]
+    fn project_file_answers_language_questions_without_reparsing_the_path() {
+        let cpp = ProjectFile::new(absolute_root(), "src/renderer.cc");
+        assert_eq!(cpp.language(), Language::Cpp);
+        assert_eq!(cpp.declaration_language(), Language::Cpp);
+        assert!(!cpp.has_unclaimed_extension());
+
+        // An extensionless vendored header: unclaimed, so a declaration found
+        // in it is spelled by the claiming analyzer's language (#1878).
+        let extensionless = ProjectFile::new(absolute_root(), "third_party/tbb/include/mutex");
+        assert_eq!(extensionless.language(), Language::None);
+        assert!(extensionless.has_unclaimed_extension());
+        assert_eq!(
+            extensionless.declaration_language(),
+            crate::analyzer::common::INCLUDE_CLAIMING_LANGUAGE
+        );
     }
 }

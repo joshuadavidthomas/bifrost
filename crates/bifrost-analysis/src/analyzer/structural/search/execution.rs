@@ -826,6 +826,8 @@ pub(super) fn execute_parallel_seed_union(
                     materialization_cache: materialization::MaterializationTraversalCache::default(
                     ),
                     edge_cache: EdgeTraversalCache::default(),
+                    flow_state_cache: FlowStateTraversalCache::default(),
+                    rewrite_path_cache: RewritePathTraversalCache::default(),
                     path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
@@ -1110,6 +1112,10 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
             | CodeQueryDiagnosticCode::EdgeAxisUnsupported
             | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
+            | CodeQueryDiagnosticCode::FlowStateAxisUnsupported
+            | CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
+            | CodeQueryDiagnosticCode::RewriteDomainUnsupported
+            | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
             | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }

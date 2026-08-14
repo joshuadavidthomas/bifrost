@@ -5509,7 +5509,7 @@ object Tokens {
         ),
         ("app/Use.scala", consumer_source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positives, negative) in [
@@ -5649,7 +5649,7 @@ object HttpCodecError {
         ),
         ("app/Use.scala", consumer),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, line, token, positive, negative) in [
@@ -5766,7 +5766,7 @@ object EntityTag {
         ),
         ("org/http4s/Consumer.scala", consumer),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, line, token, positive, negative) in [
@@ -6116,7 +6116,7 @@ object Replica {
         ),
         ("app/Use.scala", consumer_source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     let request = definition(&analyzer, "model.Request$");
@@ -6214,7 +6214,7 @@ object Forwarded {
         ),
         ("app/Use.scala", consumer_source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive) in [
@@ -6277,7 +6277,7 @@ object Use {
 }
 "#;
     let (_project, analyzer) = scala_analyzer_with_files(&[("app/Replay.scala", source)]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive, negative) in [
@@ -6359,7 +6359,7 @@ object Use {
         ),
         ("app/Use.scala", consumer_source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive, negative, line, token) in [
@@ -6422,7 +6422,7 @@ object OtherSyntax:
     def invert: Boolean = value.nonEmpty // negative-other-receiver-invert
 "#;
     let (_project, analyzer) = scala_analyzer_with_files(&[("app/Syntax.scala", source)]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target, positive, negative, line, token) in [
@@ -6514,7 +6514,7 @@ object Use {
         ),
         ("app/Use.scala", source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target, positives, negatives) in [
@@ -6612,7 +6612,7 @@ final class Decoy {
 }
 "#;
     let (_project, analyzer) = scala_analyzer_with_files(&[("app/Config.scala", source)]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive, negatives, line, token) in [
@@ -6783,7 +6783,7 @@ object Decoys {
 }
 "#;
     let (_project, analyzer) = scala_analyzer_with_files(&[("app/ZioHttpShapes.scala", source)]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive, negatives, line, token) in [
@@ -6884,7 +6884,7 @@ object MatchFields {
         ),
         ("app/Use.scala", consumer_source),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, positive, negative) in [
@@ -6940,7 +6940,7 @@ object NettyConfig {
         ),
         ("app/Use.scala", consumer),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     let target = definition(&analyzer, "model.netty.NettyConfig$");
@@ -8756,7 +8756,7 @@ object Use {
 "#,
         ),
     ]);
-    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
 
     for (target_fqn, line, token, positive, negative) in [

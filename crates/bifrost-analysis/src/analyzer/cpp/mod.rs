@@ -52,6 +52,8 @@ pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
+use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
+use brokk_bifrost_cpp::graph::resolver::SourceUsingIndex;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
@@ -62,6 +64,7 @@ use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{
     weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
     weight_project_file_set, weight_reconcile_candidates, weight_reconciled_groups,
+    weight_source_using_index,
 };
 use clones::build_clone_candidate_data;
 
@@ -84,6 +87,12 @@ pub struct CppAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    /// The per-file structured using index behind
+    /// [`CppSource::source_using_index`]. Memoized here rather than on
+    /// `VisibilityIndex` because a fresh visibility index is built per usage
+    /// query, and rebuilding this index per query re-walked a 9.5 MB
+    /// amalgamation's AST once per candidate (issue #1927).
+    source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
     unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
@@ -115,6 +124,7 @@ pub struct CppAnalyzer {
     /// the exclusion verdict is a pure function of the analyzer and the file.
     direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
+    external_header_closures: Arc<KeyedPoolSafeMemo<ProjectFile, external::ReachedExternalHeaders>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -126,6 +136,10 @@ pub struct CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     visible_type_units_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
+    source_using_index_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    using_guard_context_inspection_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Identifier-index scans issued for reconciliation. One per member
     /// identifier after #1908; one per queried fq name before it.
@@ -135,11 +149,54 @@ pub struct CppAnalyzer {
     /// counted 11.0M of.
     #[cfg(any(test, feature = "test-support"))]
     reconcile_candidate_evaluation_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    external_header_closure_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    external_header_parse_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExternalHeaderClosureWorkCounts {
+    pub builds: usize,
+    pub external_header_parses: usize,
+}
+
+impl ForwardQueryProvider for CppAnalyzer {
+    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = self.inner.forward_definition_fqn(fqn);
+        let reconciled = self.reconciled_definitions(fqn);
+        units.extend(reconciled.rekeyed.iter().cloned());
+        units.sort();
+        units.dedup();
+        units
+    }
+
+    fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.inner.forward_file_identifier(file, identifier)
+    }
+
+    fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.forward_direct_children(owner)
+    }
+
+    fn forward_package_exists(&self, package: &str) -> bool {
+        self.inner.forward_package_exists(package)
+    }
+
+    fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.inner.forward_fqn_prefix_exists(prefix)
+    }
+}
 
 impl CppAnalyzer {
+    pub(crate) fn reconciled_provisional(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        self.reconciled_definitions(&unit.fq_name())
+            .provisional_of
+            .get(unit)
+            .cloned()
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
     }
@@ -185,6 +242,10 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            source_using_index_by_file: build_weighted_cache(
+                memo_budget / 8,
+                weight_source_using_index,
+            ),
             unconditional_include_reachability: build_weighted_cache(
                 memo_budget / 8,
                 weight_include_reachability,
@@ -201,6 +262,7 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
+            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -214,9 +276,17 @@ impl CppAnalyzer {
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
+            source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -297,6 +367,10 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            source_using_index_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_source_using_index,
+            ),
             unconditional_include_reachability: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_include_reachability,
@@ -313,6 +387,7 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
+            external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -326,9 +401,17 @@ impl CppAnalyzer {
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
+            source_using_index_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            using_guard_context_inspection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -370,6 +453,43 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
+    }
+
+    pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+        self.inner.active_query_cancellation()
+    }
+
+    fn external_header_closure_cell(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<PoolSafeMemo<external::ReachedExternalHeaders>> {
+        self.external_header_closures.cell(file)
+    }
+
+    fn record_external_header_closure_build(&self) {
+        #[cfg(test)]
+        self.external_header_closure_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_external_header_parse(&self) {
+        #[cfg(test)]
+        self.external_header_parse_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_header_closure_work_counts_for_test(
+        &self,
+    ) -> ExternalHeaderClosureWorkCounts {
+        ExternalHeaderClosureWorkCounts {
+            builds: self
+                .external_header_closure_build_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            external_header_parses: self
+                .external_header_parse_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn prepared_syntax_limited_cancellable(
@@ -564,6 +684,23 @@ impl CppAnalyzer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Per-file structured using-index builds; a cache hit does not count
+    /// (#1927).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn source_using_index_build_count_for_test(&self) -> usize {
+        self.source_using_index_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Guard-ancestry inspections performed inside per-file using-index
+    /// builds. Only structured using declarations may inspect guard ancestry;
+    /// a rebuild-free query keeps this constant (#1927).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn using_guard_context_inspection_count_for_test(&self) -> usize {
+        self.using_guard_context_inspection_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #1908: reset both reconcile counters together. They are two halves of
     /// one measurement -- scans and the candidates those scans fed -- and a
     /// test that reset one and read the other would report a ratio it never
@@ -661,6 +798,15 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::visible_type_units_while(self, file, keep_going)
     }
 
+    fn source_using_index(&self, file: &ProjectFile) -> Arc<SourceUsingIndex> {
+        self.source_using_index_by_file.get_with_by_ref(file, || {
+            #[cfg(any(test, feature = "test-support"))]
+            self.source_using_index_build_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(build_source_using_index(self, file))
+        })
+    }
+
     fn file_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.file_source(file)
     }
@@ -734,6 +880,12 @@ impl CppSource for CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     fn record_cpp_class_strength_parse_for_test(&self) {
         CppAnalyzer::record_cpp_class_strength_parse_for_test(self);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_using_guard_context_inspection_for_test(&self) {
+        self.using_guard_context_inspection_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

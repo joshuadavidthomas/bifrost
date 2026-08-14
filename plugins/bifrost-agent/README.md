@@ -1,11 +1,9 @@
 # Bifrost Agent Plugin
 
-This directory is the shared source for Bifrost integrations in Pi, Codex,
-Claude Code, Cursor, and Amp. Every host reuses the same launcher and pinned
-release metadata, but each distribution includes only the resources its host
-supports. The npm package `@brokk/bifrost-agent` contains the Pi extension.
-The Claude, Codex, and Cursor plugin manifests expose host-specific MCP
-configuration and specialist agents.
+This directory implements the Agent Plugins v1 package for Bifrost. Codex can
+use the root package files. Pi, Claude Code, and Cursor also use this directory
+with their host adapters. Every host reuses the same launcher and pinned release
+metadata. The npm package `@brokk/bifrost-agent` contains the Pi extension.
 
 None of these distributions bundles the Bifrost binary. The launcher resolves a
 released Bifrost binary and makes a multi-language code-analysis subset of the
@@ -19,8 +17,26 @@ namespace-qualified install names.
 
 Claude Code starts
 `${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs --mcp "symbol|extended"` from
-the host-specific `claude-mcp.json`. Codex starts the same launcher through its
-package-relative `.mcp.json`.
+the host-specific `claude-mcp.json`. Codex starts the same launcher through
+the portable root `mcp.json`.
+
+## Portable Agent Plugins v1 Package
+
+The package root contains the portable Agent Plugins v1 files:
+
+- `plugin.json` gives the shared package identity.
+- `mcp.json` gives the portable Bifrost stdio server.
+- `skills/` contains portable skill directories.
+
+Codex uses these root files without an adapter. Claude Code uses
+`.claude-plugin/plugin.json` and
+`claude-mcp.json`. Cursor uses `.cursor-plugin/plugin.json` and
+`cursor-mcp.json` because Cursor needs `${CURSOR_PLUGIN_ROOT}` and timeout
+settings. Pi uses its TypeScript extension.
+
+We tested package discovery with Codex CLI. We did not explicitly test the
+Agent Plugins v1 package with VS Code, GitHub Copilot, Kiro, or Cursor.
+
 The launcher uses `BIFROST_WORKSPACE_ROOT` when set, then a host-provided
 `--root` or `--workspace-root`. Without either explicit override, Bifrost
 starts unbound and requests the host's approved workspace through standard MCP
@@ -29,11 +45,10 @@ roots. On a rootless connection without advertised roots, it offers the
 supply the active task. Bifrost never treats the installed plugin directory as
 the analyzer workspace.
 Claude Code uses `${CLAUDE_PLUGIN_ROOT}` because its MCP commands otherwise
-resolve relative to the project directory, not the installed plugin. Codex
-retains the package-relative `.mcp.json`. Cursor's plugin manifest explicitly
-selects root `mcp.json`, which uses Cursor's documented `type: "stdio"` and
-`${CURSOR_PLUGIN_ROOT}` placeholder. Both host-specific entries start Bifrost
-rootless. Builds containing the post-0.8.9 Cursor compatibility fix
+resolve relative to the project directory, not the installed plugin. Cursor's
+plugin manifest explicitly selects `cursor-mcp.json`, which uses Cursor's documented `type: "stdio"` and
+`${CURSOR_PLUGIN_ROOT}` placeholder. The root `mcp.json` remains portable.
+Both host-specific entries start Bifrost rootless. Builds containing the post-0.8.9 Cursor compatibility fix
 accept both standard `file:` root URIs and Cursor's native absolute-path form
 while keeping MCP roots authoritative; the published 0.8.9 binary requires an
 explicit fixed-project root. Amp uses a different direct server-map shape for
@@ -41,25 +56,37 @@ explicit fixed-project root. Amp uses a different direct server-map shape for
 
 Binary resolution order is:
 
-1. `BIFROST_BINARY_PATH`, when set.
-2. The launcher-managed cache for the pinned Bifrost release.
-3. A compatible `bifrost` already on `PATH`, only when
+1. `BIFROST_BINARY_PATH`, when set to a compatible binary as an explicit override.
+2. The exact preferred Bifrost release in the launcher-managed cache.
+3. The newest compatible cached patch in the declared minor-series range.
+4. A compatible `bifrost` already on `PATH`, only when
    `BIFROST_LAUNCHER_ALLOW_PATH=1` is set.
-4. A checksum-verified GitHub release download into the managed cache.
+5. A checksum-verified download of the exact preferred release.
+
+The launcher rejects other major or minor versions and rejects prereleases
+unless release metadata explicitly allows them. It never downloads an
+unpinned compatible fallback. Every packaged host adapter uses this shared
+selection for MCP, and the Claude Code LSP adapter uses the same result.
+When compatibility mode starts a server and automatic installation is enabled,
+the launcher also starts a detached checksum-verified preparation of the exact
+preferred release. The current server continues using its selected compatible
+binary; the next fresh host task can select the prepared preferred binary.
+Set `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable both foreground and background
+downloads.
 
 Set `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable downloads, or
 `BIFROST_LAUNCHER_CACHE_DIR=/path/to/cache` to choose the managed cache
-location. `BIFROST_BINARY_PATH` is the preferred local development override
-because it bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
+location. `BIFROST_BINARY_PATH` is the explicit local development override
+that bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
 stdio MCP traffic stays on stdin/stdout.
 
 The launcher also has commands that do not require a workspace. `doctor`
-checks the pinned version and configured binary candidates without modifying
-the cache or downloading anything. Compatibility checks execute each selected
+reports the preferred and selected versions, source, and exact or compatibility
+mode without modifying the cache or downloading anything. Compatibility checks execute each selected
 candidate with `--version`, so use `doctor` only with binary locations you
 trust. `prepare` follows the normal resolution order and,
-when automatic installation is enabled, downloads and verifies the pinned
-release without starting MCP. Both accept `--json` for stable machine-readable
+when automatic installation is enabled, downloads and verifies the preferred
+pinned release without starting MCP. Both accept `--json` for stable machine-readable
 output:
 
 ```bash
@@ -119,7 +146,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.9.1
+pi install npm:@brokk/bifrost-agent@0.9.5
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -196,7 +223,8 @@ repository does not imply that npm publishing is configured automatically.
 
 ## Codex Install
 
-Add the Brokk marketplace from GitHub, then install Bifrost:
+Add the Brokk marketplace from GitHub, then install the Agent Plugins v1
+package:
 
 ```bash
 codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
@@ -217,7 +245,7 @@ selected explicitly:
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" codex
 ```
 
-Start a fresh Codex session after installing the plugin. The plugin-provided
+Start a fresh Codex session after installing the package. The package-provided
 MCP server is registered automatically; do not add a second manual Bifrost MCP
 entry. It starts a separate stdio Bifrost process with:
 
@@ -423,7 +451,7 @@ testing, use the checked-out binary and an explicit workspace root.
 ```json
 {
   "bifrost": {
-    "command": "/absolute/path/to/bifrost",
+    "command": "/absolute/path/to/plugin/bin/bifrost-launcher.mjs",
     "cwd": "/absolute/path/to/workspace",
     "args": ["--root", ".", "--mcp", "symbol|extended"]
   }

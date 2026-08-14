@@ -147,6 +147,15 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ReferenceEdge(value) => CodeQueryResultValue::ReferenceEdge {
             value: Box::new(render_reference_edge(analyzer, &value, detail, cache)),
         },
+        PipelineValue::StateEvent(value) => CodeQueryResultValue::StateEvent {
+            value: Box::new(render_state_event(analyzer, &value, cache)),
+        },
+        PipelineValue::FlowRelation(value) => CodeQueryResultValue::FlowRelation {
+            value: Box::new(render_flow_relation(analyzer, &value, cache)),
+        },
+        PipelineValue::RewritePath(value) => CodeQueryResultValue::RewritePath {
+            value: Box::new(render_rewrite_path(analyzer, &value, cache)),
+        },
         PipelineValue::QualifiedPath(value) => CodeQueryResultValue::QualifiedPath {
             value: Box::new(render_qualified_path(analyzer, &value, cache)),
         },
@@ -313,6 +322,15 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ReferenceEdge(value) => {
                         render_edge_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::StateEvent(value) => {
+                        render_state_event_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::FlowRelation(value) => {
+                        render_flow_relation_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::RewritePath(value) => {
+                        render_rewrite_path_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::QualifiedPath(value) => {
                         render_qualified_path_ref(analyzer, value, cache)
@@ -503,6 +521,91 @@ pub(super) fn render_reference_edge(
         .as_ref()
         .map(|declaration| render_declaration(analyzer, declaration, detail, cache));
     edges::public_edge(value, range, target, enclosing)
+}
+
+/// One state event, with its own source range resolved against the analyzed
+/// content the derivation ran over.
+pub(super) fn render_state_event(
+    analyzer: &dyn IAnalyzer,
+    value: &StateEventValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryStateEvent {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.site.file, &row.site.range, cache);
+    flow_state::public_state_event(value, range)
+}
+
+/// One flow relation, with both endpoints rendered inline: a relation without
+/// its write and its read is not readable evidence.
+pub(super) fn render_flow_relation(
+    analyzer: &dyn IAnalyzer,
+    value: &FlowRelationValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryFlowRelation {
+    let source = value.source();
+    let target = value.target();
+    let source_range = render_source_range(analyzer, &source.site.file, &source.site.range, cache);
+    let target_range = render_source_range(analyzer, &target.site.file, &target.site.range, cache);
+    flow_state::public_flow_relation(value, source_range, target_range)
+}
+
+pub(super) fn render_state_event_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &StateEventValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::StateEvent {
+        id: value.id(),
+        ast_id: row.site.ast_id.clone(),
+        path: rel_path_string(&row.site.file),
+        range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
+        procedure_id: value.procedure_id.to_string(),
+        event_class: row.event_class.label(),
+    }
+}
+
+pub(super) fn render_flow_relation_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &FlowRelationValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let target = value.target();
+    CodeQueryResultRef::FlowRelation {
+        id: value.id(),
+        path: rel_path_string(&target.site.file),
+        range: render_source_range(analyzer, &target.site.file, &target.site.range, cache),
+        procedure_id: value.procedure_id.to_string(),
+        relation: value.row().relation.label(),
+        certainty: value.row().certainty.label(),
+    }
+}
+
+/// One bounded rewrite path, with its origin range resolved against the
+/// analyzed content the chase ran over.
+pub(super) fn render_rewrite_path(
+    analyzer: &dyn IAnalyzer,
+    value: &RewritePathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRewritePath {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.origin.file, &row.origin.range, cache);
+    rewrite_paths::public_rewrite_path(value, range)
+}
+
+pub(super) fn render_rewrite_path_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &RewritePathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::RewritePath {
+        id: value.id(),
+        path: rel_path_string(&row.origin.file),
+        range: render_source_range(analyzer, &row.origin.file, &row.origin.range, cache),
+        domain: row.domain.label(),
+        outcome: row.outcome.kind().label(),
+    }
 }
 
 pub(super) fn render_edge_ref(

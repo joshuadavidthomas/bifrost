@@ -25,7 +25,7 @@ pub(crate) enum QueryFeature {
     /// on an adapter answering (issue #1474).
     ///
     /// The query surface that produces these arrives with the `scopes`,
-    /// `bindings`, `reaching-binding` and `candidates-of` steps; the variant
+    /// `bindings`, `binding-of` and `candidates-of` steps; the variant
     /// exists now so the environment support tables the adapters already
     /// declare have exactly one route to a diagnostic, and so the derivation
     /// layer built next has the message to report against. This mirrors how

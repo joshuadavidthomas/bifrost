@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -231,6 +231,22 @@
       ],
       "severity_rationale": "I/O, parsing, serialization, sorting, or remote work under two loop levels can grow multiplicatively.",
       "remediation": "Hoist invariant work, precompute indexes, batch external operations, or reduce the nested iteration space."
+    },
+    {
+      "path": "policies/rayon-in-blocking-lazy-init.rqlp",
+      "id": "bifrost.correctness.rayon-in-blocking-lazy-init",
+      "semantic_hash": "498af02f7cc9183b55ce0efb3059c87f7cefd17ee87caa83ef5302e4878712a8",
+      "category": "correctness",
+      "supported_languages": [
+        "rust"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "descendant-match",
+        "normalized-call-roles"
+      ],
+      "severity_rationale": "A blocking once-cell whose initializer joins on rayon can park the worker that owns the stolen re-entrant job and wedge the whole pool.",
+      "remediation": "Use a pool-safe memoization such as PoolSafeMemo::get_or_build_parallel, or build the value eagerly before entering the parallel region."
     }
   ]
 }

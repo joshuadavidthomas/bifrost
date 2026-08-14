@@ -140,6 +140,7 @@ pub struct PythonImportBinding {
     function_scoped: bool,
     pub local_name: String,
     pub qualified_name: String,
+    pub consumed_attributes: usize,
 }
 
 impl PythonImportBinding {
@@ -182,6 +183,11 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                     let details = python_import_details(&import)?;
                     match details {
                         PythonImportDetails::Import { module, alias } => {
+                            let consumed_attributes = if alias.is_some() {
+                                0
+                            } else {
+                                path.segments.len().saturating_sub(1)
+                            };
                             Some(PythonImportBinding {
                                 start_byte: node.start_byte(),
                                 scope_start_byte,
@@ -189,6 +195,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                                 function_scoped,
                                 local_name: alias.or_else(|| path.segments.first().cloned())?,
                                 qualified_name: module,
+                                consumed_attributes,
                             })
                         }
                         PythonImportDetails::FromImport {
@@ -203,6 +210,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                             function_scoped,
                             local_name: alias.unwrap_or(name.clone()),
                             qualified_name: format!("{module}.{name}"),
+                            consumed_attributes: 0,
                         }),
                         PythonImportDetails::FromImport { wildcard: true, .. } => None,
                     }
@@ -522,11 +530,7 @@ fn resolve_direct_named_exported_fqn(
         }
         let module_unit = resolve_module_code_unit(python, &module)?;
         let file = module_unit.source();
-        let local = python
-            .top_level_declarations(file)
-            .into_iter()
-            .filter(|unit| unit.identifier() == export_name)
-            .collect::<Vec<_>>();
+        let local = local_export_declarations(python, file, &export_name);
         let binder = python.import_binder_of(file);
         let binding = binder.bindings.get(&export_name);
         if !local.is_empty() && binding.is_some() {
@@ -655,7 +659,12 @@ fn local_export_declarations(
     index
         .top_level_declarations(file)
         .into_iter()
-        .filter(|unit| unit.identifier() == local_name)
+        .filter(|unit| {
+            unit.identifier() == local_name
+                && index
+                    .parent_of(unit)
+                    .is_some_and(|parent| parent.is_module() && parent.source() == file)
+        })
         .collect()
 }
 
@@ -995,9 +1004,18 @@ pub fn resolve_python_relative_module(
     source_file: &ProjectFile,
     module_expr: &str,
 ) -> Option<String> {
+    resolve_python_relative_module_from_package(&python_current_package(source_file), module_expr)
+}
+
+/// Resolve a structured Python module expression against an already-known
+/// package identity. Dependency-pack producers know module identities without
+/// owning a workspace [`ProjectFile`], so they use this entry point.
+pub fn resolve_python_relative_module_from_package(
+    current_package: &str,
+    module_expr: &str,
+) -> Option<String> {
     let level = module_expr.chars().take_while(|ch| *ch == '.').count();
     let suffix = module_expr[level..].trim_matches('.');
-    let current_package = python_current_package(source_file);
     let mut parts: Vec<_> = current_package
         .split('.')
         .filter(|part| !part.is_empty())

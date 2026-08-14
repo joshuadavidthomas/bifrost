@@ -2,6 +2,9 @@ use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStep
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
@@ -11,6 +14,9 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    RewriteDomainKind, RewriteOutcomeKind,
 };
 use brokk_bifrost_core::analyzer::usages::model::{
     ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
@@ -47,6 +53,15 @@ pub const MAX_BINDING_NAME_LENGTH: usize = 256;
 /// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
 /// auto-compatible versions was collapsed to 1; a new version is minted only
 /// when an existing query stops parsing or changes meaning.
+///
+/// A breaking rename made before RQL has any consumer outside this repository
+/// does not mint a version either. Instead the renaming change migrates every
+/// query written inside the repository -- policy packs, executable docs, test
+/// fixtures, the MCP and Python surfaces, the editor grammar -- in the same
+/// commit, so no reader is left holding an old spelling. Issue #1480 renamed
+/// the lexical `reaching-binding` step to `binding-of` and the `assert-reaching`
+/// policy family to `assert-binding-scope` under exactly this rule. Mint a
+/// version once an out-of-repository consumer exists.
 pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +100,9 @@ pub enum QueryValueKind {
     ResolutionCandidate,
     CandidateHop,
     ReferenceEdge,
+    StateEvent,
+    FlowRelation,
+    RewritePath,
     QualifiedPath,
     PathSegment,
     GenerationSite,
@@ -130,6 +148,9 @@ impl QueryValueKind {
             Self::ResolutionCandidate => "resolution_candidate",
             Self::CandidateHop => "candidate_hop",
             Self::ReferenceEdge => "reference_edge",
+            Self::StateEvent => "state_event",
+            Self::FlowRelation => "flow_relation",
+            Self::RewritePath => "rewrite_path",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
             Self::GenerationSite => "generation_site",
@@ -172,6 +193,55 @@ impl EdgeFilter {
             && self.usage_kinds.is_empty()
             && self.relations.is_empty()
             && self.site_classes.is_empty()
+    }
+}
+
+/// Constrained-value filter over flow-sensitive state-event rows (#1480).
+///
+/// Both axes are enumerations the author writes, so an empty axis means "every
+/// value", never "no value". A filter never turns an incomplete derivation into
+/// a complete one: the diagnostics the derivation reports are emitted whether or
+/// not a filter drops the row that would have carried them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StateEventFilter {
+    pub classes: Vec<StateEventClass>,
+    pub subjects: Vec<FlowSubjectKind>,
+}
+
+impl StateEventFilter {
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty() && self.subjects.is_empty()
+    }
+}
+
+/// Constrained-value filter over flow-relation rows (#1480).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlowRelationFilter {
+    pub relations: Vec<FlowRelationLabel>,
+    pub certainties: Vec<FlowCertainty>,
+}
+
+impl FlowRelationFilter {
+    pub fn is_empty(&self) -> bool {
+        self.relations.is_empty() && self.certainties.is_empty()
+    }
+}
+
+/// Constrained-value filter over bounded rewrite-path rows (#1480).
+///
+/// Both axes are enumerations the author writes, so an empty axis means "every
+/// value", never "no value". Filtering on `:outcome cycle` narrows the rows;
+/// it never turns an incomplete derivation into a complete one, because the
+/// derivation's diagnostics are emitted before any filter runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RewritePathFilter {
+    pub domains: Vec<RewriteDomainKind>,
+    pub outcomes: Vec<RewriteOutcomeKind>,
+}
+
+impl RewritePathFilter {
+    pub fn is_empty(&self) -> bool {
+        self.domains.is_empty() && self.outcomes.is_empty()
     }
 }
 
@@ -289,7 +359,7 @@ pub enum QueryStep {
     ScopeOf,
     ScopeAncestors,
     BindingsIn(BindingFilter),
-    ReachingBinding(ReachingBindingOptions),
+    BindingOf(BindingOfOptions),
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
     CandidateHierarchy,
@@ -297,12 +367,18 @@ pub enum QueryStep {
     EdgesOf(EdgeFilter),
     EdgesFrom(EdgeFilter),
     EdgeTarget,
+    StateEventsOf(StateEventFilter),
+    FlowRelationsOf(FlowRelationFilter),
+    FlowSource,
+    FlowTarget,
+    RewritePathsOf(RewritePathFilter),
     SegmentsOf(SegmentsOfOptions),
     SegmentTarget,
     Generates,
     GeneratedBy,
     DeclarationStateOf(DeclarationStateFilter),
     ImplementationOf,
+    StubsOf,
     ExportTarget,
 }
 
@@ -508,9 +584,9 @@ impl DeclarationStateFilter {
     }
 }
 
-/// Options of the `reaching-binding` step.
+/// Options of the `binding-of` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReachingBindingOptions {
+pub struct BindingOfOptions {
     /// Emit the shadowed bindings alongside the winner, so the multi-row
     /// answer that "more than one binding of this name is in effect" becomes
     /// visible rather than being collapsed to the winner.
@@ -779,7 +855,7 @@ impl QueryStep {
             Self::ScopeOf => QueryStepOp::ScopeOf,
             Self::ScopeAncestors => QueryStepOp::ScopeAncestors,
             Self::BindingsIn(_) => QueryStepOp::BindingsIn,
-            Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
+            Self::BindingOf(_) => QueryStepOp::BindingOf,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
             Self::CandidateHierarchy => QueryStepOp::CandidateHierarchy,
@@ -787,11 +863,17 @@ impl QueryStep {
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
             Self::ImplementationOf => QueryStepOp::ImplementationOf,
+            Self::StubsOf => QueryStepOp::StubsOf,
             Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
             Self::EdgesOf(_) => QueryStepOp::EdgesOf,
             Self::EdgesFrom(_) => QueryStepOp::EdgesFrom,
             Self::EdgeTarget => QueryStepOp::EdgeTarget,
+            Self::StateEventsOf(_) => QueryStepOp::StateEventsOf,
+            Self::FlowRelationsOf(_) => QueryStepOp::FlowRelationsOf,
+            Self::FlowSource => QueryStepOp::FlowSource,
+            Self::FlowTarget => QueryStepOp::FlowTarget,
+            Self::RewritePathsOf(_) => QueryStepOp::RewritePathsOf,
             Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
             Self::SegmentTarget => QueryStepOp::SegmentTarget,
         }
@@ -857,9 +939,7 @@ impl QueryStep {
             QueryStepOp::ScopeOf => Some(Self::ScopeOf),
             QueryStepOp::ScopeAncestors => Some(Self::ScopeAncestors),
             QueryStepOp::BindingsIn => Some(Self::BindingsIn(BindingFilter::default())),
-            QueryStepOp::ReachingBinding => {
-                Some(Self::ReachingBinding(ReachingBindingOptions::default()))
-            }
+            QueryStepOp::BindingOf => Some(Self::BindingOf(BindingOfOptions::default())),
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateHierarchy => Some(Self::CandidateHierarchy),
@@ -867,6 +947,13 @@ impl QueryStep {
             QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
             QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
             QueryStepOp::EdgeTarget => Some(Self::EdgeTarget),
+            QueryStepOp::StateEventsOf => Some(Self::StateEventsOf(StateEventFilter::default())),
+            QueryStepOp::FlowRelationsOf => {
+                Some(Self::FlowRelationsOf(FlowRelationFilter::default()))
+            }
+            QueryStepOp::FlowSource => Some(Self::FlowSource),
+            QueryStepOp::FlowTarget => Some(Self::FlowTarget),
+            QueryStepOp::RewritePathsOf => Some(Self::RewritePathsOf(RewritePathFilter::default())),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
             QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
             QueryStepOp::Generates => Some(Self::Generates),
@@ -875,6 +962,7 @@ impl QueryStep {
                 Some(Self::DeclarationStateOf(DeclarationStateFilter::default()))
             }
             QueryStepOp::ImplementationOf => Some(Self::ImplementationOf),
+            QueryStepOp::StubsOf => Some(Self::StubsOf),
             QueryStepOp::ExportTarget => Some(Self::ExportTarget),
         }
     }
@@ -939,7 +1027,8 @@ impl QueryStep {
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
                 | QueryValueKind::QualifiedPath
-                | QueryValueKind::PathSegment,
+                | QueryValueKind::PathSegment
+                | QueryValueKind::StateEvent,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -1055,7 +1144,7 @@ impl QueryStep {
                 Self::BindingsIn(_),
                 QueryValueKind::LexicalScope | QueryValueKind::StructuralMatch,
             ) => Some(QueryValueKind::Binding),
-            (Self::ReachingBinding(_), QueryValueKind::Occurrence) => Some(QueryValueKind::Binding),
+            (Self::BindingOf(_), QueryValueKind::Occurrence) => Some(QueryValueKind::Binding),
             (Self::BindingOccurrence, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
@@ -1083,10 +1172,21 @@ impl QueryStep {
                 Self::ImplementationOf,
                 QueryValueKind::Declaration | QueryValueKind::DeclarationState,
             ) => Some(QueryValueKind::Declaration),
+            (Self::StubsOf, QueryValueKind::Declaration) => Some(QueryValueKind::DeclarationState),
             (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
             (Self::EdgesOf(_), QueryValueKind::Declaration) => Some(QueryValueKind::ReferenceEdge),
             (Self::EdgesFrom(_), QueryValueKind::Occurrence) => Some(QueryValueKind::ReferenceEdge),
             (Self::EdgeTarget, QueryValueKind::ReferenceEdge) => Some(QueryValueKind::Declaration),
+            (Self::StateEventsOf(_), QueryValueKind::Procedure | QueryValueKind::Declaration) => {
+                Some(QueryValueKind::StateEvent)
+            }
+            (Self::FlowRelationsOf(_), QueryValueKind::StateEvent | QueryValueKind::Procedure) => {
+                Some(QueryValueKind::FlowRelation)
+            }
+            (Self::FlowSource | Self::FlowTarget, QueryValueKind::FlowRelation) => {
+                Some(QueryValueKind::StateEvent)
+            }
+            (Self::RewritePathsOf(_), QueryValueKind::File) => Some(QueryValueKind::RewritePath),
             _ => None,
         }
     }
@@ -1172,7 +1272,7 @@ pub(super) fn validate_query_steps(
             QueryStep::ScopeOf => "binding, occurrence, or structural_match",
             QueryStep::ScopeAncestors => "lexical_scope",
             QueryStep::BindingsIn(_) => "lexical_scope or structural_match",
-            QueryStep::ReachingBinding(_) => "occurrence",
+            QueryStep::BindingOf(_) => "occurrence",
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateHierarchy => "occurrence",
@@ -1180,12 +1280,17 @@ pub(super) fn validate_query_steps(
             QueryStep::EdgesOf(_) => "declaration",
             QueryStep::EdgesFrom(_) => "occurrence",
             QueryStep::EdgeTarget => "reference_edge",
+            QueryStep::StateEventsOf(_) => "procedure or declaration",
+            QueryStep::FlowRelationsOf(_) => "state_event or procedure",
+            QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
+            QueryStep::RewritePathsOf(_) => "file",
             QueryStep::SegmentsOf(_) => "qualified_path",
             QueryStep::SegmentTarget => "path_segment",
             QueryStep::Generates => "generation_site",
             QueryStep::GeneratedBy => "declaration or declaration_state",
             QueryStep::DeclarationStateOf(_) => "declaration",
             QueryStep::ImplementationOf => "declaration_state or declaration",
+            QueryStep::StubsOf => "declaration",
             QueryStep::ExportTarget => "export",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {

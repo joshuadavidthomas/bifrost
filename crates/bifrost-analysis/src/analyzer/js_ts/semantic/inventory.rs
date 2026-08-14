@@ -10,6 +10,12 @@ pub(super) struct ProcedureSpec<'tree> {
     pub(super) properties: ProcedureProperties,
     pub(super) callable: Node<'tree>,
     pub(super) captures_receiver: bool,
+    /// Whether this procedure publishes a `this` receiver formal: the body
+    /// reads `this` directly, or a nested callable captures the receiver from
+    /// it (propagated in `lower` after capture demand is settled). A plain
+    /// function whose `this` is dead has no receiver formal, so a receiverless
+    /// call to it binds completely.
+    pub(super) owns_receiver: bool,
 }
 
 impl ReceiverCaptureSpec for ProcedureSpec<'_> {
@@ -106,9 +112,11 @@ pub(super) fn enumerate_procedures<'tree>(
                 Ok(identity) => identity,
                 Err(stop) => return Ok(stop.into_outcome()),
             };
-            let captures_receiver = if kind == ProcedureKind::Lambda {
+            let receiver_eligible =
+                kind == ProcedureKind::Lambda || procedure_owns_receiver(kind, properties);
+            let direct_free_this = if receiver_eligible {
                 match body_contains_free_this(body, cancellation) {
-                    Ok(captures_receiver) => captures_receiver,
+                    Ok(direct_free_this) => direct_free_this,
                     Err(LoweringCancelled) => return Ok(inventory.cancelled()),
                 }
             } else {
@@ -122,7 +130,10 @@ pub(super) fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 callable: node,
-                captures_receiver,
+                captures_receiver: kind == ProcedureKind::Lambda && direct_free_this,
+                owns_receiver: kind != ProcedureKind::Lambda
+                    && receiver_eligible
+                    && direct_free_this,
             });
             procedure_context = Some((identity.id, identity.declaration_path));
         }

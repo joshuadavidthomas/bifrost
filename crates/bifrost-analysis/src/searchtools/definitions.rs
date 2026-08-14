@@ -71,7 +71,11 @@ pub(super) fn resolve_definition_context_query(
         return invalid_context_lookup(query, "empty_target", "target must not be empty");
     }
 
-    let mut requests = Vec::new();
+    let mut requests_by_source: Vec<(
+        ProjectFile,
+        Arc<str>,
+        Vec<crate::analyzer::usages::get_definition::DefinitionLookupRequest>,
+    )> = Vec::new();
     for unit in units {
         let Some(range) = primary_range(analyzer, &unit) else {
             continue;
@@ -79,8 +83,8 @@ pub(super) fn resolve_definition_context_query(
         // `range` above is derived from the analyzer's own declaration data,
         // so the analyzed snapshot (not a fresh disk read) is the source
         // whose byte offsets it actually corresponds to.
-        let source = match analyzer.indexed_source(unit.source()) {
-            Some(source) => source,
+        let source: Arc<str> = match analyzer.indexed_source(unit.source()) {
+            Some(source) => source.into(),
             None => {
                 return DefinitionByReferenceLookupResult {
                     query,
@@ -100,20 +104,29 @@ pub(super) fn resolve_definition_context_query(
         for (context_offset, context) in symbol_source.match_indices(&query.context) {
             for target_offset in reference_target_match_offsets(context, &query.target, language) {
                 let start_byte = range.start_byte + context_offset + target_offset;
-                requests.push(
-                    crate::analyzer::usages::get_definition::DefinitionLookupRequest {
-                        file: unit.source().clone(),
-                        line: None,
-                        column: None,
-                        start_byte: Some(start_byte),
-                        end_byte: Some(start_byte + query.target.len()),
-                    },
-                );
+                let request = crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                    file: unit.source().clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + query.target.len()),
+                };
+                match requests_by_source
+                    .iter_mut()
+                    .find(|(file, _, _)| file == unit.source())
+                {
+                    Some((_, _, requests)) => requests.push(request),
+                    None => requests_by_source.push((
+                        unit.source().clone(),
+                        Arc::clone(&source),
+                        vec![request],
+                    )),
+                }
             }
         }
     }
 
-    if requests.is_empty() {
+    if requests_by_source.is_empty() {
         return invalid_context_lookup(
             query,
             "target_not_found",
@@ -121,8 +134,14 @@ pub(super) fn resolve_definition_context_query(
         );
     }
 
-    let outcomes =
-        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
+    let outcomes = requests_by_source
+        .into_iter()
+        .flat_map(|(file, source, requests)| {
+            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
+                analyzer, requests, file, source,
+            )
+        })
+        .collect();
     collapse_context_outcomes(analyzer, query, outcomes)
 }
 

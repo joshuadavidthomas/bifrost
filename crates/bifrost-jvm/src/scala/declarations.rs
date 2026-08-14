@@ -430,6 +430,40 @@ impl<'a> ScalaVisitor<'a> {
                         return;
                     }
                 }
+                "package_object" => {
+                    let package = scala_package_name(child, self.source);
+                    if package.is_empty() {
+                        continue;
+                    }
+                    let package_name = if current_package.is_empty() {
+                        package
+                    } else {
+                        format!("{current_package}.{package}")
+                    };
+                    let mut nested_package_prefixes = package_prefixes.clone();
+                    nested_package_prefixes.push(package_name.clone());
+                    if self.parsed.package_name.is_empty() {
+                        self.parsed.package_name = package_name.clone();
+                        self.parsed.content_qualifier = package_name.clone();
+                    }
+                    if let Some(body) = child.child_by_field_name("body") {
+                        stack.push(ScalaWork::CompilationUnit {
+                            children,
+                            index,
+                            package_name: current_package,
+                            package_prefixes,
+                            recovery_owners,
+                        });
+                        stack.push(ScalaWork::CompilationUnit {
+                            children: scala_compilation_children(body),
+                            index: 0,
+                            package_name,
+                            package_prefixes: nested_package_prefixes,
+                            recovery_owners: Vec::new(),
+                        });
+                        return;
+                    }
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     let name = scala_type_declaration_name_node(child)

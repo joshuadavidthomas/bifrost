@@ -23,9 +23,11 @@ use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
 use brokk_bifrost_cpp::external_declarations::{
     CppExternalDeclarationCompleteness, CppExternalDeclarationLimits, CppExternalMemberKind,
-    CppExternalVisibility, external_angle_include_paths, extract_external_declarations,
+    CppExternalVisibility, external_angle_include_paths, external_angle_include_paths_from_root,
+    extract_external_declarations,
 };
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CppDependencyPackAdapter;
@@ -40,6 +42,9 @@ pub(crate) fn external_boundary_evidence(
     let Some(resolved_headers) = directly_reached_external_headers(analyzer, file) else {
         return (BoundaryStatus::ExternalUnknown, None);
     };
+    let Some(resolved_headers) = resolved_headers.headers() else {
+        return (BoundaryStatus::ExternalUnknown, None);
+    };
     if resolved_headers.is_empty() {
         return (BoundaryStatus::ExternalUnknown, None);
     }
@@ -48,7 +53,7 @@ pub(crate) fn external_boundary_evidence(
         .into_iter()
         .flat_map(|overlay| overlay.symbols_named(name).records)
         .filter(|symbol| symbol.language == "cpp")
-        .filter(|symbol| symbol_is_in_headers(symbol, &resolved_headers))
+        .filter(|symbol| symbol_is_in_headers(symbol, resolved_headers))
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [symbol] => (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone())),
@@ -76,6 +81,9 @@ pub(crate) fn external_member_resolution(
     let Some(headers) = directly_reached_external_headers(analyzer, file) else {
         return CppExternalMemberResolution::Unknown;
     };
+    let Some(headers) = headers.headers() else {
+        return CppExternalMemberResolution::Unknown;
+    };
     let mut matching_owner = false;
     let mut partial_owner = false;
     if let Some(overlay) = overlay {
@@ -86,7 +94,7 @@ pub(crate) fn external_member_resolution(
             .filter(|owner| {
                 owner.language == "cpp"
                     && owner.owner_id.is_none()
-                    && symbol_is_in_headers(owner, &headers)
+                    && symbol_is_in_headers(owner, headers)
             })
         {
             matching_owner = true;
@@ -98,7 +106,7 @@ pub(crate) fn external_member_resolution(
                 .any(|member| {
                     member.name == member_name
                         && member.visibility == Visibility::Public
-                        && symbol_is_in_headers(member, &headers)
+                        && symbol_is_in_headers(member, headers)
                 })
             {
                 return CppExternalMemberResolution::Indexed;
@@ -117,48 +125,109 @@ pub(crate) fn external_member_resolution(
 fn directly_reached_external_headers(
     analyzer: &CppAnalyzer,
     file: &ProjectFile,
-) -> Option<Vec<ReachedExternalHeader>> {
-    let Ok(source) = file.read_to_string() else {
+) -> Option<Arc<ReachedExternalHeaders>> {
+    let cancellation = analyzer.active_query_cancellation();
+    let keep_going = || {
+        !cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    };
+    directly_reached_external_headers_while(analyzer, file, &keep_going)
+}
+
+fn directly_reached_external_headers_while(
+    analyzer: &CppAnalyzer,
+    file: &ProjectFile,
+    keep_going: &impl Fn() -> bool,
+) -> Option<Arc<ReachedExternalHeaders>> {
+    let cell = analyzer.external_header_closure_cell(file);
+    match cell.get_or_try_build_pool_independent_while(keep_going, || {
+        Ok::<_, std::convert::Infallible>(build_directly_reached_external_headers(
+            analyzer, file, keep_going,
+        ))
+    }) {
+        Ok(outcome) => outcome,
+        Err(never) => match never {},
+    }
+}
+
+fn build_directly_reached_external_headers(
+    analyzer: &CppAnalyzer,
+    file: &ProjectFile,
+    keep_going: &impl Fn() -> bool,
+) -> Option<ReachedExternalHeaders> {
+    if !keep_going() {
         return None;
+    }
+    analyzer.record_external_header_closure_build();
+    let Some(syntax) = analyzer.prepared_syntax(file) else {
+        return Some(ReachedExternalHeaders::Unavailable);
     };
     const MAX_CLOSURE_HEADERS: usize = 10_000;
     const MAX_CLOSURE_BYTES: usize = 32 * 1024 * 1024;
     let mut resolved_headers = Vec::new();
-    let mut pending = external_angle_include_paths(&source);
+    let mut pending =
+        external_angle_include_paths_from_root(syntax.source(), syntax.tree().root_node());
     let mut visited = crate::hash::HashSet::default();
     let mut bytes_read = 0usize;
     while let Some(include) = pending.pop() {
+        if !keep_going() {
+            return None;
+        }
         match analyzer.resolve_external_angle_include(file, &include) {
             CppExternalIncludeResolution::Declared { root, header } => {
                 if !visited.insert(header.clone()) {
                     continue;
                 }
                 if visited.len() > MAX_CLOSURE_HEADERS {
-                    return None;
+                    return Some(ReachedExternalHeaders::Unavailable);
                 }
-                let relative_path = header.strip_prefix(&root).ok()?.to_path_buf();
+                let Ok(relative_path) = header.strip_prefix(&root) else {
+                    return Some(ReachedExternalHeaders::Unavailable);
+                };
                 resolved_headers.push(ReachedExternalHeader {
                     dependency_name: root_dependency_name(&root),
-                    relative_path,
+                    relative_path: relative_path.to_path_buf(),
                 });
-                let header_source = read_external_header(&header).ok()?;
+                let Ok(header_source) = read_external_header(&header) else {
+                    return Some(ReachedExternalHeaders::Unavailable);
+                };
                 bytes_read = bytes_read.saturating_add(header_source.len());
                 if bytes_read > MAX_CLOSURE_BYTES {
-                    return None;
+                    return Some(ReachedExternalHeaders::Unavailable);
                 }
+                analyzer.record_external_header_parse();
                 pending.extend(external_angle_include_paths(&header_source));
             }
             CppExternalIncludeResolution::MissingCompileContext
             | CppExternalIncludeResolution::Conflicting => {
-                return None;
+                return Some(ReachedExternalHeaders::Unavailable);
             }
             CppExternalIncludeResolution::Undeclared => {}
         }
     }
-    Some(resolved_headers)
+    resolved_headers.sort();
+    resolved_headers.dedup();
+    Some(ReachedExternalHeaders::Complete(resolved_headers))
 }
 
-struct ReachedExternalHeader {
+#[derive(Debug)]
+pub(super) enum ReachedExternalHeaders {
+    Complete(Vec<ReachedExternalHeader>),
+    Unavailable,
+}
+
+impl ReachedExternalHeaders {
+    fn headers(&self) -> Option<&[ReachedExternalHeader]> {
+        match self {
+            Self::Complete(headers) => Some(headers),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ReachedExternalHeader {
     dependency_name: String,
     relative_path: PathBuf,
 }
@@ -948,6 +1017,14 @@ mod tests {
             CppExternalMemberResolution::Absent,
             external_member_resolution(cpp, Some(&overlay), &file, "std.vector", "push_bak")
         );
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 2,
+            },
+            cpp.external_header_closure_work_counts_for_test(),
+            "all external member and boundary lookups share one closure"
+        );
 
         let [(lookup, trace)] = resolve_definition_batch_with_trace(
             workspace.analyzer(),
@@ -967,6 +1044,161 @@ mod tests {
                     && candidate.external_target.is_some()
             }),
             "lookup={lookup:#?}\ntrace={trace:#?}"
+        );
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 2,
+            },
+            cpp.external_header_closure_work_counts_for_test(),
+            "a later forward batch reuses the published closure"
+        );
+    }
+
+    #[test]
+    fn interrupted_external_header_closure_is_not_published() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write("#include <one.hpp>\n").expect("source");
+        ProjectFile::new(root.clone(), "fake/include/one.hpp")
+            .write("#include <two.hpp>\nclass One {};\n")
+            .expect("first header");
+        ProjectFile::new(root.clone(), "fake/include/two.hpp")
+            .write("class Two {};\n")
+            .expect("second header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let interrupted = directly_reached_external_headers_while(&analyzer, &file, &|| {
+            checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+        });
+        assert!(interrupted.is_none(), "interrupted work is not an answer");
+        let interrupted_counts = analyzer.external_header_closure_work_counts_for_test();
+        assert_eq!(1, interrupted_counts.builds);
+
+        let complete = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+            .expect("fresh query rebuilds");
+        let Some(headers) = complete.headers() else {
+            panic!("complete closure");
+        };
+        assert_eq!(2, headers.len());
+        let complete_counts = analyzer.external_header_closure_work_counts_for_test();
+        assert_eq!(2, complete_counts.builds);
+        assert_eq!(
+            interrupted_counts.external_header_parses + 2,
+            complete_counts.external_header_parses
+        );
+
+        let cached = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+            .expect("cached closure");
+        assert_eq!(2, cached.headers().expect("complete cached closure").len());
+        assert_eq!(
+            complete_counts,
+            analyzer.external_header_closure_work_counts_for_test(),
+            "completed work is published exactly once"
+        );
+    }
+
+    #[test]
+    fn unavailable_compile_context_is_cached_without_claiming_headers() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write("#include <missing.hpp>\n").expect("source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+
+        for _ in 0..2 {
+            let outcome = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+                .expect("stable unavailable outcome");
+            assert!(outcome.headers().is_none());
+        }
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 0,
+            },
+            analyzer.external_header_closure_work_counts_for_test()
+        );
+    }
+
+    #[test]
+    fn conflicting_compile_context_is_cached_without_claiming_one_header() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write("#include <shared.hpp>\n").expect("source");
+        ProjectFile::new(root.clone(), "first/include/shared.hpp")
+            .write("class First {};\n")
+            .expect("first header");
+        ProjectFile::new(root.clone(), "second/include/shared.hpp")
+            .write("class Second {};\n")
+            .expect("second header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[
+                    {"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","first/include","-c","src/main.cpp"]},
+                    {"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","second/include","-c","src/main.cpp"]}
+                ]"#,
+            )
+            .expect("database");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+
+        for _ in 0..2 {
+            let outcome = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+                .expect("stable conflicting outcome");
+            assert!(outcome.headers().is_none());
+        }
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 0,
+            },
+            analyzer.external_header_closure_work_counts_for_test()
+        );
+    }
+
+    #[test]
+    fn analyzer_update_discards_external_header_closure_state() {
+        use crate::analyzer::IAnalyzer;
+        use std::collections::BTreeSet;
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/main.cpp");
+        file.write("#include <one.hpp>\n").expect("source");
+        ProjectFile::new(root.clone(), "fake/include/one.hpp")
+            .write("class One {};\n")
+            .expect("first header");
+        ProjectFile::new(root.clone(), "fake/include/two.hpp")
+            .write("class Two {};\n")
+            .expect("second header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+        let first = directly_reached_external_headers_while(&analyzer, &file, &|| true)
+            .expect("first closure");
+        assert_eq!(1, first.headers().expect("complete first closure").len());
+
+        file.write("#include <one.hpp>\n#include <two.hpp>\n")
+            .expect("updated source");
+        let updated = analyzer.update(&BTreeSet::from([file.clone()]));
+        let second = directly_reached_external_headers_while(&updated, &file, &|| true)
+            .expect("updated closure");
+        assert_eq!(2, second.headers().expect("complete updated closure").len());
+        assert_eq!(
+            crate::analyzer::cpp::ExternalHeaderClosureWorkCounts {
+                builds: 1,
+                external_header_parses: 2,
+            },
+            updated.external_header_closure_work_counts_for_test()
         );
     }
 }

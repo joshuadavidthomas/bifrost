@@ -74,7 +74,7 @@ pub use brokk_bifrost_mcp::{
 #[cfg(feature = "nlp")]
 pub use brokk_bifrost_nlp as nlp;
 pub use brokk_bifrost_policy as policy;
-pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
+pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence, extension};
 pub use brokk_bifrost_semantic_packs as semantic_packs;
 
 use std::sync::OnceLock;

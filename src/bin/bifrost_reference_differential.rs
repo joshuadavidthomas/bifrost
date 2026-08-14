@@ -1,6 +1,7 @@
 use brokk_bifrost::reference_differential::{
     ExactReferenceSite, ProbeSeed, ReferenceDifferentialConfig, ReferenceDifferentialProgress,
-    ReferenceDifferentialReport, TierSelection, run_reference_differential_with_progress,
+    ReferenceDifferentialReport, ReferenceShardSpec, TierSelection,
+    run_reference_differential_with_progress,
 };
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use git2::{Repository, StatusOptions};
@@ -11,8 +12,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -30,6 +32,7 @@ const DEFAULT_MAX_TARGETS: usize = 1_000;
 const DEFAULT_TARGET_PARALLELISM: usize = 8;
 const DEFAULT_MAX_USAGE_FILES: usize = 1_000;
 const DEFAULT_MAX_USAGES: usize = 100_000;
+const DEFAULT_BROKKBENCH_ROOT: &str = "/home/jonathan/Projects/brokkbench";
 
 fn main() -> ExitCode {
     match run() {
@@ -76,6 +79,7 @@ struct EngineOptions {
     cache_mode: CacheMode,
     probe_seed: ProbeSeed,
     tiers: TierSelection,
+    shard: Option<ReferenceShardSpec>,
 }
 
 impl Default for EngineOptions {
@@ -95,6 +99,7 @@ impl Default for EngineOptions {
             cache_mode: CacheMode::Persisted,
             probe_seed: ProbeSeed::Index,
             tiers: TierSelection::default(),
+            shard: None,
         }
     }
 }
@@ -141,6 +146,7 @@ impl EngineOptions {
             exact_site: self.exact_site.clone(),
             probe_seed: self.probe_seed,
             tiers: self.tiers,
+            shard: self.shard,
         }
     }
 }
@@ -164,6 +170,8 @@ struct RunCorpusArgs {
     languages: Vec<String>,
     repos: HashSet<String>,
     repo_parallelism: usize,
+    task_ranked: bool,
+    brokkbench_root: PathBuf,
     strict: bool,
     force: bool,
     dry_run: bool,
@@ -229,6 +237,8 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
     let mut languages = Vec::new();
     let mut repos = HashSet::new();
     let mut repo_parallelism = 1;
+    let mut task_ranked = false;
+    let mut brokkbench_root = PathBuf::from(DEFAULT_BROKKBENCH_ROOT);
     let mut strict = false;
     let mut force = false;
     let mut dry_run = false;
@@ -265,6 +275,10 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
             "--repo-jobs" => {
                 repo_parallelism = take_positive_usize(args, &mut index, "--repo-jobs")?
             }
+            "--task-ranked" => task_ranked = true,
+            "--brokkbench-root" => {
+                brokkbench_root = PathBuf::from(take_value(args, &mut index, "--brokkbench-root")?)
+            }
             "--strict" => strict = true,
             "--force" => force = true,
             "--dry-run" => dry_run = true,
@@ -290,6 +304,8 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
         languages,
         repos,
         repo_parallelism,
+        task_ranked,
+        brokkbench_root,
         strict,
         force,
         dry_run,
@@ -338,6 +354,10 @@ fn parse_engine_option(
         "--tiers" => {
             let value = take_value(args, index, option)?;
             options.tiers = parse_tiers(&value)?;
+        }
+        "--shard" => {
+            let value = take_value(args, index, option)?;
+            options.shard = Some(ReferenceShardSpec::parse(&value)?);
         }
         "--cache-mode" => options.cache_mode = CacheMode::parse(&take_value(args, index, option)?)?,
         "--path" => {
@@ -706,7 +726,8 @@ fn execute_corpus_run(
     );
     let started = Instant::now();
     let progress_repo = format!("{}/{}", selected_repo.language, selected_repo.slug);
-    let result = run_engine(&selected_repo.root, &config, cache_mode, &progress_repo);
+    let result =
+        catch_engine_panic(|| run_engine(&selected_repo.root, &config, cache_mode, &progress_repo));
     let record = repository_record(
         &selected_repo.language,
         &selected_repo.slug,
@@ -726,6 +747,21 @@ fn execute_corpus_run(
         record.elapsed_seconds
     );
     record
+}
+
+fn catch_engine_panic(
+    run: impl FnOnce() -> Result<ReferenceDifferentialReport, String>,
+) -> Result<ReferenceDifferentialReport, String> {
+    catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        Err(format!("analyzer panicked: {message}"))
+    })
 }
 
 fn run_engine(
@@ -840,6 +876,10 @@ fn select_corpus_repositories(args: &RunCorpusArgs) -> Result<Vec<SelectedReposi
     let mut selected = Vec::new();
     let mut matched_repo_filters = HashSet::new();
 
+    if args.task_ranked {
+        return select_task_ranked_repositories(args, &sizes, &clones_root);
+    }
+
     for language in &args.languages {
         let language_dir = args.commits_root.join(language);
         let members = language_members(&language_dir)?;
@@ -906,6 +946,99 @@ fn select_corpus_repositories(args: &RunCorpusArgs) -> Result<Vec<SelectedReposi
         if !selected.iter().any(|repo| &repo.language == language) {
             return Err(format!(
                 "no valid repositories selected for corpus language `{language}`"
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskRankedRepository {
+    slug: String,
+    task_count: usize,
+}
+
+fn select_task_ranked_repositories(
+    args: &RunCorpusArgs,
+    sizes: &HashMap<String, u64>,
+    clones_root: &Path,
+) -> Result<Vec<SelectedRepository>, String> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("fird-task-repo-rank.py");
+    let venv_python = args.brokkbench_root.join(".venv/bin/python3");
+    let interpreter = if venv_python.is_file() {
+        venv_python
+    } else {
+        PathBuf::from("python3")
+    };
+    let output = Command::new(interpreter)
+        .arg(&script)
+        .arg("--brokkbench-root")
+        .arg(&args.brokkbench_root)
+        .arg("--commits-root")
+        .arg(&args.commits_root)
+        .arg("--languages")
+        .arg(args.languages.join(","))
+        .output()
+        .map_err(|err| format!("failed to run `{}`: {err}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` failed: {}",
+            script.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let ranking: HashMap<String, Vec<TaskRankedRepository>> =
+        serde_json::from_slice(&output.stdout)
+            .map_err(|err| format!("invalid ranking JSON from `{}`: {err}", script.display()))?;
+    let mut selected = Vec::new();
+    let mut matched_filters = HashSet::new();
+    for language in &args.languages {
+        let rows = ranking
+            .get(language)
+            .ok_or_else(|| format!("task ranking omitted language `{language}`"))?;
+        let rows = rows
+            .iter()
+            .filter(|row| args.repos.is_empty() || args.repos.contains(&row.slug))
+            .take(if args.repos.is_empty() {
+                args.repos_per_language
+            } else {
+                usize::MAX
+            });
+        for row in rows {
+            matched_filters.insert(row.slug.clone());
+            let code_loc = sizes
+                .get(&row.slug)
+                .copied()
+                .ok_or_else(|| format!("task-ranked repository `{}` has no code_loc", row.slug))?;
+            let root = clones_root.join(&row.slug);
+            let root = validate_clone(&root).map_err(|err| {
+                format!(
+                    "task-ranked repository {language} rank selection `{}` is unusable: {err}",
+                    row.slug
+                )
+            })?;
+            let _ = row.task_count;
+            selected.push(SelectedRepository {
+                language: language.clone(),
+                slug: row.slug.clone(),
+                code_loc,
+                root,
+            });
+        }
+    }
+    if !args.repos.is_empty() {
+        let mut unmatched = args
+            .repos
+            .difference(&matched_filters)
+            .cloned()
+            .collect::<Vec<_>>();
+        unmatched.sort();
+        if !unmatched.is_empty() {
+            return Err(format!(
+                "task selector did not match requested repository filters: {}",
+                unmatched.join(", ")
             ));
         }
     }
@@ -1006,11 +1139,22 @@ fn repository_metadata(root: &Path) -> Result<RepositoryMetadata, String> {
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false);
-    let dirty = !repo
+    let dirty = repo
         .statuses(Some(&mut options))
         .map_err(|err| format!("failed to inspect status for `{}`: {err}", root.display()))?
-        .is_empty();
+        .iter()
+        .any(|entry| {
+            entry
+                .path()
+                .is_none_or(|path| !is_generated_analyzer_state(Path::new(path)))
+        });
     Ok(RepositoryMetadata { head, dirty })
+}
+
+fn is_generated_analyzer_state(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        component.as_os_str() == ".bifrost" || component.as_os_str() == ".brokk"
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1264,6 +1408,8 @@ fn print_run_corpus_help() {
     println!("  --language LANG          Exact corpus language filter; repeatable");
     println!("  --repo SLUG              Exact repository filter; repeatable");
     println!("  --repo-jobs N            Repositories audited concurrently (default: 1)");
+    println!("  --task-ranked            Rank through tasks.py SFT_PREDICATES, not code LOC");
+    println!("  --brokkbench-root PATH   tasks.py checkout (default: {DEFAULT_BROKKBENCH_ROOT})");
     println!("  --dry-run                Print deterministic selection without auditing");
     print_common_options();
 }
@@ -1296,6 +1442,7 @@ fn print_common_options() {
     println!(
         "  --tiers LIST             census gap tiers to report as findings, e.g. 1,2,3 (default) or 1"
     );
+    println!("  --shard K/N              Audit hash shard K (1-based) of the sampled files");
     println!("  --include-tests          Include references in test files");
     println!(
         "  --cache-mode MODE        persisted for warm/resumable campaigns (default); ephemeral for one-off smoke runs"
@@ -1303,4 +1450,90 @@ fn print_common_options() {
     println!("  --path PATH --start-byte N [--end-byte N]   Re-run one exact site");
     println!("  --strict                 Exit 2 when actionable findings are present");
     println!("  --force                  Ignore completed records already in output");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ReferenceDifferentialReport, RepositoryMetadata, catch_engine_panic, repository_metadata,
+        repository_record,
+    };
+    use git2::{IndexAddOption, Repository, Signature};
+    use std::fs;
+
+    #[test]
+    fn repository_engine_panic_becomes_an_engine_error_and_next_run_continues() {
+        let first = catch_engine_panic(|| -> Result<ReferenceDifferentialReport, String> {
+            panic!("fixture analyzer panic")
+        });
+        let mut continued = false;
+        let second = catch_engine_panic(|| {
+            continued = true;
+            Err("fixture ordinary error".to_string())
+        });
+
+        assert_eq!(
+            first
+                .as_ref()
+                .expect_err("the repository panic must become an error result"),
+            "analyzer panicked: fixture analyzer panic"
+        );
+        assert!(continued, "the next repository run must continue");
+        assert_eq!(
+            second.expect_err("the ordinary error must pass through"),
+            "fixture ordinary error"
+        );
+
+        let metadata = RepositoryMetadata {
+            head: "fixture-head".to_string(),
+            dirty: false,
+        };
+        let record = repository_record(
+            "rust",
+            "fixture__panic",
+            Some(1),
+            &metadata,
+            &metadata,
+            "fixture-fingerprint".to_string(),
+            0.0,
+            first,
+        );
+        let value = serde_json::to_value(record).expect("serialize engine-error record");
+        assert_eq!(value["status"], "engine_error");
+        assert_eq!(
+            value["message"],
+            "analyzer panicked: fixture analyzer panic"
+        );
+    }
+
+    #[test]
+    fn repository_metadata_ignores_only_generated_analyzer_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(temp.path()).expect("init repository");
+        fs::write(temp.path().join("tracked.rs"), "fn original() {}\n").expect("tracked file");
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["tracked.rs"], IndexAddOption::DEFAULT, None)
+            .expect("stage tracked file");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let signature = Signature::now("FIRD Test", "fird@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .expect("commit");
+        drop(tree);
+
+        fs::create_dir_all(temp.path().join(".bifrost/cache")).expect("bifrost cache directory");
+        fs::write(temp.path().join(".bifrost/cache/state"), "cache").expect("bifrost cache");
+        fs::create_dir_all(temp.path().join(".brokk")).expect("legacy cache directory");
+        fs::write(temp.path().join(".brokk/state"), "cache").expect("legacy cache");
+        assert!(!repository_metadata(temp.path()).expect("metadata").dirty);
+
+        fs::write(temp.path().join("notes.txt"), "user file").expect("untracked file");
+        assert!(repository_metadata(temp.path()).expect("metadata").dirty);
+        fs::remove_file(temp.path().join("notes.txt")).expect("remove untracked file");
+
+        fs::write(temp.path().join("tracked.rs"), "fn changed() {}\n").expect("tracked edit");
+        assert!(repository_metadata(temp.path()).expect("metadata").dirty);
+    }
 }

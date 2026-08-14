@@ -25,28 +25,34 @@ const binaryPath = options.binaryPath
   : null;
 await assertEmptyCache(cacheDir);
 
-const codexLaunch = await resolveCodexPluginLaunch(pluginDir);
+const portableLaunch = await resolvePortablePluginLaunch(pluginDir);
 
-const launcherEnv = {
-  ...process.env,
-  BIFROST_BINARY_PATH: binaryPath ?? "",
-  BIFROST_LAUNCHER_ALLOW_PATH: "0",
-  BIFROST_LAUNCHER_AUTO_INSTALL: binaryPath ? "0" : "1",
-  BIFROST_LAUNCHER_CACHE_DIR: cacheDir,
-};
-
-await prepare(codexLaunch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
-await withDisposableSmokeWorkspace((workspace) =>
-  assertCodexSandboxWorkspaceBinding(codexLaunch, workspace, launcherEnv)
-);
-await withDisposableSmokeWorkspace((workspace) =>
-  assertMcpRootsWorkspaceBinding(codexLaunch, workspace, launcherEnv)
-);
-await assertNoPluginWorkspaceCache(pluginDir);
+await smokeLaunch("portable Agent Plugins v1 package", portableLaunch, path.join(cacheDir, "portable"));
 console.log(
-  `Packaged Codex plugin passed .mcp.json launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
+  `Portable Agent Plugins v1 package passed launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
   "handshake replay, and the MCP roots smoke."
 );
+
+async function smokeLaunch(label, launch, launcherCacheDir) {
+  await assertEmptyCache(launcherCacheDir);
+  const launcherEnv = {
+    ...process.env,
+    BIFROST_BINARY_PATH: binaryPath ?? "",
+    BIFROST_LAUNCHER_ALLOW_PATH: "0",
+    BIFROST_LAUNCHER_AUTO_INSTALL: binaryPath ? "0" : "1",
+    BIFROST_LAUNCHER_CACHE_DIR: launcherCacheDir,
+  };
+
+  await prepare(launch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
+  await withDisposableSmokeWorkspace((workspace) =>
+    assertCodexSandboxWorkspaceBinding(launch, workspace, launcherEnv)
+  );
+  await withDisposableSmokeWorkspace((workspace) =>
+    assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv)
+  );
+  await assertNoPluginWorkspaceCache(pluginDir);
+  console.log(`Passed ${label} MCP launch smoke.`);
+}
 
 function validateRecordedCodexHandshake(fixture) {
   const version = fixture.initialize?.params?.clientInfo?.version;
@@ -103,41 +109,33 @@ async function requiredFile(value, name) {
   return file;
 }
 
-async function resolveCodexPluginLaunch(pluginRoot) {
-  const manifestPath = path.join(pluginRoot, ".codex-plugin", "plugin.json");
+async function resolvePortablePluginLaunch(pluginRoot) {
+  const manifestPath = path.join(pluginRoot, "plugin.json");
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
   assert.equal(
-    typeof manifest.mcpServers,
-    "string",
-    `${manifestPath} must select the Codex MCP config`
+    manifest.$schema,
+    "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+    `${manifestPath} must use the Agent Plugins v1 plugin schema`
   );
-  const mcpConfigPath = path.resolve(pluginRoot, manifest.mcpServers);
+  const mcpConfigPath = path.join(pluginRoot, "mcp.json");
   const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+  assert.equal(
+    mcpConfig.$schema,
+    "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+    `${mcpConfigPath} must use the Agent Plugins v1 MCP schema`
+  );
   const server = mcpConfig.mcpServers?.bifrost;
   assert.ok(server, `${mcpConfigPath} must define the bifrost MCP server`);
-  assert.equal(
-    typeof server.command,
-    "string",
-    `${mcpConfigPath} must define a launcher command`
-  );
+  assert.equal(server.type, "stdio", `${mcpConfigPath} must declare stdio transport`);
   assert.equal(
     server.command,
     "./bin/bifrost-launcher.mjs",
     `${mcpConfigPath} must resolve the package-local launcher`
   );
-  assert.equal(
-    server.cwd,
-    ".",
-    `${mcpConfigPath} must keep the package as the launcher working directory`
-  );
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
-  const mcpConfigDir = path.dirname(mcpConfigPath);
-  const command = path.resolve(mcpConfigDir, server.command);
-  const cwd = path.resolve(mcpConfigDir, server.cwd);
-  assert.equal(path.isAbsolute(command), true, `${mcpConfigPath} did not resolve an absolute launcher path`);
-  assert.equal(path.isAbsolute(cwd), true, `${mcpConfigPath} did not resolve an absolute launcher working directory`);
+  const command = path.resolve(pluginRoot, server.command);
   await fs.access(command);
-  return { command, cwd, args: server.args, manifestPath, mcpConfigPath };
+  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
 }
 
 async function assertEmptyCache(directory) {
@@ -305,7 +303,14 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     });
     assert.equal(catalog.result?.isError, false, `MCP list_policies returned an error: ${JSON.stringify(catalog)}`);
     assert.equal(catalog.result?.structuredContent?.id, "bifrost.code-smells");
-    assert.equal(catalog.result?.structuredContent?.policies?.length, 12);
+    const policies = catalog.result?.structuredContent?.policies;
+    assert.ok(Array.isArray(policies) && policies.length > 0, "MCP list_policies returned no built-in policies");
+    const policyIds = policies.map((entry) => entry.id);
+    assert.equal(new Set(policyIds).size, policyIds.length, "MCP list_policies returned duplicate policy IDs");
+    assert.ok(
+      policyIds.includes("bifrost.correctness.dynamic-evaluation"),
+      `MCP list_policies omitted the policy exercised by this smoke: ${JSON.stringify(policyIds)}`
+    );
     const policy = await roundTrip(child, reader, {
       jsonrpc: "2.0",
       id: 4,
@@ -444,13 +449,13 @@ async function withMcpServer(codexLaunch, env, scenario) {
   if (failure) {
     const diagnosticLogs = logs.trim() ? `\nMCP stderr:\n${logs.trimEnd()}` : "";
     throw new Error(
-      `${failure.message}\nCodex manifest: ${codexLaunch.manifestPath}\nMCP config: ${codexLaunch.mcpConfigPath}${diagnosticLogs}`,
+      `${failure.message}\nPlugin manifest: ${codexLaunch.manifestPath}\nMCP config: ${codexLaunch.mcpConfigPath}${diagnosticLogs}`,
       { cause: failure }
     );
   }
   if (!shutdown.forcedSignal && (shutdown.code !== 0 || shutdown.signal)) {
     throw new Error(
-      `Packaged Codex MCP launcher exited with ${shutdown.signal ?? shutdown.code}; ` +
+      `Packaged plugin MCP launcher exited with ${shutdown.signal ?? shutdown.code}; ` +
       `manifest=${codexLaunch.manifestPath}; config=${codexLaunch.mcpConfigPath}: ${logs}`
     );
   }

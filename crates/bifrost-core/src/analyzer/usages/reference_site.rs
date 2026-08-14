@@ -67,7 +67,14 @@ pub fn resolve_reference_site_with_line_starts(
                     "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
                 ));
             }
-            if let Some(token) = token_bounds_at(source, start, language, raw_identifier_aware) {
+            if let Some(root) = root {
+                parsed_leaf_bounds(root, start, end, language).ok_or_else(|| {
+                    "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
+                        .to_string()
+                })?
+            } else if let Some(token) =
+                token_bounds_at(source, start, language, raw_identifier_aware)
+            {
                 if end > token.1 {
                     return Err(
                         "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
@@ -158,6 +165,34 @@ pub fn resolve_reference_site_with_line_starts(
         focus_start_byte: selection_start,
         focus_end_byte: selection_end,
     })
+}
+
+/// Return the complete parsed token that contains `[start, end)`.
+///
+/// The byte scanner used when parsing is unavailable intentionally recognizes
+/// only a conservative ASCII identifier alphabet. A parsed leaf is the
+/// authoritative token boundary for Unicode identifiers and language-specific
+/// symbolic names. Requiring one real leaf also keeps a range that crosses two
+/// adjacent tokens fail-closed.
+fn parsed_leaf_bounds(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+    language: Language,
+) -> Option<(usize, usize)> {
+    let node = root.descendant_for_byte_range(start, end)?;
+    let exact_cpp_destructor = language == Language::Cpp
+        && node.kind() == "destructor_name"
+        && node.start_byte() == start
+        && node.end_byte() == end;
+    ((node.child_count() == 0 || exact_cpp_destructor)
+        && !node.is_error()
+        && !node.is_missing()
+        && !node.is_extra()
+        && node.start_byte() < node.end_byte()
+        && node.start_byte() <= start
+        && node.end_byte() >= end)
+        .then(|| (node.start_byte(), node.end_byte()))
 }
 
 fn single_non_whitespace_character_at(source: &str, byte: usize) -> Option<(usize, usize)> {

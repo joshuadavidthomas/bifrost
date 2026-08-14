@@ -29,6 +29,25 @@ For a raw query, commit the RQL used for exploration and the canonical JSON used
 
 ## Run Manifest
 
+Independent extensions should use the authoritative
+`brokk_bifrost_runtime::extension::ExtensionRunManifest` schema and its
+`encode_run_manifest_json`, `decode_canonical_run_manifest_json`,
+`verify_extension_bundle`, and reproduction APIs. The canonical bundle places
+`manifest.json` at its root and keeps requests, observations, relation
+snapshots, mappings, protocols, and results in external content-addressed
+files. Paths are normalized relative paths; symlinks, escapes, duplicate roles,
+dependency cycles, hash/length mismatches, and a complete aggregate containing
+incomplete evidence are rejected.
+
+The manifest digest excludes only the schema-defined `volatile` measurements;
+the hash of the complete `manifest.json` file includes them. Reproduction first
+returns every engine, workspace, extension, semantic, environment, cache, or
+artifact mismatch in stable order. It executes only after that preflight, uses
+a typed executor rather than a command string from the manifest, stages into a
+new directory, verifies the result, and atomically publishes only equal
+deterministic artifacts. Never include secrets or absolute checkout paths in
+deterministic identity fields.
+
 Use a machine-readable manifest such as:
 
 ```json

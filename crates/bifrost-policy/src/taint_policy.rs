@@ -50,15 +50,16 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
-    WorkspaceIcfgProvider,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget,
+    SemanticOutcome, UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider,
+    split_qualified_member,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledProcedureSummary, CompiledSummaryEffect, ExactProcedureSummaryBoundary,
     ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
-    ExactProcedureSummaryTargetBinding, ProcedureSummaryTargetKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
+    ExactProcedureSummaryTargetBinding, ProcedureSummaryMemberKey, ProcedureSummaryTargetKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
@@ -222,6 +223,28 @@ impl TaintExecutionBudget {
             remaining_witness_expansions: limits.value_flow.max_witness_expansions,
             remaining_witness_bytes: budget.max_witness_bytes(),
         }
+    }
+
+    /// Restore the witness-reconstruction lanes to their per-batch starting
+    /// budget.
+    ///
+    /// Witness reconstruction is a per-batch concern: each solved batch rebuilds
+    /// evidence only for its own findings. These lanes were threaded as one
+    /// request-wide running total, so on a corpus the early batches drained them
+    /// and every later batch failed the `solve_and_project_batch` pre-check and
+    /// dropped its findings to `not_analyzed` by accumulation (#1935). Resetting
+    /// per batch bounds each batch's evidence work on its own; the request-wide
+    /// `remaining_findings` still caps total output, so the aggregate stays
+    /// bounded. Evidence, not the finding, is what a depleted witness lane
+    /// truncates, so this never turns an abstain into a false clean.
+    fn reset_per_batch_witness_budget(&mut self, budget: &PolicyBudget) {
+        let limits = budget.query_limits();
+        self.remaining_witnesses = budget
+            .max_findings()
+            .saturating_mul(budget.max_witnesses_per_finding());
+        self.remaining_witness_steps = budget.max_witness_steps();
+        self.remaining_witness_expansions = limits.value_flow.max_witness_expansions;
+        self.remaining_witness_bytes = budget.max_witness_bytes();
     }
 }
 
@@ -403,6 +426,10 @@ struct DiscoveredValueFlow {
     bindings: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>>,
     procedures: HashSet<ProcedureHandle>,
     external_targets: Vec<ExactExternalProcedureTarget>,
+    /// Canonical identities of fully-qualified external callees that never
+    /// materialize to an artifact, kept separate from `external_targets` so the
+    /// materialized-external binding path is unchanged (#1978).
+    unmaterialized_external_targets: Vec<UnmaterializedExternalTarget>,
 }
 
 /// Compile-scoped materialization cache for require-model taint discovery
@@ -608,7 +635,30 @@ impl<'a> TaintPolicyCompiler<'a> {
         // that reaches it (#1936).
         let mut materialization = DiscoveryMaterializationCache::default();
         for root in roots {
-            discoveries.push(self.discover_value_flow(&root, &mut materialization)?);
+            // Each region is an independent source-to-sink analysis, so budget
+            // it independently rather than accumulating every region's
+            // materialization into one shared cap (which makes a corpus abstain
+            // by accumulation). The shared `materialization` cache keeps
+            // cross-region work amortized, so a region's fresh budget only
+            // accounts for the procedures it newly pulls.
+            self.selectors.reset_region_semantic_budget();
+            match self.discover_value_flow(&root, &mut materialization) {
+                Ok(discovery) => discoveries.push(discovery),
+                Err(error) if is_region_budget_exhausted(&error) => {
+                    // This root's forward closure did not fit its own per-region
+                    // budget. `discover_value_flow` errors on exhaustion instead
+                    // of truncating, so the region is complete-or-absent: there
+                    // is no partial region to solve. Skipping it is honest -- the
+                    // root's file simply has no covering region, so any source or
+                    // sink it holds reports `not_analyzed`, never a false clean
+                    // (the scoreboard already treats an uncovered file as an
+                    // abstain). Regions that fit their budget are unaffected, so
+                    // one oversized root -- typically a high call-graph entry
+                    // whose closure spans the workspace -- no longer aborts the
+                    // whole compile and drops every later region (#1936).
+                }
+                Err(error) => return Err(error),
+            }
         }
         // Keep only regions that contain both a selected source and a selected
         // sink: those are the regions where a flow can exist, and each becomes
@@ -855,9 +905,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut seen = HashSet::new();
         let mut seen_bindings = HashSet::new();
         let mut seen_external_targets = HashSet::new();
+        let mut seen_unmaterialized_targets = HashSet::new();
         let mut snapshots = Vec::new();
         let mut bindings = Vec::new();
         let mut external_targets = Vec::new();
+        let mut unmaterialized_external_targets = Vec::new();
         while let Some(procedure) = pending.pop() {
             if !seen.insert(procedure.clone()) {
                 continue;
@@ -928,6 +980,14 @@ impl<'a> TaintPolicyCompiler<'a> {
                     {
                         external_targets.push(target.clone());
                     }
+                    // #1978: a fully-qualified external callee that never
+                    // materializes carries its canonical identity here instead of
+                    // a materialized `exact_external_target`.
+                    if let Some(target) = boundary.unmaterialized_external_target()
+                        && seen_unmaterialized_targets.insert(target.clone())
+                    {
+                        unmaterialized_external_targets.push(target.clone());
+                    }
                 }
                 for candidate in dispatch.candidates() {
                     let binding_key = (call.clone(), candidate.target().clone());
@@ -974,6 +1034,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             bindings,
             procedures: seen,
             external_targets,
+            unmaterialized_external_targets,
         })
     }
 
@@ -986,7 +1047,8 @@ impl<'a> TaintPolicyCompiler<'a> {
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
         let external_summaries = self.bind_external_summaries(
             &discovery.external_targets,
-            discovery.root.artifact().key().dependencies(),
+            &discovery.unmaterialized_external_targets,
+            discovery.root.artifact().key(),
             call_behavior,
         )?;
         let plan = ValueFlowPlan::with_call_behavior(
@@ -1009,12 +1071,14 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn bind_external_summaries(
         &self,
         targets: &[ExactExternalProcedureTarget],
-        dependencies: brokk_bifrost_analysis::analyzer::semantic::DependencyFingerprint,
+        unmaterialized: &[UnmaterializedExternalTarget],
+        root_artifact: &SemanticArtifactKey,
         call_behavior: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior,
     ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
         let Some(active) = &self.active_semantic_models else {
             return Ok(None);
         };
+        let dependencies = root_artifact.dependencies();
         let compatibility = ExternalSummaryCompatibilityKey::new(
             SummarySchemaVersion::CURRENT,
             SummarySemanticsVersion::hash_bytes(b"bifrost.production-value-flow.semantic-pack.v1"),
@@ -1059,7 +1123,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 });
             family.root_ids.insert(selected.record.id.clone());
         }
-        if families.is_empty() {
+        if families.is_empty() && unmaterialized.is_empty() {
             return Ok(None);
         }
 
@@ -1160,6 +1224,151 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
             lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
         }
+
+        // #1978: bind activated summaries to fully-qualified external callees that
+        // never materialize. They select a summary by canonical identity
+        // (language, owner FQN, member, arity, has_receiver) rather than by
+        // artifact path or parameter-typed symbol, and anchor the lowered summary
+        // to the boundary's synthetic locator so it applies at solve time. The
+        // materialized-external binding above is untouched.
+        let mut unmaterialized_families = HashMap::<usize, SelectedSummaryFamily>::new();
+        for target in unmaterialized {
+            let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                target.language().stable_label(),
+                target.owner_fqn(),
+                target.member(),
+                target.has_receiver(),
+                target.arity(),
+            ));
+            match matched.disposition {
+                SemanticModelMatchDisposition::Empty => continue,
+                SemanticModelMatchDisposition::Conflict => {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "conflicting activated procedure summaries target unmaterialized external {}.{}",
+                        target.owner_fqn(),
+                        target.member()
+                    )));
+                }
+                SemanticModelMatchDisposition::Unique => {}
+            }
+            let [selected] = matched.records.as_slice() else {
+                return Err(TaintPolicyCompileError::Model(
+                    "unique unmaterialized procedure-summary lookup returned a non-unique record set"
+                        .to_owned(),
+                ));
+            };
+            let family_key = selected.payload.as_ptr() as usize;
+            let family = unmaterialized_families
+                .entry(family_key)
+                .or_insert_with(|| SelectedSummaryFamily {
+                    language: selected.shard.manifest.language.clone(),
+                    payload: selected.payload.to_vec(),
+                    root_ids: HashSet::new(),
+                });
+            family.root_ids.insert(selected.record.id.clone());
+        }
+        let mut unmaterialized_families = unmaterialized_families.into_values().collect::<Vec<_>>();
+        unmaterialized_families.sort_unstable_by(|left, right| {
+            left.language.cmp(&right.language).then_with(|| {
+                left.payload
+                    .iter()
+                    .map(|summary| (&summary.model_id, &summary.id))
+                    .cmp(
+                        right
+                            .payload
+                            .iter()
+                            .map(|summary| (&summary.model_id, &summary.id)),
+                    )
+            })
+        });
+        for family in unmaterialized_families {
+            let by_id = family
+                .payload
+                .iter()
+                .map(|summary| (summary.id.as_str(), summary))
+                .collect::<HashMap<_, _>>();
+            let mut pending = family.root_ids.into_iter().collect::<Vec<_>>();
+            pending.sort_unstable_by(|left, right| right.cmp(left));
+            let mut selected_ids = HashSet::new();
+            while let Some(id) = pending.pop() {
+                if !selected_ids.insert(id.clone()) {
+                    continue;
+                }
+                let summary = by_id.get(id.as_str()).ok_or_else(|| {
+                    TaintPolicyCompileError::Model(format!(
+                        "activated procedure-summary dependency `{id}` is missing from its payload"
+                    ))
+                })?;
+                for effect in &summary.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            pending.extend(candidates.iter().cloned());
+                        }
+                        CompiledSummaryEffect::Allocation { .. }
+                        | CompiledSummaryEffect::Escape { .. }
+                        | CompiledSummaryEffect::UnknownCall { .. }
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                        | CompiledSummaryEffect::Sanitize { .. } => {}
+                    }
+                }
+            }
+            let summaries = family
+                .payload
+                .iter()
+                .filter(|summary| selected_ids.contains(&summary.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut bindings = Vec::with_capacity(summaries.len());
+            for summary in &summaries {
+                // Re-match this closure summary to its unmaterialized external
+                // target by canonical identity. Parameter types are discarded, so
+                // a same-arity overload set collapses to one identity here.
+                let binding_error = || {
+                    TaintPolicyCompileError::Model(format!(
+                        "unmaterialized procedure summary `{}` dependency closure lacks one external target identity",
+                        summary.id
+                    ))
+                };
+                let mut exact = unmaterialized.iter().filter(|target| {
+                    target.language().stable_label() == family.language
+                        && target.has_receiver() == summary.target.has_receiver
+                        && target.arity() == summary.target.parameter_count
+                        && split_qualified_member(&summary.target.symbol).is_some_and(
+                            |(owner, member)| {
+                                owner == target.owner_fqn() && member == target.member()
+                            },
+                        )
+                });
+                let Some(target) = exact.next() else {
+                    return Err(binding_error());
+                };
+                if exact.any(|candidate| candidate != target) {
+                    return Err(binding_error());
+                }
+                let receiver = summary
+                    .target
+                    .has_receiver
+                    .then_some(ExactProcedureSummaryReceiver);
+                let parameters = (0..summary.target.parameter_count)
+                    .map(ExactProcedureSummaryParameter::new)
+                    .collect();
+                bindings.push(ExactProcedureSummaryTargetBinding::new(
+                    summary.id.clone(),
+                    summary.target.clone(),
+                    target.provenance_artifact_key(root_artifact),
+                    target.locator().clone(),
+                    ExactProcedureSummaryBoundary::new(receiver, parameters),
+                ));
+            }
+            let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
+                .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
+            lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+
+        if lowered.is_empty() {
+            return Ok(None);
+        }
         ExternalSemanticSummarySet::try_new(lowered, compatibility)
             .map(Some)
             .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))
@@ -1180,6 +1389,11 @@ fn solve_and_project_batch(
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
 ) -> Result<(), String> {
+    // Each batch reconstructs evidence only for its own findings, so give it a
+    // fresh witness budget instead of the request-wide remainder a corpus would
+    // have already drained (#1935). `remaining_findings` is deliberately not
+    // reset: it stays the request-wide cap on total output.
+    execution_budget.reset_per_batch_witness_budget(budget);
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
     let witness_retention = WitnessRetentionLimits::best_effort(
@@ -1370,9 +1584,17 @@ fn solve_and_project_batch(
                         .filter_map(|segment| segment.name())
                         .collect::<Vec<_>>()
                         .join(".");
-                    let status = cause
-                        .status()
-                        .map_or("incomplete coverage", SemanticInputStatus::label);
+                    // Name the missing capability when the input is unsupported,
+                    // so a corpus abstention report says which value-flow
+                    // capability the procedure lacked rather than a bare
+                    // "unsupported".
+                    let status = match cause.status() {
+                        Some(status @ SemanticInputStatus::Unsupported { capability }) => {
+                            format!("{} ({})", status.label(), capability.label())
+                        }
+                        Some(status) => status.label().to_owned(),
+                        None => "incomplete coverage".to_owned(),
+                    };
                     if let Ok(diagnostic) = PolicyDiagnostic::try_new(
                         PolicyDiagnosticCode::EvaluationFailure,
                         PolicyDiagnosticSeverity::Warning,
@@ -1835,8 +2057,18 @@ fn project_taint_report(
     if witness_incomplete {
         incomplete.push(FindingIncompleteReason::WitnessTruncated);
     }
-    let (witnesses, witness_refs, omitted_witnesses) =
-        project_taint_witnesses(workspace, group, finding_key, budget)?;
+    let ProjectedTaintWitnesses {
+        witnesses,
+        witness_refs,
+        omitted: omitted_witnesses,
+        display_path,
+    } = project_taint_witnesses(
+        workspace,
+        group,
+        finding_key,
+        finding_incomplete || origins_truncated || witness_incomplete,
+        budget,
+    )?;
     if omitted_witnesses > 0 || witnesses.iter().any(BoundedWitness::truncated) {
         incomplete.push(FindingIncompleteReason::WitnessTruncated);
     }
@@ -1899,29 +2131,51 @@ fn project_taint_report(
             witnesses,
             witnesses_truncated: omitted_witnesses > 0,
             omitted_witnesses_lower_bound: u64::try_from(omitted_witnesses).unwrap_or(u64::MAX),
+            display_path,
         },
         witness_refs,
     ))
+}
+
+struct ProjectedTaintWitnesses {
+    witnesses: Vec<BoundedWitness>,
+    witness_refs: Vec<WitnessId>,
+    omitted: usize,
+    display_path: Option<crate::display_path::TaintDisplayPath>,
 }
 
 fn project_taint_witnesses(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
     finding_key: &str,
+    finding_incomplete: bool,
     budget: &PolicyBudget,
-) -> Result<(Vec<BoundedWitness>, Vec<WitnessId>, usize), String> {
-    let mut retained = Vec::<&SummaryWitness>::new();
-    for witness in group.origins.iter().flat_map(|origin| origin.witnesses()) {
-        let witness = witness.as_ref();
-        if !retained.contains(&witness) {
-            retained.push(witness);
+) -> Result<ProjectedTaintWitnesses, String> {
+    let mut retained = Vec::<(&TaintOriginFindingEvidence, &SummaryWitness)>::new();
+    for origin in &group.origins {
+        for witness in origin.witnesses() {
+            let witness = witness.as_ref();
+            if !retained
+                .iter()
+                .any(|(_, retained_witness)| *retained_witness == witness)
+            {
+                retained.push((origin, witness));
+            }
         }
     }
     let retained_limit = retained.len().min(budget.max_witnesses_per_finding());
     let mut omitted = retained.len().saturating_sub(retained_limit);
     let mut witnesses = Vec::new();
     let mut witness_refs = Vec::new();
-    for (index, witness) in retained.into_iter().take(retained_limit).enumerate() {
+    let mut display_candidates = Vec::new();
+    let sink_locator = group
+        .findings
+        .first()
+        .expect("a projected source group has a finding")
+        .key()
+        .sink()
+        .site();
+    for (index, (origin, witness)) in retained.into_iter().take(retained_limit).enumerate() {
         let id_key =
             super::semantic_identity::stable_hex(format!("{finding_key}:{index}").as_bytes());
         let id = WitnessId::try_new("bifrost", id_key).map_err(|error| error.to_string())?;
@@ -1945,10 +2199,23 @@ fn project_taint_witnesses(
             omitted = omitted.saturating_add(1);
             continue;
         };
+        display_candidates.push(crate::display_path::project_taint_display_candidate(
+            workspace,
+            origin.origin().value_flow_key().site(),
+            sink_locator,
+            id.clone(),
+            witness,
+            finding_incomplete,
+        )?);
         witnesses.push(projected);
         witness_refs.push(id);
     }
-    Ok((witnesses, witness_refs, omitted))
+    Ok(ProjectedTaintWitnesses {
+        witnesses,
+        witness_refs,
+        omitted,
+        display_path: crate::display_path::select_taint_display_path(display_candidates),
+    })
 }
 
 fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProjectionPayload {
@@ -2387,6 +2654,19 @@ fn query_budget_error(
         completion: CodeQueryCompletion::Incomplete { codes: vec![code] },
         detail: detail.into(),
     }
+}
+
+/// True when a compile error is a per-region semantic-budget exhaustion, the one
+/// error the discovery loop recovers from by skipping the oversized root rather
+/// than aborting the whole compile (#1936). Every other error still propagates.
+fn is_region_budget_exhausted(error: &TaintPolicyCompileError) -> bool {
+    matches!(
+        error,
+        TaintPolicyCompileError::QueryIncomplete {
+            completion: CodeQueryCompletion::Incomplete { codes },
+            ..
+        } if codes.contains(&CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+    )
 }
 
 fn taint_selector_error(

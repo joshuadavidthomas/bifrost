@@ -15954,6 +15954,188 @@ mod tests {
         );
     }
 
+    /// C++ recovered-origin provenance for the remaining recovery shapes
+    /// (issue #1657): a sentinel-macro region reparse records every unit the
+    /// reparse walk mints, a fragmented multiple-base export declaration
+    /// records its recovered class, and a fragmented partial specialization
+    /// records the recovered member scope.
+    #[test]
+    fn cpp_remaining_recovery_shapes_record_recovered_origin() {
+        use crate::analyzer::structural::materialization::MaterializationRecord;
+        use brokk_bifrost_core::analyzer::model::Range;
+
+        fn recovered_units(state: &FileState) -> Vec<(String, Range)> {
+            state
+                .materialization_records
+                .iter()
+                .filter_map(|record| match record {
+                    MaterializationRecord::RecoveredDeclaration { recovery, unit } => {
+                        Some((unit.fq_name().to_string(), *recovery))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Issue #941: file-scope macro sentinels make tree-sitter swallow the
+        // wrapped namespace/struct region as one bogus function definition.
+        // The region reparse mints the namespace, struct, and method directly
+        // (there is no single recovered envelope unit), so every minted unit
+        // carries the reparse window; the sibling outside the region stays
+        // parsed.
+        let sentinel = write_file(
+            temp.path(),
+            "sentinel.cpp",
+            concat!(
+                "BEGIN_NS\n",
+                "namespace demo { struct Widget { void doWork(); }; }\n",
+                "END_NS\n",
+                "void callWidget() {\n",
+                "    demo::Widget w;\n",
+                "    w.doWork();\n",
+                "}\n",
+            ),
+        );
+        let state = parse_state(&CppAdapter, &sentinel);
+        let recovered = recovered_units(&state);
+        let names: Vec<&str> = recovered.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["demo", "demo.Widget", "demo.Widget.doWork"],
+            "records: {:?}",
+            state.materialization_records
+        );
+        let source = sentinel.read_to_string().unwrap();
+        let widget_start = source.find("struct Widget").unwrap();
+        for (name, recovery) in &recovered {
+            assert!(
+                recovery.start_byte <= widget_start && widget_start < recovery.end_byte,
+                "the reparse window must cover the recovered struct for {name}: {recovery:?}"
+            );
+        }
+
+        // Issue #938: a multiple-base export-macro class parses as a broken
+        // `declaration` whose members tree-sitter scatters; the recovery
+        // records the recovered class over its full class range.
+        let fragmented = write_file(
+            temp.path(),
+            "two_base.h",
+            concat!(
+                "#define VIEWS_EXPORT\n",
+                "namespace views {\n",
+                "class VIEWS_EXPORT TwoBase : public internal::NativeWidgetDelegate,\n",
+                "                             public ui::EventSource {\n",
+                "public:\n",
+                "    TwoBase();\n",
+                "};\n",
+                "}\n",
+            ),
+        );
+        let state = parse_state(&CppAdapter, &fragmented);
+        let recovered = recovered_units(&state);
+        assert_eq!(
+            recovered.len(),
+            1,
+            "records: {:?}",
+            state.materialization_records
+        );
+        let (name, recovery) = &recovered[0];
+        assert_eq!(
+            name, "views.TwoBase",
+            "records: {:?}",
+            state.materialization_records
+        );
+        let source = fragmented.read_to_string().unwrap();
+        let class_start = source.find("class VIEWS_EXPORT").unwrap();
+        assert_eq!(recovery.start_byte, class_start, "recovery: {recovery:?}");
+        assert!(
+            recovery.end_byte > source.find("TwoBase();").unwrap(),
+            "the recovery window must span to the displaced closing brace: {recovery:?}"
+        );
+
+        // A macro-constrained template parameter fragments a partial
+        // specialization; the recovered member scope is recorded over the
+        // proven specialization range while the ordinary forward declaration
+        // stays parsed.
+        let specialization = write_file(
+            temp.path(),
+            "expected.hpp",
+            concat!(
+                "namespace lib {\n",
+                "#if USE_STANDARD\n",
+                "using std::expected;\n",
+                "#else\n",
+                "template<typename T, typename E> class expected;\n",
+                "\n",
+                "template<typename E>\n",
+                "class expected<void, E> {\n",
+                "public:\n",
+                "    constexpr expected() noexcept\n",
+                "        : contained(true)\n",
+                "    {}\n",
+                "\n",
+                "    constexpr explicit expected(in_place_t(void))\n",
+                "        : contained(true)\n",
+                "    {}\n",
+                "\n",
+                "    template<typename G = E\n",
+                "        nsel_REQUIRES_T(\n",
+                "            !std::is_convertible<G const&, E>::value\n",
+                "        )\n",
+                "    >\n",
+                "    nsel_constexpr14 explicit expected(G const& error)\n",
+                "        : contained(false)\n",
+                "    {\n",
+                "        contained.construct_error(E{error.error()});\n",
+                "    }\n",
+                "\n",
+                "    template<typename G = E\n",
+                "        nsel_REQUIRES_T(\n",
+                "            std::is_convertible<G const&, E>::value\n",
+                "        )\n",
+                "    >\n",
+                "    nsel_constexpr14 expected(G const& error)\n",
+                "        : contained(false)\n",
+                "    {\n",
+                "        contained.construct_error(error.error());\n",
+                "    }\n",
+                "\n",
+                "    bool has_value() const { return contained.has_value(); }\n",
+                "\n",
+                "private:\n",
+                "    bool contained;\n",
+                "};\n",
+                "\n",
+                "void after_specialization() {}\n",
+                "#endif\n",
+                "}\n",
+            ),
+        );
+        let state = parse_state(&CppAdapter, &specialization);
+        let recovered = recovered_units(&state);
+        assert_eq!(
+            recovered.len(),
+            1,
+            "records: {:?}",
+            state.materialization_records
+        );
+        let (name, recovery) = &recovered[0];
+        assert_eq!(
+            name, "lib.expected<void, E>",
+            "records: {:?}",
+            state.materialization_records
+        );
+        let source = specialization.read_to_string().unwrap();
+        let specialization_start = source.find("class expected<void, E>").unwrap();
+        let member_start = source.find("bool has_value").unwrap();
+        assert!(
+            recovery.start_byte <= specialization_start && member_start < recovery.end_byte,
+            "the recovery window must cover the specialization scope: {recovery:?}"
+        );
+    }
+
     /// TS export provenance (issue #1476): the TypeScript dialect's own
     /// visitor records the same export-row vocabulary, including type-space
     /// exports (interfaces, type aliases) and the default re-export.
@@ -15969,6 +16151,7 @@ mod tests {
                 "export interface Shape { area(): number }\n",
                 "export type Alias = Shape;\n",
                 "export const answer = 42;\n",
+                "export const { high, low: renamed } = bounds;\n",
                 "export class Widget {}\n",
                 "const table = { greet: 'hi' };\n",
                 "export default table;\n",
@@ -15993,6 +16176,8 @@ mod tests {
                 (ExportForm::Named, "Shape".to_string()),
                 (ExportForm::Named, "Alias".to_string()),
                 (ExportForm::Named, "answer".to_string()),
+                (ExportForm::Named, "high".to_string()),
+                (ExportForm::Named, "renamed".to_string()),
                 (ExportForm::Named, "Widget".to_string()),
                 (ExportForm::DefaultNamed, "default".to_string()),
             ],
@@ -16014,6 +16199,8 @@ mod tests {
             "exports.js",
             concat!(
                 "export const answer = 42;\n",
+                "export const { alpha, beta: renamed = 1, ...rest } = source;\n",
+                "export const [first, second] = pair;\n",
                 "export function makeWidget() {}\n",
                 "const messages = { greet: 'hi' };\n",
                 "export default messages;\n",
@@ -16037,6 +16224,11 @@ mod tests {
             exports,
             vec![
                 (ExportForm::Named, "answer".to_string(), false),
+                (ExportForm::Named, "alpha".to_string(), false),
+                (ExportForm::Named, "renamed".to_string(), false),
+                (ExportForm::Named, "rest".to_string(), false),
+                (ExportForm::Named, "first".to_string(), false),
+                (ExportForm::Named, "second".to_string(), false),
                 (ExportForm::Named, "makeWidget".to_string(), false),
                 (ExportForm::DefaultNamed, "default".to_string(), false),
             ],

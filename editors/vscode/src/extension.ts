@@ -24,24 +24,25 @@ import {
   buildMcpHostCommands,
   decideBifrostGitignorePrompt,
   formatError,
-  appendBifrostGitignoreEntry,
-  inspectWorkspaceBifrostGitignore,
   parseExtraArgs,
   replaceLegacyBifrostGitignoreEntry,
   selectTrustedFormatterCommands,
   sourceFileWatchers,
   spawnBifrostServer,
   supportedWorkspaceRoot,
-  validateLaunchCommand
+  validateLaunchCommand,
+  workspaceGitignoreIncludesLegacyBifrostEntry
 } from "./lifecycle";
 import {
-  findManagedBinary,
+  activatePreparedManagedBinary,
+  findCompatibleManagedBinary,
   installManagedBinary,
-  isVersionCompatible,
-  probeBifrostVersion,
+  normalizeBinaryCompatibility,
   releaseAssetFor,
-  releaseTargetFor
+  releaseTargetFor,
+  selectManagedBinaryAndPreparePreferred
 } from "./provisioning";
+import type { BinaryCompatibility, ManagedBinaryPreparation } from "./provisioning";
 import type {
   RqlQueryDocument,
   RqlQueryNavigationTarget,
@@ -86,8 +87,9 @@ let rqlDiagnostics: vscode.DiagnosticCollection | undefined;
 let rqlValidation: RqlValidationController<vscode.CancellationToken> | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
+let pendingManagedBinaryPreparation: ManagedBinaryPreparation | undefined;
 let extensionActive = false;
-const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.gitignoreCachePromptDeclined:";
+const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.legacyGitignoreMigrationDeclined:";
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionActive = true;
@@ -456,6 +458,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
       startInFlight = undefined;
     }
   }
+  schedulePreparedManagedBinaryActivation(context);
 }
 
 async function startClientInner(context: vscode.ExtensionContext): Promise<void> {
@@ -470,7 +473,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     log("No workspace folder is open; Bifrost language server was not started.");
     return;
   }
-  void promptAppendBifrostGitignore(context, root);
+  void promptReplaceLegacyBifrostGitignore(context, root);
 
   const config = vscode.workspace.getConfiguration("bifrost");
   const command = config.get<string>("serverPath") || "bifrost";
@@ -482,7 +485,9 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
 
   let launchConfig: BifrostLaunchConfig;
   try {
-    const managedBinaryPath = await prepareManagedBinary(context, mode, command);
+    const managedBinary = await prepareManagedBinary(context, mode, command);
+    const managedBinaryPath = managedBinary?.selected.path ?? null;
+    pendingManagedBinaryPreparation = managedBinary?.preferredInstall ? managedBinary : undefined;
     launchConfig = buildLaunchConfig(
       root,
       context.extensionUri.fsPath,
@@ -762,7 +767,7 @@ async function promptRestartAfterConfigurationChange(
   }
 }
 
-async function promptAppendBifrostGitignore(
+async function promptReplaceLegacyBifrostGitignore(
   context: vscode.ExtensionContext,
   workspaceRoot: string
 ): Promise<void> {
@@ -771,54 +776,40 @@ async function promptAppendBifrostGitignore(
     return;
   }
 
-  let state: Awaited<ReturnType<typeof inspectWorkspaceBifrostGitignore>>;
+  let hasLegacyEntry: boolean;
   try {
-    state = await inspectWorkspaceBifrostGitignore(workspaceRoot);
+    hasLegacyEntry = await workspaceGitignoreIncludesLegacyBifrostEntry(workspaceRoot);
   } catch (error) {
-    log(`Failed to inspect .gitignore for Bifrost cache entry: ${formatError(error)}`);
+    log(`Failed to inspect .gitignore for legacy Bifrost entry: ${formatError(error)}`);
     return;
   }
 
-  if (state === "configured") {
+  if (!hasLegacyEntry) {
     await context.workspaceState.update(declinedKey, undefined);
     return;
   }
 
-  const legacy = state === "legacy-whole-directory";
-  const acceptedChoice = legacy ? "Replace" : "Add";
   const choice = await vscode.window.showInformationMessage(
-    legacy
-      ? "Bifrost now tracks project configuration in .bifrost. Replace the legacy .bifrost ignore rule with .bifrost/cache/?"
-      : "Bifrost stores generated workspace state in .bifrost/cache. Add .bifrost/cache/ to .gitignore?",
-    acceptedChoice,
+    "Bifrost now tracks project configuration in .bifrost. Replace the legacy .bifrost ignore rule with .bifrost/cache/?",
+    "Replace",
     BIFROST_GITIGNORE_ASK_AGAIN_LATER,
     BIFROST_GITIGNORE_DONT_ASK_AGAIN
   );
-  const decision = decideBifrostGitignorePrompt(choice, acceptedChoice);
+  const decision = decideBifrostGitignorePrompt(choice);
   if (decision === "defer") {
-    log(
-      `User deferred ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`
-    );
+    log("User deferred replacing the legacy .bifrost ignore.");
     return;
   }
   if (decision === "decline") {
     await context.workspaceState.update(declinedKey, true);
-    log(
-      `User declined ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`
-    );
+    log("User declined replacing the legacy .bifrost ignore.");
     return;
   }
 
   try {
-    if (legacy) {
-      await replaceLegacyBifrostGitignoreEntry(workspaceRoot);
-    } else {
-      await appendBifrostGitignoreEntry(workspaceRoot);
-    }
+    await replaceLegacyBifrostGitignoreEntry(workspaceRoot);
     await context.workspaceState.update(declinedKey, undefined);
-    log(
-      `${legacy ? "Replaced legacy .bifrost ignore with" : "Added"} .bifrost/cache/ in .gitignore.`
-    );
+    log("Replaced legacy .bifrost ignore with .bifrost/cache/ in .gitignore.");
   } catch (error) {
     const message = formatError(error);
     log(`Failed to update .gitignore for Bifrost cache entry: ${message}`);
@@ -906,7 +897,8 @@ async function resolveMcpConfig(context: vscode.ExtensionContext): Promise<Bifro
   const config = vscode.workspace.getConfiguration("bifrost");
   const command = config.get<string>("serverPath") || "bifrost";
   const mode = config.get<LaunchMode>("launchMode") || "auto";
-  const managedBinaryPath = await prepareManagedBinary(context, mode, command);
+  const managedBinary = await prepareManagedBinary(context, mode, command);
+  const managedBinaryPath = managedBinary?.selected.path ?? null;
   return buildMcpConfig(root, context.extensionUri.fsPath, mode, command, managedBinaryPath);
 }
 
@@ -920,13 +912,14 @@ async function prepareManagedBinary(
   context: vscode.ExtensionContext,
   mode: LaunchMode,
   configuredPath: string
-): Promise<string | null> {
+): Promise<ManagedBinaryPreparation | null> {
   const configured = configuredPath.trim();
   if (mode === "path" || (mode === "auto" && configured && configured !== "bifrost")) {
     return null;
   }
 
-  const binaryVersion = requiredBinaryVersion(context);
+  const compatibility = requiredBinaryCompatibility(context);
+  const binaryVersion = compatibility.binaryVersion;
   const archiveSha256 = requiredArchiveSha256(context, binaryVersion);
   const storageDir = context.globalStorageUri.fsPath;
   try {
@@ -940,72 +933,71 @@ async function prepareManagedBinary(
     return null;
   }
 
-  let binaryPath = await findManagedBinary(storageDir, binaryVersion);
-  if (!binaryPath) {
-    binaryPath = await promptAndInstallManagedBinary(context, mode, binaryVersion, archiveSha256);
+  const managed = await selectManagedBinaryAndPreparePreferred(
+    () => findCompatibleManagedBinary(storageDir, compatibility),
+    () => installManagedBinaryForContext(context, compatibility, archiveSha256),
+    log
+  );
+  if (!managed) {
+    const binaryPath = await promptAndInstallManagedBinary(
+      context,
+      mode,
+      compatibility,
+      archiveSha256
+    );
     if (!binaryPath && mode === "bundled") {
       throw new Error(
         `Bifrost ${binaryVersion} is not installed for ${process.platform}-${process.arch}.`
       );
     }
-    return binaryPath;
+    return binaryPath
+      ? {
+          selected: {
+            path: binaryPath,
+            version: binaryVersion,
+            compatibilityMode: "exact"
+          },
+          preferredInstall: null
+        }
+      : null;
   }
-
-  return verifyManagedBinary(context, mode, binaryVersion, archiveSha256, binaryPath);
+  if (managed.selected.compatibilityMode === "compatible") {
+    log(
+      `Using compatible managed Bifrost ${managed.selected.version}; preferred ${binaryVersion}.`
+    );
+  }
+  return managed;
 }
 
-async function verifyManagedBinary(
-  context: vscode.ExtensionContext,
-  mode: LaunchMode,
-  binaryVersion: string,
-  archiveSha256: string,
-  binaryPath: string
-): Promise<string | null> {
-  try {
-    const probe = await probeBifrostVersion(binaryPath);
-    if (isVersionCompatible(probe.version, binaryVersion)) {
-      return binaryPath;
-    }
-    const found = probe.version ?? (probe.rawOutput || "unknown");
-    log(`Managed Bifrost version mismatch: expected ${binaryVersion}, found ${found}.`);
-    const choice = await vscode.window.showWarningMessage(
-      `Bifrost ${binaryVersion} is required, but the managed binary is ${found}.`,
-      "Update",
-      mode === "auto" ? "Use PATH" : "Cancel"
-    );
-    if (choice === "Update") {
-      return tryInstallManagedBinaryForMode(context, mode, binaryVersion, archiveSha256);
-    }
-    if (mode === "bundled") {
-      throw new Error(
-        `Managed Bifrost binary version ${found} does not match required ${binaryVersion}.`
-      );
-    }
-    return null;
-  } catch (error) {
-    const message = formatError(error);
-    log(`Managed Bifrost binary failed version check: ${message}`);
-    const choice = await vscode.window.showWarningMessage(
-      "The managed Bifrost binary could not be run. Reinstall it?",
-      "Reinstall",
-      mode === "auto" ? "Use PATH" : "Cancel"
-    );
-    if (choice === "Reinstall") {
-      return tryInstallManagedBinaryForMode(context, mode, binaryVersion, archiveSha256);
-    }
-    if (mode === "bundled") {
-      throw new Error(`Managed Bifrost binary is not runnable: ${message}`, { cause: error });
-    }
-    return null;
+function schedulePreparedManagedBinaryActivation(context: vscode.ExtensionContext): void {
+  const preparation = pendingManagedBinaryPreparation;
+  pendingManagedBinaryPreparation = undefined;
+  if (!preparation) {
+    return;
   }
+
+  void activatePreparedManagedBinary(
+    preparation,
+    (selectedPath) =>
+      extensionActive &&
+      client?.state === State.Running &&
+      lastLaunchConfig?.command === selectedPath,
+    async (preferredPath) => {
+      log(`Preferred managed Bifrost is ready at ${preferredPath}; restarting language server.`);
+      await restartClient(context);
+    }
+  ).catch((error: unknown) => {
+    log(`Preferred managed Bifrost activation failed: ${formatError(error)}`);
+  });
 }
 
 async function promptAndInstallManagedBinary(
   context: vscode.ExtensionContext,
   mode: LaunchMode,
-  binaryVersion: string,
+  compatibility: BinaryCompatibility,
   archiveSha256: string
 ): Promise<string | null> {
+  const binaryVersion = compatibility.binaryVersion;
   const choice = await vscode.window.showInformationMessage(
     `Install Bifrost ${binaryVersion} for ${process.platform}-${process.arch}?`,
     "Install",
@@ -1015,17 +1007,17 @@ async function promptAndInstallManagedBinary(
     log("Managed Bifrost install was skipped.");
     return null;
   }
-  return tryInstallManagedBinaryForMode(context, mode, binaryVersion, archiveSha256);
+  return tryInstallManagedBinaryForMode(context, mode, compatibility, archiveSha256);
 }
 
 async function tryInstallManagedBinaryForMode(
   context: vscode.ExtensionContext,
   mode: LaunchMode,
-  binaryVersion: string,
+  compatibility: BinaryCompatibility,
   archiveSha256: string
 ): Promise<string | null> {
   try {
-    return await installManagedBinaryForContext(context, binaryVersion, archiveSha256);
+    return await installManagedBinaryForContext(context, compatibility, archiveSha256);
   } catch (error) {
     if (mode === "bundled") {
       throw error;
@@ -1039,14 +1031,17 @@ async function tryInstallManagedBinaryForMode(
 
 async function installManagedBinaryForContext(
   context: vscode.ExtensionContext,
-  binaryVersion: string,
+  compatibility: BinaryCompatibility,
   archiveSha256: string
 ): Promise<string> {
+  const binaryVersion = compatibility.binaryVersion;
   setStatus("$(sync~spin) Bifrost", `Installing Bifrost ${binaryVersion}...`);
   try {
     return await installManagedBinary({
       storageDir: context.globalStorageUri.fsPath,
       version: binaryVersion,
+      minimumBinaryVersion: compatibility.minimumBinaryVersion,
+      allowPrerelease: compatibility.allowPrerelease,
       expectedSha256: archiveSha256,
       platform: process.platform,
       arch: process.arch,
@@ -1059,15 +1054,27 @@ async function installManagedBinaryForContext(
   }
 }
 
-function requiredBinaryVersion(context: vscode.ExtensionContext): string {
+function requiredBinaryCompatibility(context: vscode.ExtensionContext): BinaryCompatibility {
   const packageJson = context.extension.packageJSON as {
-    bifrost?: { binaryVersion?: string };
+    bifrost?: {
+      binaryVersion?: string;
+      minimumBinaryVersion?: string;
+      allowPrerelease?: boolean;
+    };
   };
-  const version = packageJson.bifrost?.binaryVersion?.trim();
-  if (!version) {
+  const binaryVersion = packageJson.bifrost?.binaryVersion?.trim();
+  const minimumBinaryVersion = packageJson.bifrost?.minimumBinaryVersion?.trim();
+  const allowPrerelease = packageJson.bifrost?.allowPrerelease;
+  if (!binaryVersion) {
     throw new Error("Extension package metadata is missing bifrost.binaryVersion.");
   }
-  return version.replace(/^v/, "");
+  if (!minimumBinaryVersion) {
+    throw new Error("Extension package metadata is missing bifrost.minimumBinaryVersion.");
+  }
+  if (allowPrerelease === undefined) {
+    throw new Error("Extension package metadata is missing bifrost.allowPrerelease.");
+  }
+  return normalizeBinaryCompatibility({ binaryVersion, minimumBinaryVersion, allowPrerelease });
 }
 
 function requiredArchiveSha256(context: vscode.ExtensionContext, binaryVersion: string): string {

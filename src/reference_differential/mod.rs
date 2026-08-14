@@ -2,23 +2,28 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
-    go_is_declaration_or_import_name, reference_candidate_ranges,
-    reference_candidate_requires_point_lookup,
+    census_membership_identifier_ranges, go_is_declaration_or_import_name, php_is_declaration_name,
+    python_deferred_annotation_membership_ranges, reference_candidate_ranges,
+    reference_candidate_requires_point_lookup, rust_identifier_text, rust_is_declaration_name,
+    rust_is_pattern_binding_name,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
-    is_adjudicated_answer_diagnostic_kind, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND,
+    PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND, is_adjudicated_answer_diagnostic_kind,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range,
-    cpp_is_constructor_or_destructor_declarator_name, rust_is_field_declaration_name,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer,
+    cpp_is_constructor_or_destructor_declarator_name, resolve_analyzer,
+    rust_declaration_is_enum_variant, rust_declaration_matches_reference_namespace,
+    rust_is_field_declaration_name, rust_reference_namespace,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -56,6 +61,48 @@ pub struct ReferenceDifferentialConfig {
     /// be reported under. Only consulted for `probe_seed == Census`.
     #[serde(default)]
     pub tiers: TierSelection,
+    /// Optional hash partition of the globally sampled file set. Shards are
+    /// disjoint and their union is the same set selected by an unsharded run.
+    #[serde(default)]
+    pub shard: Option<ReferenceShardSpec>,
+}
+
+/// A one-based hash partition used by `--shard K/N` corpus runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceShardSpec {
+    pub index: usize,
+    pub count: usize,
+}
+
+impl ReferenceShardSpec {
+    pub fn new(index: usize, count: usize) -> Result<Self, String> {
+        if count == 0 {
+            return Err("--shard count must be at least 1".to_string());
+        }
+        if index == 0 || index > count {
+            return Err(format!("--shard index {index} is out of range 1..={count}"));
+        }
+        Ok(Self { index, count })
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (index, count) = value
+            .split_once('/')
+            .ok_or_else(|| format!("--shard expects K/N, got `{value}`"))?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| format!("--shard index `{index}` is not a positive integer"))?;
+        let count = count
+            .parse::<usize>()
+            .map_err(|_| format!("--shard count `{count}` is not a positive integer"))?;
+        Self::new(index, count)
+    }
+
+    fn contains(self, seed: u64, path: &str) -> bool {
+        let digest = stable_hash(seed, path.as_bytes());
+        let bucket = u64::from_le_bytes(digest[..8].try_into().expect("eight digest bytes"));
+        self.count == 1 || bucket % self.count as u64 == (self.index - 1) as u64
+    }
 }
 
 /// The probe frontier that proposes reference sites to the differential.
@@ -127,6 +174,7 @@ impl Default for ReferenceDifferentialConfig {
             exact_site: None,
             probe_seed: ProbeSeed::Index,
             tiers: TierSelection::default(),
+            shard: None,
         }
     }
 }
@@ -144,12 +192,17 @@ pub struct ReferenceDifferentialReport {
     pub config: ReferenceDifferentialConfig,
     pub summary: ReferenceDifferentialSummary,
     pub sites: Vec<ReferenceDifferentialSite>,
+    #[serde(default)]
+    pub inverse_precision_findings: Vec<InversePrecisionFinding>,
     pub file_errors: Vec<ReferenceDifferentialFileError>,
 }
 
 impl ReferenceDifferentialReport {
     pub fn actionable_count(&self) -> usize {
-        self.summary.classifications.missing
+        self.summary
+            .classifications
+            .missing
+            .saturating_add(self.summary.inverse_precision_unbacked_hits)
     }
 
     pub fn has_actionable_findings(&self) -> bool {
@@ -173,6 +226,8 @@ pub struct ReferenceDifferentialSummary {
     pub skipped_targets: usize,
     pub target_truncated_sites: usize,
     pub classifications: ReferenceClassificationCounts,
+    #[serde(default)]
+    pub inverse_precision_unbacked_hits: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -219,6 +274,9 @@ pub struct ReferenceDifferentialSite {
     pub note: Option<String>,
     pub inverse_hit: Option<InverseHitEvidence>,
     pub diagnostics: Vec<ReferenceDiagnostic>,
+    /// Tree-sitter node context for ledger signature grouping.
+    #[serde(default)]
+    pub syntactic_shape: String,
     /// The probe frontier that proposed this site: `"index"` or `"census"`.
     #[serde(default = "default_seed_tag")]
     pub seed: String,
@@ -250,6 +308,26 @@ pub struct InverseHitEvidence {
     pub kind: String,
     pub exact_range: bool,
     pub snippet: String,
+}
+
+/// An inverse result whose range contains no census occurrence of the target's
+/// literal terminal name. Alias-aware precision is intentionally future work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InversePrecisionFinding {
+    pub signature: String,
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub line: usize,
+    pub kind: String,
+    pub snippet: String,
+    pub expected_names: Vec<String>,
+    pub targets: Vec<StableDeclarationIdentity>,
+    /// A forward-resolved census site whose target query produced this hit.
+    /// Re-running this exact site reproduces the inverse query without needing
+    /// a separate target-identity CLI syntax.
+    #[serde(default)]
+    pub trigger_site: Option<ExactReferenceSite>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +388,7 @@ struct SampledSite {
     range: Range,
     csharp_nameof_argument: bool,
     point_lookup: bool,
+    syntactic_shape: String,
 }
 
 impl Ord for SampledSite {
@@ -341,6 +420,8 @@ struct PreparedInverseGroup {
     group: ResolvedGroup,
     candidate_files: HashSet<ProjectFile>,
 }
+
+type CensusMembership = HashMap<String, Option<HashSet<(usize, usize, String)>>>;
 
 struct ForwardFileResult {
     records: Vec<ReferenceDifferentialSite>,
@@ -399,6 +480,16 @@ pub fn run_reference_differential_with_progress(
         &mut summary,
         &mut file_errors,
     )?;
+    let mut census_membership = if config.probe_seed == ProbeSeed::Census {
+        collect_census_membership(
+            analyzer,
+            &audited,
+            requested_language,
+            config.max_candidates_per_file,
+        )
+    } else {
+        HashMap::default()
+    };
     summary.sampled_sites = sampled.len();
     progress(ReferenceDifferentialProgress::Sampling {
         sampled_sites: summary.sampled_sites,
@@ -421,9 +512,10 @@ pub fn run_reference_differential_with_progress(
         resolved_sites: groups.iter().map(|group| group.site_indexes.len()).sum(),
         distinct_targets: summary.distinct_targets,
     });
-    compare_inverse(
+    let inverse_precision_findings = compare_inverse(
         analyzer,
         &audited,
+        &mut census_membership,
         groups,
         config,
         &mut records,
@@ -438,14 +530,129 @@ pub fn run_reference_differential_with_progress(
         classify_census_gaps(analyzer, config, &mut records);
     }
     recompute_classifications(&records, &mut summary.classifications);
+    summary.inverse_precision_unbacked_hits = inverse_precision_findings.len();
 
     Ok(ReferenceDifferentialReport {
         root: analyzer.project().root().display().to_string(),
         config: config.clone(),
         summary,
         sites: records,
+        inverse_precision_findings,
         file_errors,
     })
+}
+
+fn collect_census_membership(
+    analyzer: &dyn IAnalyzer,
+    audited: &[ProjectFile],
+    language: Language,
+    max_candidates_per_file: usize,
+) -> CensusMembership {
+    let mut membership = HashMap::default();
+    for file in audited {
+        let Some(source) = analyzer.indexed_source(file) else {
+            continue;
+        };
+        let context = DeclarationNameRangeContext::new(file, source.clone());
+        let Some(root) = context.root_node() else {
+            continue;
+        };
+        let ranges =
+            match census_membership_identifier_ranges(root, language, max_candidates_per_file) {
+                ReferenceCandidateRanges::Complete(ranges) => ranges,
+                ReferenceCandidateRanges::LimitExceeded { .. } => {
+                    membership.insert(rel_path_string(file), None);
+                    continue;
+                }
+            };
+        let mut entries: HashSet<(usize, usize, String)> = ranges
+            .into_iter()
+            .filter_map(|range| {
+                source
+                    .get(range.start_byte..range.end_byte)
+                    .map(|text| (range.start_byte, range.end_byte, text.to_string()))
+            })
+            .collect();
+        if language == Language::Python
+            && !augment_python_deferred_annotation_membership(
+                root,
+                &source,
+                &mut entries,
+                max_candidates_per_file,
+            )
+        {
+            membership.insert(rel_path_string(file), None);
+            continue;
+        }
+        membership.insert(rel_path_string(file), Some(entries));
+    }
+    membership
+}
+
+fn augment_python_deferred_annotation_membership(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    entries: &mut HashSet<(usize, usize, String)>,
+    limit: usize,
+) -> bool {
+    let ranges = match python_deferred_annotation_membership_ranges(root, source, limit) {
+        ReferenceCandidateRanges::Complete(ranges) => ranges,
+        ReferenceCandidateRanges::LimitExceeded { .. } => return false,
+    };
+    ranges.into_iter().all(|range| {
+        let Some(text) = source.get(range.start_byte..range.end_byte) else {
+            return true;
+        };
+        entries.insert((range.start_byte, range.end_byte, text.to_string()));
+        entries.len() <= limit
+    })
+}
+
+fn augment_c_recovery_membership(
+    analyzer: &dyn IAnalyzer,
+    membership: &mut CensusMembership,
+    batch: Option<&CppAuthoritativeUsageBatch<'_>>,
+    files: &HashSet<ProjectFile>,
+    limit: usize,
+) {
+    for file in files {
+        let path = rel_path_string(file);
+        let Some(entry) = membership.get_mut(&path) else {
+            continue;
+        };
+        if entry.is_none() {
+            continue;
+        }
+        let Some(batch) = batch else {
+            *entry = None;
+            continue;
+        };
+        let Some(source) = analyzer.indexed_source(file) else {
+            *entry = None;
+            continue;
+        };
+        let Some(ranges) = batch.recovered_c_reference_ranges(file, limit) else {
+            *entry = None;
+            continue;
+        };
+        let mut exceeded = false;
+        if let Some(entries) = entry.as_mut() {
+            for range in ranges {
+                let Some(text) = source.get(range.start_byte..range.end_byte) else {
+                    exceeded = true;
+                    break;
+                };
+                entries.insert((range.start_byte, range.end_byte, text.to_string()));
+                if entries.len() > limit {
+                    exceeded = true;
+                    break;
+                }
+            }
+        }
+        if exceeded {
+            *entry = None;
+        }
+    }
 }
 
 fn eligible_files_with_inventory(
@@ -592,6 +799,9 @@ fn select_audited_files(
     }
     eligible.sort_by_cached_key(|file| stable_hash(config.seed, rel_path_string(file).as_bytes()));
     eligible.truncate(config.max_files);
+    if let Some(shard) = config.shard {
+        eligible.retain(|file| shard.contains(config.seed, &rel_path_string(file)));
+    }
     eligible.sort();
     eligible
 }
@@ -629,6 +839,7 @@ fn collect_sampled_sites(
         }
         summary.source_bytes = summary.source_bytes.saturating_add(source.len() as u64);
         let context = DeclarationNameRangeContext::new(file, source);
+        let content = context.content();
         let Some(root) = context.root_node() else {
             file_errors.push(file_error(
                 &path,
@@ -661,6 +872,9 @@ fn collect_sampled_sites(
             }
         };
         let declarations = analyzer.declarations(file);
+        let rust = (language == Language::Rust)
+            .then(|| resolve_analyzer::<RustAnalyzer>(analyzer))
+            .flatten();
         let declaration_ranges: HashSet<(usize, usize)> = declarations
             .iter()
             .flat_map(|unit| context.name_ranges(analyzer, unit))
@@ -706,6 +920,41 @@ fn collect_sampled_sites(
                     summary.declaration_sites_excluded.saturating_add(1);
                 continue;
             }
+            if language == Language::Rust
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .filter(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && rust_is_pattern_binding_name(*node)
+                    })
+                    .is_some_and(|node| {
+                        let name = rust_identifier_text(node, content);
+                        rust.is_some_and(|rust| {
+                            !declarations.iter().any(|declaration| {
+                                declaration.identifier() == name
+                                    && rust_declaration_is_enum_variant(rust, declaration)
+                            })
+                        })
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Rust
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && rust_is_declaration_name(node)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
             if language == Language::Go
                 && root
                     .named_descendant_for_byte_range(range.start_byte, range.end_byte)
@@ -713,6 +962,19 @@ fn collect_sampled_sites(
                         node.start_byte() == range.start_byte
                             && node.end_byte() == range.end_byte
                             && go_is_declaration_or_import_name(node)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Php
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && php_is_declaration_name(node)
                     })
             {
                 summary.declaration_sites_excluded =
@@ -760,6 +1022,13 @@ fn collect_sampled_sites(
                         )
                     });
             let point_lookup = reference_candidate_requires_point_lookup(root, language, &range);
+            let syntactic_shape = root
+                .descendant_for_byte_range(range.start_byte, range.end_byte)
+                .map(|node| match node.parent() {
+                    Some(parent) => format!("{}>{}", parent.kind(), node.kind()),
+                    None => node.kind().to_string(),
+                })
+                .unwrap_or_else(|| "unknown".to_string());
             let priority = site_priority(config.seed, &path, &range);
             push_bounded(
                 &mut heap,
@@ -769,6 +1038,7 @@ fn collect_sampled_sites(
                     range,
                     csharp_nameof_argument,
                     point_lookup,
+                    syntactic_shape,
                 },
                 config.max_sites,
             );
@@ -930,6 +1200,7 @@ fn forward_resolve_file(
             },
             inverse_hit: None,
             diagnostics,
+            syntactic_shape: site.syntactic_shape,
             seed: default_seed_tag(),
             tier: None,
         });
@@ -1029,13 +1300,14 @@ fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
 fn compare_inverse(
     analyzer: &dyn IAnalyzer,
     audited_files: &[ProjectFile],
+    census_membership: &mut CensusMembership,
     mut groups: Vec<ResolvedGroup>,
     config: &ReferenceDifferentialConfig,
     records: &mut [ReferenceDifferentialSite],
     summary: &mut ReferenceDifferentialSummary,
     progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
     worker_pool: &rayon::ThreadPool,
-) -> Result<(), String> {
+) -> Result<Vec<InversePrecisionFinding>, String> {
     let files_by_path: HashMap<String, ProjectFile> = audited_files
         .iter()
         .cloned()
@@ -1091,12 +1363,13 @@ fn compare_inverse(
 
     summary.queried_targets += prepared.len();
     if prepared.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let total = prepared.len();
     let records = Mutex::new(records);
     let completed = Mutex::new(0usize);
+    let precision_findings = Mutex::new(Vec::new());
     // Nested UsageFinder queries share this outer request context, allowing
     // immutable per-file syntax to be prepared once across target groups.
     let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
@@ -1124,6 +1397,15 @@ fn compare_inverse(
     } else {
         CppAuthoritativeUsageBatch::new(analyzer, &cpp_roots)
     };
+    if config.probe_seed == ProbeSeed::Census && config.corpus_language == "c" {
+        augment_c_recovery_membership(
+            analyzer,
+            census_membership,
+            cpp_batch.as_ref(),
+            &cpp_roots,
+            config.max_candidates_per_file,
+        );
+    }
     if !cpp_roots.is_empty() {
         progress(
             ReferenceDifferentialProgress::InverseVisibilityBuildCompleted {
@@ -1181,12 +1463,39 @@ fn compare_inverse(
                 // The short lock expresses that invariant safely without retaining every
                 // potentially large query result until the slowest target finishes.
                 let mut records = records.lock().expect("inverse record lock poisoned");
-                classify_group_result(
+                let proven = classify_group_result(
                     &mut records,
                     &prepared.group,
                     result,
                     &prepared.candidate_files,
                 );
+                let trigger_sites = prepared
+                    .group
+                    .site_indexes
+                    .iter()
+                    .map(|index| {
+                        let record = &records[*index];
+                        ExactReferenceSite {
+                            path: record.path.clone(),
+                            start_byte: record.start_byte,
+                            end_byte: Some(record.end_byte),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let findings = inverse_precision_findings(
+                    analyzer,
+                    &prepared.group.targets,
+                    &proven,
+                    census_membership,
+                    &trigger_sites,
+                );
+                drop(records);
+                if !findings.is_empty() {
+                    precision_findings
+                        .lock()
+                        .expect("inverse precision lock poisoned")
+                        .extend(findings);
+                }
             }
             let mut completed = completed.lock().expect("inverse progress lock poisoned");
             *completed += 1;
@@ -1197,7 +1506,24 @@ fn compare_inverse(
             });
         });
     });
-    finish_inverse_query(&query_scope)
+    finish_inverse_query(&query_scope)?;
+    let mut findings = precision_findings
+        .into_inner()
+        .expect("inverse precision lock poisoned");
+    findings.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_byte.cmp(&right.start_byte))
+            .then_with(|| left.end_byte.cmp(&right.end_byte))
+            .then_with(|| left.expected_names.cmp(&right.expected_names))
+    });
+    findings.dedup_by(|left, right| {
+        left.path == right.path
+            && left.start_byte == right.start_byte
+            && left.end_byte == right.end_byte
+            && left.expected_names == right.expected_names
+    });
+    Ok(findings)
 }
 
 fn finish_inverse_query(
@@ -1223,7 +1549,7 @@ fn classify_group_result(
     group: &ResolvedGroup,
     result: FuzzyResult,
     candidate_files: &HashSet<ProjectFile>,
-) {
+) -> Vec<UsageHit> {
     match result {
         FuzzyResult::Success {
             hits_by_overload,
@@ -1248,6 +1574,7 @@ fn classify_group_result(
                 &unproven,
                 unproven_truncated,
             );
+            proven
         }
         FuzzyResult::Ambiguous {
             hits_by_overload, ..
@@ -1267,24 +1594,96 @@ fn classify_group_result(
                     record.note = Some("inverse usage result was ambiguous".to_string());
                 }
             }
+            proven
         }
         FuzzyResult::Failure {
             fq_name, reason, ..
-        } => set_group_inconclusive(
-            records,
-            &group.site_indexes,
-            &format!("inverse failure for {fq_name}: {reason}"),
-        ),
+        } => {
+            set_group_inconclusive(
+                records,
+                &group.site_indexes,
+                &format!("inverse failure for {fq_name}: {reason}"),
+            );
+            Vec::new()
+        }
         FuzzyResult::TooManyCallsites {
             total_callsites,
             limit,
             ..
-        } => set_group_inconclusive(
-            records,
-            &group.site_indexes,
-            &format!("inverse call-site limit exceeded: {total_callsites} > {limit}"),
-        ),
+        } => {
+            set_group_inconclusive(
+                records,
+                &group.site_indexes,
+                &format!("inverse call-site limit exceeded: {total_callsites} > {limit}"),
+            );
+            Vec::new()
+        }
     }
+}
+
+fn inverse_precision_findings(
+    analyzer: &dyn IAnalyzer,
+    targets: &[CodeUnit],
+    hits: &[UsageHit],
+    census_membership: &CensusMembership,
+    trigger_sites: &[ExactReferenceSite],
+) -> Vec<InversePrecisionFinding> {
+    let mut expected_names = targets
+        .iter()
+        .map(|target| target.terminal_name().to_string())
+        .collect::<Vec<_>>();
+    expected_names.sort();
+    expected_names.dedup();
+    let stable_targets = targets
+        .iter()
+        .map(stable_declaration_identity)
+        .collect::<Vec<_>>();
+    hits.iter()
+        .filter_map(|hit| {
+            if matches!(
+                hit.kind,
+                UsageHitKind::Import
+                    | UsageHitKind::Reexport
+                    | UsageHitKind::Definition
+                    | UsageHitKind::OverrideDeclaration
+            ) {
+                return None;
+            }
+            let path = rel_path_string(&hit.file);
+            let trigger_site = trigger_sites
+                .iter()
+                .find(|site| site.path == path)
+                .or_else(|| trigger_sites.first())?
+                .clone();
+            let source = analyzer.indexed_source(&hit.file)?;
+            let literal = source.get(hit.start_offset..hit.end_offset)?;
+            if !expected_names.iter().any(|name| name == literal) {
+                return None;
+            }
+            let entries = census_membership.get(&path)?.as_ref()?;
+            let backed = entries.contains(&(hit.start_offset, hit.end_offset, literal.to_string()));
+            if backed {
+                return None;
+            }
+            let signature = format!(
+                "inverse_precision:{}:{}",
+                hit.kind.wire_label(),
+                expected_names.join("|")
+            );
+            Some(InversePrecisionFinding {
+                signature,
+                path,
+                start_byte: hit.start_offset,
+                end_byte: hit.end_offset,
+                line: hit.line + 1,
+                kind: hit.kind.wire_label().to_string(),
+                snippet: hit.snippet.clone(),
+                expected_names: expected_names.clone(),
+                targets: stable_targets.clone(),
+                trigger_site: Some(trigger_site),
+            })
+        })
+        .collect()
 }
 
 fn classify_complete_sites(
@@ -1500,6 +1899,66 @@ fn bare_call_reaches_same_file_declaration(
     }
 }
 
+fn rust_same_file_definition_evidence(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    root: Option<tree_sitter::Node<'_>>,
+    source: &str,
+    record: &ReferenceDifferentialSite,
+    declarations: &BTreeSet<CodeUnit>,
+) -> bool {
+    let Some(node) = root
+        .and_then(|root| root.named_descendant_for_byte_range(record.start_byte, record.end_byte))
+        .filter(|node| {
+            node.start_byte() == record.start_byte && node.end_byte() == record.end_byte
+        })
+    else {
+        return false;
+    };
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return false;
+    };
+    let reference_name = rust_identifier_text(node, source);
+    if node
+        .parent()
+        .is_some_and(|parent| matches!(parent.kind(), "token_tree" | "token_repetition"))
+    {
+        return declarations
+            .iter()
+            .any(|candidate| candidate.identifier() == reference_name);
+    }
+    let namespace = rust_reference_namespace(node);
+    let mut candidates = declarations.iter().filter(|candidate| {
+        candidate.identifier() == reference_name
+            && rust_declaration_matches_reference_namespace(rust, candidate, namespace)
+    });
+
+    let Some(scoped) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(node)
+    }) else {
+        return candidates.count() > 0;
+    };
+    let Some(path) = scoped.child_by_field_name("path") else {
+        return false;
+    };
+    let owner_text = &source[path.byte_range()];
+    let references = rust.forward_reference_context_of(file);
+    let Some(owner) = references
+        .resolve_bare(owner_text)
+        .or_else(|| references.resolve_scoped_owner(owner_text))
+    else {
+        return false;
+    };
+    candidates.any(|candidate| {
+        analyzer
+            .parent_of(candidate)
+            .is_some_and(|parent| parent.fq_name() == owner)
+    })
+}
+
 /// Whether a census site is the joint-blindness residue the tier classifier
 /// grades, or an answer the forward resolver already gave.
 ///
@@ -1513,9 +1972,11 @@ fn bare_call_reaches_same_file_declaration(
 /// twitter/util's `class Oneshot(var more: ...)` doubled as the one behind a
 /// `case Cons(fa, more) => more()` pattern binder the resolver had already
 /// proven local (#1858).
-fn census_gap_is_gradable(record: &ReferenceDifferentialSite) -> bool {
+fn census_gap_is_gradable(language: Language, record: &ReferenceDifferentialSite) -> bool {
     record.forward_status != DefinitionLookupStatus::Resolved.as_str()
         && record.forward_status != DefinitionLookupStatus::UnresolvableImportBoundary.as_str()
+        && !(language == Language::Rust
+            && record.forward_status == DefinitionLookupStatus::Ambiguous.as_str())
         && !record
             .diagnostics
             .iter()
@@ -1550,9 +2011,10 @@ fn classify_census_gaps(
     records: &mut [ReferenceDifferentialSite],
 ) {
     use std::collections::BTreeMap;
+    let language = corpus_language(&config.corpus_language).unwrap_or(Language::None);
     let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
-        if census_gap_is_gradable(record) {
+        if census_gap_is_gradable(language, record) {
             by_path.entry(record.path.clone()).or_default().push(index);
         }
     }
@@ -1567,9 +2029,9 @@ fn classify_census_gaps(
         let Some(source) = analyzer.indexed_source(&file) else {
             continue;
         };
-        let same_file_names: HashSet<String> = analyzer
-            .declarations(&file)
-            .into_iter()
+        let same_file_declarations = analyzer.declarations(&file);
+        let same_file_names: HashSet<String> = same_file_declarations
+            .iter()
             .map(|unit| unit.identifier().to_string())
             .collect();
         let context = DeclarationNameRangeContext::new(&file, source);
@@ -1583,14 +2045,30 @@ fn classify_census_gaps(
             let role = root
                 .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
                 .unwrap_or(CensusSiteRole::Other);
-            let same_file_evidence = same_file_names.contains(&name)
-                && (role != CensusSiteRole::BareCall
-                    || bare_call_reaches_same_file_declaration(
-                        language,
-                        bindings.as_ref(),
-                        &name,
-                        record.start_byte,
-                    ));
+            let owner_unresolved_go_label = language == Language::Go
+                && record.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND
+                });
+            let same_file_evidence = if language == Language::Rust {
+                rust_same_file_definition_evidence(
+                    analyzer,
+                    &file,
+                    root,
+                    content,
+                    record,
+                    &same_file_declarations,
+                )
+            } else {
+                !owner_unresolved_go_label
+                    && same_file_names.contains(&name)
+                    && (role != CensusSiteRole::BareCall
+                        || bare_call_reaches_same_file_declaration(
+                            language,
+                            bindings.as_ref(),
+                            &name,
+                            record.start_byte,
+                        ))
+            };
             let tier = if same_file_evidence
                 && matches!(
                     role,
@@ -1788,6 +2266,130 @@ mod tests {
     };
     use std::cell::Cell;
     use std::fs;
+
+    #[test]
+    fn reference_shards_partition_paths_exactly_once() {
+        let paths = ["src/lib.rs", "src/main.rs", "tests/a.rs", "tests/b.rs"];
+        for count in 1..=4 {
+            let shards = (1..=count)
+                .map(|index| ReferenceShardSpec::new(index, count).expect("valid shard"))
+                .collect::<Vec<_>>();
+            for path in paths {
+                assert_eq!(
+                    shards
+                        .iter()
+                        .filter(|shard| shard.contains(7, path))
+                        .count(),
+                    1,
+                    "path {path} must occur in exactly one of {count} shards"
+                );
+            }
+        }
+        assert!(ReferenceShardSpec::parse("0/2").is_err());
+        assert!(ReferenceShardSpec::parse("3/2").is_err());
+        assert!(ReferenceShardSpec::parse("1").is_err());
+    }
+
+    #[test]
+    fn inverse_precision_reports_only_literal_hits_without_census_membership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = "fn target() {}\nfn caller() { target(); }\n";
+        fs::write(root.join("lib.rs"), source).expect("source");
+        let project = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = ProjectFile::new(&root, "lib.rs");
+        let target = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.terminal_name() == "target")
+            .expect("target declaration");
+        let start = source.rfind("target").expect("target call");
+        let enclosing = analyzer
+            .enclosing_code_unit(
+                &file,
+                &Range {
+                    start_byte: start,
+                    end_byte: start + "target".len(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            )
+            .expect("caller owner");
+        let hit = UsageHit::new(
+            file.clone(),
+            1,
+            start,
+            start + "target".len(),
+            enclosing,
+            1.0,
+            "fn caller() { target(); }",
+        );
+
+        let mut empty_membership = HashMap::default();
+        empty_membership.insert("lib.rs".to_string(), Some(HashSet::default()));
+        let unbacked = inverse_precision_findings(
+            analyzer,
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&hit),
+            &empty_membership,
+            &[ExactReferenceSite {
+                path: "lib.rs".to_string(),
+                start_byte: start,
+                end_byte: Some(start + "target".len()),
+            }],
+        );
+        assert_eq!(unbacked.len(), 1, "{unbacked:#?}");
+        assert_eq!(unbacked[0].expected_names, ["target"]);
+        assert_eq!(
+            unbacked[0]
+                .trigger_site
+                .as_ref()
+                .expect("trigger site")
+                .path,
+            "lib.rs"
+        );
+        assert!(
+            inverse_precision_findings(
+                analyzer,
+                std::slice::from_ref(&target),
+                &[hit.clone().into_definition()],
+                &empty_membership,
+                &[ExactReferenceSite {
+                    path: "lib.rs".to_string(),
+                    start_byte: start,
+                    end_byte: Some(start + "target".len()),
+                }],
+            )
+            .is_empty(),
+            "definition linkage is not a source reference precision claim"
+        );
+
+        let mut membership = HashMap::default();
+        membership.insert(
+            "lib.rs".to_string(),
+            Some(
+                [(start, start + "target".len(), "target".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(
+            inverse_precision_findings(
+                analyzer,
+                &[target],
+                &[hit],
+                &membership,
+                &[ExactReferenceSite {
+                    path: "lib.rs".to_string(),
+                    start_byte: start,
+                    end_byte: Some(start + "target".len()),
+                }],
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn inverse_query_scope_propagates_store_errors_after_the_batch() {

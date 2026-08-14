@@ -422,6 +422,147 @@ fn typestate_step_help_and_diagnostics_are_range_precise() {
     assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
 }
 
+/// Hover help and validation ranges for the flow-state vocabulary (#1480), in
+/// both frontends. Every option name and every constrained value is checked at
+/// its own range, so an editor cannot underline the wrong token.
+#[test]
+fn flow_state_help_and_diagnostics_are_range_precise() {
+    let rql = "(flow-relations-of :relation [reaching] :certainty [exact] (state-events-of :class [establish] :subject [binding] (procedure-of (function))))";
+    for token in [
+        "flow-relations-of",
+        ":relation",
+        ":certainty",
+        "state-events-of",
+        ":class",
+        ":subject",
+    ] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no flow-state help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    for projection in ["(flow-source ", "(flow-target "] {
+        let source = format!("{projection}(flow-relations-of (procedure-of (function))))");
+        let offset = source
+            .find(projection.trim_start_matches('(').trim())
+            .unwrap();
+        let help = query_source_help_at(&source, offset).expect("flow projection help");
+        assert!(!help.description.is_empty());
+        assert!(validate_query_source(&source).is_empty(), "{source}");
+    }
+
+    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"state_events_of","event_class":["read"],"subject":["property"]},{"op":"flow_relations_of","flow_relation":["dominates"],"certainty":["may"]}]}"#;
+    for token in [
+        "state_events_of",
+        "event_class",
+        "subject",
+        "flow_relations_of",
+        "flow_relation",
+        "certainty",
+    ] {
+        let offset = json.find(token).unwrap();
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON flow-state help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(json).is_empty(), "{json}");
+}
+
+/// A constrained value outside the registry is reported on the value's own
+/// range, and the message names the allowed set.
+#[test]
+fn flow_state_constrained_values_report_their_allowed_set() {
+    let rql = "(state-events-of :class [obliterate] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("obliterate"))
+        .expect("state-event class diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], "obliterate");
+    for allowed in ["establish", "kill", "read"] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+
+    let rql = "(flow-relations-of :certainty [probably] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("probably"))
+        .expect("certainty diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], "probably");
+    assert!(diagnostic.message.contains("exact"), "{diagnostic:?}");
+    assert!(diagnostic.message.contains("may"), "{diagnostic:?}");
+
+    let rql = "(state-events-of :relation [reaching] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-property")
+        .expect("unknown option diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], ":relation");
+
+    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"flow_relations_of","flow_relation":["adjacent"]}]}"#;
+    let diagnostic = validate_query_source(json)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("adjacent"))
+        .expect("JSON flow-relation diagnostic");
+    assert_eq!(&json[diagnostic.range.clone()], "\"adjacent\"");
+}
+
+/// Hover help and validation ranges for the bounded rewrite vocabulary
+/// (#1480), in both frontends.
+#[test]
+fn rewrite_path_help_and_diagnostics_are_range_precise() {
+    let rql =
+        "(rewrite-paths-of :domain [rust-import-alias] :outcome [cycle] (file-of (function)))";
+    for token in ["rewrite-paths-of", ":domain", ":outcome"] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no rewrite-path help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"file_of"},{"op":"rewrite_paths_of","domain":["rust_import_alias"],"rewrite_outcome":["converged"]}]}"#;
+    for token in ["rewrite_paths_of", "domain", "rewrite_outcome"] {
+        let offset = json.find(token).unwrap();
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON rewrite-path help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(json).is_empty(), "{json}");
+}
+
+/// A constrained value outside the registry is reported on the value's own
+/// range, and the message names the allowed set.
+#[test]
+fn rewrite_path_constrained_values_report_their_allowed_set() {
+    let rql = "(rewrite-paths-of :outcome [diverged] (file-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("diverged"))
+        .expect("rewrite outcome diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], "diverged");
+    for allowed in ["converged", "cycle", "exceeded_budget"] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+
+    let rql = "(rewrite-paths-of :certainty [exact] (file-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-property")
+        .expect("unknown option diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
+
+    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"file_of"},{"op":"rewrite_paths_of","domain":["ruby_require"]}]}"#;
+    let diagnostic = validate_query_source(json)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("ruby_require"))
+        .expect("JSON rewrite-domain diagnostic");
+    assert_eq!(&json[diagnostic.range.clone()], "\"ruby_require\"");
+}
+
 #[test]
 fn value_flow_help_and_diagnostics_are_range_precise() {
     let rql = "(witness :max-steps 8 (value-flow :plan-ref test:flow (procedure-of (function))))";
@@ -932,6 +1073,28 @@ fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
         validate_query_source(exports).is_empty(),
         "{exports}: {:#?}",
         validate_query_source(exports)
+    );
+
+    // The inverse linkage step (#1660) validates and hovers in both
+    // spellings, exactly like its forward sibling.
+    let stubs = "(stubs-of (enclosing-decl (function)))";
+    for token in ["stubs-of", "enclosing-decl"] {
+        let offset = stubs.find(token).unwrap();
+        let help = query_source_help_at(stubs, offset)
+            .unwrap_or_else(|| panic!("no materialization help for {token}"));
+        assert_eq!(&stubs[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(
+        validate_query_source(stubs).is_empty(),
+        "{stubs}: {:#?}",
+        validate_query_source(stubs)
+    );
+    let underscored = "(stubs_of (enclosing-decl (function)))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}: {:#?}",
+        validate_query_source(underscored)
     );
 
     for (source, token, code) in [

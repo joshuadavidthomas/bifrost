@@ -28,11 +28,12 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-// v10: `SignatureMetadata::field_has_initializer` changed the bincode record
-// shape shared by every language. Rows written before that field existed end
-// before the current decoder reaches it, so every language must rebuild its
-// analyzer facts. Semantic chunks and vectors have a separate identity and
-// remain valid.
+// v11: merge of two v10 bumps made independently on both sides of a branch.
+// One added `SignatureMetadata::field_has_initializer`; the other added the
+// declaration-backed structured underlying type identity for Go named
+// containers (#2069). The merged bincode shape matches rows written under
+// neither v10 salt, so both generations turn over here. Semantic chunks and
+// vectors have a separate identity and remain valid.
 //
 // v9: migration 0019 merged `import_details` into `import_statements`, so an
 // import is one row per binding instead of a raw statement plus a bincode
@@ -41,7 +42,7 @@ use tree_sitter::Language as TsLanguage;
 // and Scala and TypeScript now emit one row per binding rather than one per
 // declaration. `binder_span` (#1600) rides along as a column on that row
 // rather than as a bincode field, because the blob it used to live in is gone.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v10-signature-metadata-field-initializer";
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v11-signature-metadata-merge";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -236,7 +237,7 @@ lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08;named-type-underlying-identity-2026-08"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using
@@ -411,11 +412,18 @@ mod query_content_tests {
 // crate's `include_str!`.
 // Salt bumped again (#1926): JavaScript `field_definition` uses the structured
 // `property` field. Reading it now indexes public and private class fields.
+// Salt bumped again (#1658): the TypeScript declaration walk now records
+// declaration-only signature metadata for overload signatures and ambient
+// declarations. `.js` files can be parsed through the TS grammar, so both
+// dialect salts carry the bump; rows persisted before it read every stub as
+// runnable.
+// Salt bumped again (#1862): plain top-level fields in scripts now use the
+// shared program-scope identity. Warm rows used a file-qualified identity.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
@@ -427,24 +435,32 @@ lang_epoch!(
 // Salt bumped again (#1548 stage 3 fleet): the TypeScript `.scm` query assets
 // moved from this crate's `resources/treesitter/typescript/` into
 // `brokk-bifrost-js-ts` alongside JavaScript's -- one crate holds both dialects.
+// Salt bumped again (#1658): overload signatures and ambient declarations now
+// persist declaration-only signature metadata. Rows written before this change
+// read every stub as runnable behavior, the da26602 regression.
+// Salt bumped again (#1862): plain top-level fields in scripts now use the
+// shared program-scope identity. Warm rows used a file-qualified identity.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
 // this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
-// Salt bumped again (#1860): Scala anonymous template bodies now publish a
-// synthetic class owner and source-backed member CodeUnits.
+// Salt bumped again (#1971): Python module identity now starts at a nested
+// setuptools import root declared in pyproject.toml.
+// Salt bumped again (#2052): repeated assignments to one logical class field
+// now retain every physical navigation range so class-body lookup can select
+// the binding active at the reference site.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
@@ -478,11 +494,20 @@ lang_epoch!(
 // unguarded import for a `#[cfg]`-gated one (making two disjoint cfg
 // alternatives look like one ambiguity, #1377) and would let an extern-crate
 // alias also bind a same-named local module.
+// Rust salt bumped again (#2033): named fields of enum struct variants now
+// persist beneath the exact variant identity (`Enum.Variant.field`). Warm rows
+// written before this change contain the variant but omit all of those fields.
+// Rust salt bumped again (#2035): callable signature metadata now persists each
+// parameter type spelling. Associated trait-call applicability must not read a
+// warm row that predates that declaration-side discriminator.
+// Rust salt bumped again (#2128): Cargo module route facts now canonicalize raw
+// identifiers such as `mod r#struct;`. Warm rows retain the source spelling and
+// cannot connect the declaration to its physical `struct.rs` child.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08"
 );
 
 #[cfg(test)]

@@ -258,15 +258,9 @@ fn javascript_local_schema_builder_call_materializes_object_shape() {
             });
         "#,
     )]);
-    let file = project.file("schema.js");
-    let declarations = analyzer.declarations(&file);
-
-    assert!(declarations.contains(&CodeUnit::new(
-        file,
-        CodeUnitType::Field,
-        "",
-        "schema.js.LocalSchema.isEnabled",
-    )));
+    let field = definition(&analyzer, "LocalSchema.isEnabled");
+    assert_eq!(field.source(), &project.file("schema.js"));
+    assert_eq!(field.kind(), CodeUnitType::Field);
 }
 
 #[test]
@@ -281,10 +275,7 @@ fn javascript_regex_initializer_included_in_variable_skeleton() {
     let skeletons = analyzer.get_skeletons(&file);
     assert_eq!(
         "const p = /x/",
-        skeletons
-            .get(&definition(&analyzer, "pattern.js.p"))
-            .unwrap()
-            .trim()
+        skeletons.get(&definition(&analyzer, "p")).unwrap().trim()
     );
 }
 

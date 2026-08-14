@@ -1,17 +1,18 @@
 use super::ir::{
-    ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter,
-    CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT,
-    DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
-    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
-    ReachingBindingOptions, ReceiverTraversalFilter, ReferenceTraversalFilter, ScopeFilter,
-    ScopeSeed, SegmentsOfOptions, SetOperator, StringPredicate, TaintTraversal, TypestateTraversal,
-    UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallInputSelector,
+    CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
+    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
+    DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter,
+    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
+    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
+    ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -21,6 +22,9 @@ use super::schema::{
 };
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
@@ -30,6 +34,9 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    RewriteDomainKind, RewriteOutcomeKind,
 };
 use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
 use regex::Regex;
@@ -790,6 +797,86 @@ pub(super) fn decode_edge_filter(
     })
 }
 
+pub(super) fn decode_state_event_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<StateEventFilter, QueryError> {
+    let classes = QueryStepField::StateEventClasses.label();
+    let subjects = QueryStepField::StateEventSubjects.label();
+    reject_unknown_filter_fields(object, path, &[classes, subjects, "op"], "state event")?;
+    Ok(StateEventFilter {
+        classes: decode_environment_axis(
+            object,
+            path,
+            classes,
+            "state event class",
+            StateEventClass::from_label,
+        )?,
+        subjects: decode_environment_axis(
+            object,
+            path,
+            subjects,
+            "flow subject kind",
+            FlowSubjectKind::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_flow_relation_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<FlowRelationFilter, QueryError> {
+    let relations = QueryStepField::FlowRelations.label();
+    let certainties = QueryStepField::FlowCertainties.label();
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[relations, certainties, "op"],
+        "flow relation",
+    )?;
+    Ok(FlowRelationFilter {
+        relations: decode_environment_axis(
+            object,
+            path,
+            relations,
+            "flow relation",
+            FlowRelationLabel::from_label,
+        )?,
+        certainties: decode_environment_axis(
+            object,
+            path,
+            certainties,
+            "flow certainty",
+            FlowCertainty::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_rewrite_path_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<RewritePathFilter, QueryError> {
+    let domains = QueryStepField::RewriteDomains.label();
+    let outcomes = QueryStepField::RewriteOutcomes.label();
+    reject_unknown_filter_fields(object, path, &[domains, outcomes, "op"], "rewrite path")?;
+    Ok(RewritePathFilter {
+        domains: decode_environment_axis(
+            object,
+            path,
+            domains,
+            "rewrite domain",
+            RewriteDomainKind::from_label,
+        )?,
+        outcomes: decode_environment_axis(
+            object,
+            path,
+            outcomes,
+            "rewrite outcome",
+            RewriteOutcomeKind::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_candidate_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1126,9 +1213,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         );
         let binding = matches!(step, QueryStep::BindingsIn(_));
         let candidate = matches!(step, QueryStep::CandidatesOf(_));
-        let reaching = matches!(step, QueryStep::ReachingBinding(_));
+        let binding_of = matches!(step, QueryStep::BindingOf(_));
         let declaration_state = matches!(step, QueryStep::DeclarationStateOf(_));
         let edge = matches!(step, QueryStep::EdgesOf(_) | QueryStep::EdgesFrom(_));
+        let state_event = matches!(step, QueryStep::StateEventsOf(_));
+        let flow_relation = matches!(step, QueryStep::FlowRelationsOf(_));
+        let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
@@ -1163,7 +1253,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CandidateOutcomes
                     | QueryStepField::CandidateBoundaries,
                 ) if candidate => {}
-                Some(QueryStepField::IncludeShadowed) if reaching => {}
+                Some(QueryStepField::IncludeShadowed) if binding_of => {}
                 Some(QueryStepField::Resolved) if segments => {}
                 Some(
                     QueryStepField::DeclarationOrigins
@@ -1183,6 +1273,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::EdgeRelations
                     | QueryStepField::EdgeSiteClasses,
                 ) if edge => {}
+                Some(QueryStepField::StateEventClasses | QueryStepField::StateEventSubjects)
+                    if state_event => {}
+                Some(QueryStepField::FlowRelations | QueryStepField::FlowCertainties)
+                    if flow_relation => {}
+                Some(QueryStepField::RewriteDomains | QueryStepField::RewriteOutcomes)
+                    if rewrite_path => {}
                 Some(
                     QueryStepField::Depth
                     | QueryStepField::Transitive
@@ -1215,6 +1311,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::EdgeUsageKinds
                     | QueryStepField::EdgeRelations
                     | QueryStepField::EdgeSiteClasses
+                    | QueryStepField::StateEventClasses
+                    | QueryStepField::StateEventSubjects
+                    | QueryStepField::FlowRelations
+                    | QueryStepField::FlowCertainties
+                    | QueryStepField::RewriteDomains
+                    | QueryStepField::RewriteOutcomes
                     | QueryStepField::Resolved,
                 )
                 | None => {
@@ -1255,7 +1357,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 None => false,
             };
             step = QueryStep::SegmentsOf(SegmentsOfOptions { resolved });
-        } else if reaching {
+        } else if binding_of {
             let include_shadowed = match object.get("include_shadowed") {
                 Some(value) => {
                     if value.as_bool() != Some(true) {
@@ -1268,7 +1370,13 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
                 None => false,
             };
-            step = QueryStep::ReachingBinding(ReachingBindingOptions { include_shadowed });
+            step = QueryStep::BindingOf(BindingOfOptions { include_shadowed });
+        } else if state_event {
+            step = QueryStep::StateEventsOf(decode_state_event_filter(object, &entry_path)?);
+        } else if flow_relation {
+            step = QueryStep::FlowRelationsOf(decode_flow_relation_filter(object, &entry_path)?);
+        } else if rewrite_path {
+            step = QueryStep::RewritePathsOf(decode_rewrite_path_filter(object, &entry_path)?);
         } else if edge {
             let filter = decode_edge_filter(object, &entry_path)?;
             step = match step {

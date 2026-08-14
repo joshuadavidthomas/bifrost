@@ -14,7 +14,7 @@
 ; was itself created inside the loop, so the work is inherent to the iteration.
 ; The condition those rules actually want is loop *invariance* of the operand:
 ; the same value, created once, re-sorted on every pass. That is a
-; reaching-binding question, and this rule asks it -- the requirement is that
+; binding-of question, and this rule asks it -- the requirement is that
 ; the sorted receiver be declared inside the loop, so the violation is the half
 ; declared outside it.
 ;
@@ -58,6 +58,6 @@
               (inside (loop :capture "region")
                       (call :callee (name "sort") :receiver (identifier :capture "target"))))))
       :asserts [
-        (assert-reaching :id declared-inside :at "target" :role receiver_position
+        (assert-binding-scope :id declared-inside :at "target" :role receiver_position
                          :declared inside :relative-to "region")
       ]))

@@ -288,21 +288,33 @@ impl CallSiteFacts {
 /// Per-file knowledge a language spec gathers once, before any call site is
 /// classified, because the answer for one call lives elsewhere in the file.
 ///
-/// Today it carries exactly one axis: the callee names whose argument list is
-/// produced by a macro this analyzer does not expand. C and C++ need it —
-/// `FOO(a, b)` where `FOO` is a function-like macro has a source argument
-/// count that is not the called callable's arity — and the answer is the set
-/// of function-like macro definitions in the translation unit, which is one
-/// scan of the tree rather than one scan per call.
+/// It carries two axes. C and C++ record the callee names whose argument list
+/// is produced by a macro this analyzer does not expand — `FOO(a, b)` where
+/// `FOO` is a function-like macro has a source argument count that is not the
+/// called callable's arity, and the answer is the set of function-like macro
+/// definitions in the translation unit. Ruby records the start bytes of the
+/// bare identifier nodes that are zero-argument call sites — whether `x` reads
+/// a local variable or calls a method depends on the assignments and
+/// parameters lexically before it in the enclosing callable. Both are one
+/// scan of the tree rather than one scan per node.
 #[derive(Debug, Default, Clone)]
 pub struct CallSiteContext {
     macro_derived_callees: HashSet<String>,
+    identifier_call_starts: HashSet<usize>,
 }
 
 impl CallSiteContext {
     pub fn with_macro_derived_callees(names: HashSet<String>) -> Self {
         Self {
             macro_derived_callees: names,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_identifier_call_starts(starts: HashSet<usize>) -> Self {
+        Self {
+            identifier_call_starts: starts,
+            ..Self::default()
         }
     }
 
@@ -310,6 +322,11 @@ impl CallSiteContext {
     /// is not the callable's argument list.
     pub fn is_macro_derived_callee(&self, callee: &str) -> bool {
         self.macro_derived_callees.contains(callee)
+    }
+
+    /// Whether the identifier node starting at `start_byte` is a call site.
+    pub fn is_identifier_call_at(&self, start_byte: usize) -> bool {
+        self.identifier_call_starts.contains(&start_byte)
     }
 }
 

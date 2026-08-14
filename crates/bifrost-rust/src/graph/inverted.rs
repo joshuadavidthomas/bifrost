@@ -38,8 +38,9 @@ use crate::hierarchy::canonical_rust_hierarchy_type;
 use crate::imports::{resolve_rust_import_package_scoped, rust_focused_use_path};
 use crate::lexical_scope::RustLexicalScopeIndex;
 use crate::usage::{
-    RustBindingSeeds, RustReferenceNamespace, usage_binding_seeds, usage_exact_root_for_resolution,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    RustBindingSeeds, RustReferenceNamespace, RustSymbolNamespace, usage_binding_seeds,
+    usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
 };
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -89,17 +90,17 @@ impl RustSeedsCache {
 /// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
 /// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
 /// this per file, so the Rust half is a pure function of a parsed file, the
-/// file's cached reference context, and the two sources.
+/// file's query-scoped reference context, and the two sources.
 pub fn scan_file(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     seeds_cache: &RustSeedsCache,
     file: &ProjectFile,
-    refs: Arc<RustReferenceContext>,
+    refs: RustReferenceContext<'_>,
     input: &FileEdgeScanInput<'_>,
     keep_going: &dyn Fn() -> bool,
 ) -> PerFileEdges {
-    // One shared, cached per-file resolution context. Both this inverted
+    // One query-scoped per-file resolution context. Both this inverted
     // builder and (from Phase 1b) the forward scan resolve references
     // through it, so the two paths can't drift.
     let factory_returns = collect_factory_return_types(input.root(), input.source, &refs);
@@ -139,7 +140,7 @@ struct RustScan<'a> {
     seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,
     source: &'a str,
-    refs: Arc<RustReferenceContext>,
+    refs: RustReferenceContext<'a>,
     lexical_scope: RustLexicalScopeIndex,
     token_tree_roles: RustTokenTreeRoleCache,
     factory_returns: HashMap<String, String>,
@@ -205,7 +206,7 @@ impl RustScan<'_> {
 
     fn bare_nominal_namespace(&self, node: Node<'_>) -> Option<RustReferenceNamespace> {
         let candidate = self.refs.resolve_bare(slice(node, self.source))?;
-        rust_unique_nominal_reference_namespace(self.rust, self.support, candidate)
+        rust_unique_nominal_reference_namespace(self.rust, self.support, &candidate)
     }
 
     fn bare_pattern_value_callee(&self, node: Node<'_>) -> Option<String> {
@@ -521,7 +522,7 @@ impl RustScan<'_> {
         } else {
             let (name, prefix) = path.segments.split_last()?;
             if prefix.is_empty() {
-                self.refs.resolve_bare(name).map(str::to_string)
+                self.refs.resolve_bare(name)
             } else {
                 self.refs.resolve_scoped(&prefix.join("::"), name)
             }
@@ -545,22 +546,8 @@ impl RustScan<'_> {
         unit: &CodeUnit,
         namespace: RustReferenceNamespace,
     ) -> bool {
-        match namespace {
-            RustReferenceNamespace::Any => {
-                unit.is_module()
-                    || unit.is_function()
-                    || unit.is_field()
-                    || unit.is_class()
-                    || self.rust.is_type_alias(unit)
-                    || unit.is_macro()
-            }
-            RustReferenceNamespace::Value => unit.is_function() || unit.is_field(),
-            RustReferenceNamespace::Type => unit.is_class() || self.rust.is_type_alias(unit),
-            RustReferenceNamespace::Macro => unit.is_macro(),
-            RustReferenceNamespace::PathPrefix => {
-                unit.is_module() || unit.is_class() || self.rust.is_type_alias(unit)
-            }
-        }
+        RustSymbolNamespace::of(self.rust, unit)
+            .is_some_and(|symbol_namespace| symbol_namespace.accepts(namespace))
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -1025,7 +1012,7 @@ fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_>) -> Option<String
             let name = slice(function, ctx.source);
             ctx.refs
                 .resolve_bare(name)
-                .and_then(|fqn| ctx.factory_returns.get(fqn).cloned())
+                .and_then(|fqn| ctx.factory_returns.get(&fqn).cloned())
         }
         "scoped_identifier" | "scoped_type_identifier" => {
             let path = function.child_by_field_name("path")?;
@@ -1042,7 +1029,7 @@ fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_>) -> Option<String
 fn collect_factory_return_types(
     root: Node<'_>,
     source: &str,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
 ) -> HashMap<String, String> {
     let mut returns = HashMap::default();
     let mut stack = vec![(root, None::<String>)];
@@ -1115,7 +1102,7 @@ fn type_node_fqn(type_node: Node<'_>, ctx: &RustScan<'_>) -> Option<String> {
 fn type_node_fqn_with_impl(
     type_node: Node<'_>,
     source: &str,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     impl_owner_fqn: Option<&str>,
 ) -> Option<String> {
     match type_node.kind() {
@@ -1124,7 +1111,7 @@ fn type_node_fqn_with_impl(
             if name == "Self" {
                 return impl_owner_fqn.map(str::to_string);
             }
-            refs.resolve_bare(&name).map(str::to_string)
+            refs.resolve_bare(&name)
         }
         "scoped_type_identifier" | "scoped_identifier" => {
             let path = type_node

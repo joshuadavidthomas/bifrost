@@ -73,7 +73,7 @@ object Factory {
     let formal_receiver = instance
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("Kotlin instance methods must publish their current receiver");
     let input = instance
         .values()
@@ -360,7 +360,7 @@ fun caller(service: Service) {
     let receiver = extended
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("a Kotlin extension must publish its receiver as a receiver value");
     assert!(
         mapped_source(extended, SOURCE, receiver.source).contains("Service"),

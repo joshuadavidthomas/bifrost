@@ -7,6 +7,7 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -399,6 +400,7 @@ impl StructuralSpec for RustStructuralSpec {
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Identifier
             && node.kind() == "identifier"

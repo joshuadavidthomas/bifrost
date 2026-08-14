@@ -12,10 +12,10 @@ use super::ir::MAX_BINDING_NAME_LENGTH;
 use super::schema;
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
-    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
-    QueryField, QueryStepField, QueryStepOp, REACHING_BINDING_STEP_OPTIONS, RqlForm, RqlFormClass,
-    RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
-    binding_option_for_rql_label, candidate_option_for_rql_label,
+    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, BINDING_OF_STEP_OPTIONS,
+    CodeQueryExecutionMode, PatternField, QueryField, QueryStepField, QueryStepOp, RqlForm,
+    RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
+    binding_option_for_rql_label, candidate_option_for_rql_label, constrained_step_option_labels,
     declaration_state_option_for_rql_label, environment_filter_labels, export_field_for_rql_label,
     generation_site_field_for_rql_label, occurrence_filter_labels, occurrence_option_for_rql_label,
     reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,

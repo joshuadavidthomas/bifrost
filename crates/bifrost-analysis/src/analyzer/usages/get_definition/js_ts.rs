@@ -12,7 +12,8 @@ use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
-    js_program_is_external_module, pattern_binder_identifiers, slice,
+    is_export_alias_identifier, js_program_is_external_module, pattern_binder_identifiers, slice,
+    typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -212,6 +213,12 @@ pub(super) fn resolve_js_ts(
         }
     }
 
+    if focused.is_some_and(is_export_alias_identifier) {
+        return no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            "JS/TS export aliases declare outward bindings and do not reference indexed definitions",
+        );
+    }
     if focused
         .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
     {
@@ -236,6 +243,23 @@ pub(super) fn resolve_js_ts(
             "local_binding",
             format!("`{reference}` is a local JS/TS binding, which is not indexed"),
         );
+    }
+    if language == Language::TypeScript
+        && !reference.contains(['.', ':'])
+        && let Some(candidates) = focused.and_then(|node| {
+            ts_enclosing_enum_initializer_member_candidates(
+                analyzer, support, file, source, node, site, reference,
+            )
+        })
+    {
+        return if candidates.is_empty() {
+            no_definition(
+                "enum_member_not_visible",
+                format!("`{reference}` is not an earlier member of the enclosing TypeScript enum"),
+            )
+        } else {
+            js_ts_candidates_outcome(analyzer, candidates)
+        };
     }
 
     // AST path for an inline construction receiver `new Foo().member` — the
@@ -598,7 +622,24 @@ pub(super) fn resolve_js_ts(
         .filter(|candidate| jsts_candidate_is_bare_declaration(file, reference, candidate))
         .cloned()
         .collect();
-    if same_file.is_empty() && language == Language::JavaScript {
+    let binding_ranges =
+        lexical_bindings.binding_identifier_ranges_at(reference, site.focus_start_byte);
+    // TypeScript keeps value and type declarations in separate namespaces. A
+    // visible `const Widget` must narrow a value-position `Widget`, but it must
+    // not hide an `interface Widget` or `type Widget` at an annotation site.
+    // The lexical binding index records value binders, so apply its declaration
+    // range filter only in the value namespace (#2114).
+    if value_position && !binding_ranges.is_empty() {
+        same_file.retain(|candidate| {
+            analyzer.ranges(candidate).iter().any(|declaration_range| {
+                binding_ranges.iter().any(|binding_range| {
+                    declaration_range.start_byte <= binding_range.start_byte
+                        && binding_range.end_byte <= declaration_range.end_byte
+                })
+            })
+        });
+    }
+    if same_file.is_empty() && binding_ranges.is_empty() && language == Language::JavaScript {
         same_file = jsts_exact_browser_global_bare_candidates(
             analyzer,
             tree.root_node(),
@@ -614,6 +655,14 @@ pub(super) fn resolve_js_ts(
     }
     if !same_file.is_empty() {
         return js_ts_candidates_outcome(analyzer, same_file);
+    }
+    if !binding_ranges.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "the lexical binding for `{reference}` is not indexed in the requested namespace"
+            ),
+        );
     }
 
     // Last resort for a bare name, symmetric with the dotted one above (#1787).
@@ -640,6 +689,49 @@ pub(super) fn resolve_js_ts(
     )
 }
 
+fn ts_enclosing_enum_initializer_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    focused: Node<'_>,
+    site: &ResolvedReferenceSite,
+    reference: &str,
+) -> Option<Vec<CodeUnit>> {
+    if !matches!(focused.kind(), "identifier" | "property_identifier") {
+        return None;
+    }
+    let (enum_declaration, assignment) = typescript_enclosing_enum_initializer(focused)?;
+    let enum_name = enum_declaration.child_by_field_name("name")?;
+    let enclosing = analyzer.enclosing_code_unit(file, &site.range)?;
+    let owner = if enclosing.is_field() {
+        analyzer.parent_of(&enclosing)?
+    } else {
+        enclosing
+    };
+    if !owner.is_class()
+        || owner.source() != file
+        || owner.terminal_name() != slice(enum_name, source)
+    {
+        return None;
+    }
+
+    let member_fqn = format!("{}.{}", owner.fq_name(), reference);
+    Some(
+        support
+            .fqn(&member_fqn)
+            .into_iter()
+            .filter(|candidate| candidate.is_field() && candidate.source() == file)
+            .filter(|candidate| {
+                analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.end_byte <= assignment.start_byte())
+            })
+            .collect(),
+    )
+}
+
 /// Bare names another script contributes to the shared script global scope.
 ///
 /// The project-wide question is the one `jsts_exact_dotted_candidates` asks --
@@ -652,11 +744,9 @@ pub(super) fn resolve_js_ts(
 /// scripts that both declare the name really are two contenders, and the shared
 /// outcome machinery calls that Ambiguous (#1811).
 ///
-/// The reach is exactly what the JS/TS indexer gives a bare fq name: a
-/// program-scope function, class, or function-valued binder. A top-level
-/// plain-value `const`/`var` is indexed as the file-scoped field
-/// `<file name>.<name>` instead, so it has no bare fq to look up and stays
-/// invisible across scripts.
+/// The JS/TS indexer gives each program-scope script binding a bare qualified
+/// name. Module fields keep a file-scoped identity and fail the script gate
+/// below.
 fn jsts_script_global_bare_candidates(
     analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,

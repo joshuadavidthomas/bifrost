@@ -18,8 +18,8 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
 };
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v8";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v9";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v9";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v10";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -147,6 +147,23 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 parent.captures_receiver || procedure_owns_receiver(parent.kind, parent.properties)
             });
             specs[index].captures_receiver &= can_capture_receiver;
+        }
+        // A surviving capture ultimately reads the receiver of the nearest
+        // non-lambda ancestor, so that owner must publish its receiver formal
+        // even when its own body never reads `this` directly.
+        for index in 0..specs.len() {
+            if !specs[index].captures_receiver {
+                continue;
+            }
+            let Some(parent) = specs[index].lexical_parent else {
+                continue;
+            };
+            let parent = parent.index();
+            if specs[parent].kind != ProcedureKind::Lambda
+                && procedure_owns_receiver(specs[parent].kind, specs[parent].properties)
+            {
+                specs[parent].owns_receiver = true;
+            }
         }
         if cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -337,10 +354,26 @@ struct LoweringContext<'tree, 'targets> {
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     abruptness: HashMap<usize, bool>,
     cleanups: Vec<CleanupRegion<'tree>>,
+    plain_object_locals: HashMap<ValueId, PlainObjectLocal>,
 }
 
 struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+}
+
+/// A local whose value is a plain object literal for the binding's whole
+/// extent: the initializer is a plain literal, and every use of the name in
+/// the procedure is a non-`__proto__` member-access base outside call-callee
+/// position, so no alias, capture, rebind, or prototype mutation exists that
+/// could install an accessor or a proxy behind a later property access.
+struct PlainObjectLocal {
+    /// Node id of the declaration statement's parent. A property access is
+    /// established only when this node is among its ancestors, so control
+    /// cannot reach the access without first executing the declarator.
+    declaration_parent: usize,
+    /// End byte of the declarator; accesses before it may observe the
+    /// binding uninitialized.
+    available_after: usize,
 }

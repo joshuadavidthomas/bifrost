@@ -304,6 +304,44 @@ fn a_complete_type_closure_proves_a_missing_attribute() {
 }
 
 #[test]
+fn a_complete_declared_base_closure_proves_a_missing_attribute() {
+    let environment = Environment::new()
+        .standard_library_module("builtins.pyi", BUILTINS_STUB)
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[(
+                "__init__.pyi",
+                "class Base:\n    def inherited(self) -> None: ...\n\nclass Child(Base): ...\n",
+            )],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Child.inherited, theta.Child.nope\n",
+    );
+
+    let report = fixture.report();
+    assert_eq!(1, report.diagnostics().len(), "{report:#?}");
+    assert!(
+        report.diagnostics()[0].message.contains("nope"),
+        "the inherited member must resolve through the declared base: {report:#?}"
+    );
+    assert!(
+        absence_domains(&report).iter().any(|domain| matches!(
+            domain,
+            SemanticDiagnosticDomain::MemberSurface { owner, member }
+                if owner == "theta.Child" && member == "nope"
+        )),
+        "the complete inherited surface must prove absence: {report:#?}"
+    );
+    assert!(
+        incomplete_reasons(&report).is_empty(),
+        "a fully indexed declared base must not need name guessing: {report:#?}"
+    );
+}
+
+#[test]
 fn an_inherited_attribute_from_the_object_root_resolves() {
     let environment = Environment::new()
         .standard_library_module("builtins.pyi", BUILTINS_STUB)

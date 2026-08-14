@@ -28,6 +28,7 @@ input.on("line", (line) => {
         : message.params.protocolVersion,
       capabilities: { tools: {} },
       serverInfo: { name: "fake-bifrost", version: "0.8.4" },
+      instructions: "Use fake Bifrost for semantic code lookup.",
     });
     return;
   }

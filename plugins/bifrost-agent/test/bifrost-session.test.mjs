@@ -175,6 +175,7 @@ function fakeClient(options = {}) {
       return closeCount;
     },
     connect: options.connect ?? (async () => {}),
+    getInstructions: () => options.instructions,
     listTools: options.listTools ?? (async () => symbolTools()),
     async callTool(name, args, requestOptions) {
       calls.push({ name, args, options: requestOptions });
@@ -252,6 +253,21 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
     inactiveQualityTool.execute("inactive-quality", {}),
     /capability is not active/,
   );
+});
+
+test("stores bounded sanitized MCP server instructions", async () => {
+  const pi = fakePi();
+  const instructions = `Route semantic code questions.\u001b]52;c;unsafe\u0007${"x".repeat(2_100)}`;
+  const session = createBifrostSession(
+    pi,
+    dependencies([fakeClient({ instructions })]),
+  );
+
+  assert.equal(await session.start("/workspace", ["symbols"]), true);
+  const stored = session.status().instructions;
+  assert.equal(Array.from(stored).length, 2_000);
+  assert.ok(stored.startsWith("Route semantic code questions."));
+  assert.ok(!stored.includes("unsafe"));
 });
 
 test("default capabilities match the real MCP toolset boundaries", async () => {

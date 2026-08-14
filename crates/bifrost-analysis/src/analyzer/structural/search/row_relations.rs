@@ -185,7 +185,7 @@ pub(super) fn scope_of_position(
 /// reports a diagnostic: "no binding of this name is in effect here" is a
 /// complete answer (the name resolves to something other than a lexical
 /// binding), while "this file's intervals are not stateable" is not.
-pub(super) fn reaching_binding_expansions(
+pub(super) fn binding_of_expansions(
     analyzer: &dyn IAnalyzer,
     environment_cache: &mut EnvironmentTraversalCache,
     row: &OccurrenceRow,
@@ -199,13 +199,13 @@ pub(super) fn reaching_binding_expansions(
         environment::BINDING_QUERY_AXES,
         diagnostics,
     );
-    let outcome = super::super::lexical_environment::reaching_binding(
+    let outcome = super::super::lexical_environment::binding_of(
         &result,
         row.effective_spelling(),
         row.range.start_byte,
         Some(row.namespace),
     );
-    // The occurrence's identity travels with the answer: a reaching binding is
+    // The occurrence's identity travels with the answer: a binding-of answer is
     // an answer *about one occurrence*, and a consumer that captured that token
     // joins on this rather than guessing which returned binding is theirs.
     let reached_from = row.ast_id();
@@ -219,16 +219,16 @@ pub(super) fn reaching_binding_expansions(
         }))
     };
     match outcome {
-        ReachingBindingOutcome::Reached(index) => vec![binding(index, false)],
-        ReachingBindingOutcome::Shadowed { winner, shadowed } => {
+        BindingOfOutcome::Reached(index) => vec![binding(index, false)],
+        BindingOfOutcome::Shadowed { winner, shadowed } => {
             let mut expansions = vec![binding(winner, false)];
             if include_shadowed {
                 expansions.extend(shadowed.into_iter().map(|index| binding(index, true)));
             }
             expansions
         }
-        ReachingBindingOutcome::NoBinding => Vec::new(),
-        ReachingBindingOutcome::Incomplete(_) => Vec::new(),
+        BindingOfOutcome::NoBinding => Vec::new(),
+        BindingOfOutcome::Incomplete(_) => Vec::new(),
     }
 }
 
@@ -441,6 +441,207 @@ pub(super) fn inverse_edge_expansions(
     let language = crate::analyzer::common::language_for_file(declaration.unit.source());
     edge_cache.report_completeness(&declaration.unit.fq_name(), language, &result, diagnostics);
     edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
+}
+
+/// The state events of one seed procedure.
+///
+/// The file's whole derivation is computed (and memoised) once; this narrows it
+/// to the seed procedure and applies the author's filter. The derivation's own
+/// completeness is reported *before* the filter runs, so a filter that drops
+/// every row still leaves the reason the answer is partial on the response.
+pub(super) fn state_event_expansions(
+    workspace: &WorkspaceAnalyzer,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    procedure: &SemanticProcedureValue,
+    filter: &StateEventFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let Some((file_state, procedure_index, procedure_id, file)) = seed_derivation(
+        workspace,
+        flow_state_cache,
+        procedure,
+        cancellation,
+        diagnostics,
+    ) else {
+        return Vec::new();
+    };
+    let derivation = &file_state.procedures[procedure_index];
+    let mut expansions = Vec::new();
+    for event in 0..derivation.events.len() {
+        if !flow_state::state_event_filter_matches(filter, derivation.event(event)) {
+            continue;
+        }
+        expansions.push(pipeline_expansion(PipelineValue::StateEvent(Box::new(
+            StateEventValue {
+                file_state: Arc::clone(&file_state),
+                procedure_index,
+                event,
+                file: file.clone(),
+                procedure_id: Arc::clone(&procedure_id),
+            },
+        ))));
+    }
+    expansions
+}
+
+/// The flow relations of one seed procedure.
+pub(super) fn flow_relation_expansions(
+    workspace: &WorkspaceAnalyzer,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    procedure: &SemanticProcedureValue,
+    filter: &FlowRelationFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let Some((file_state, procedure_index, procedure_id, file)) = seed_derivation(
+        workspace,
+        flow_state_cache,
+        procedure,
+        cancellation,
+        diagnostics,
+    ) else {
+        return Vec::new();
+    };
+    relation_expansions(
+        &file_state,
+        procedure_index,
+        &procedure_id,
+        &file,
+        filter,
+        None,
+    )
+}
+
+/// The flow relations incident to one state event: seeded from an event, an
+/// author is asking what serves (or is served by) exactly that event, so both
+/// ends are matched rather than the read end alone.
+pub(super) fn flow_relations_of_event(
+    value: &StateEventValue,
+    filter: &FlowRelationFilter,
+) -> Vec<PipelineExpansion> {
+    relation_expansions(
+        &value.file_state,
+        value.procedure_index,
+        &value.procedure_id,
+        &value.file,
+        filter,
+        Some(value.event),
+    )
+}
+
+fn relation_expansions(
+    file_state: &Arc<super::super::flow_state::FileFlowState>,
+    procedure_index: usize,
+    procedure_id: &Arc<str>,
+    file: &ProjectFile,
+    filter: &FlowRelationFilter,
+    incident_to: Option<usize>,
+) -> Vec<PipelineExpansion> {
+    let derivation = &file_state.procedures[procedure_index];
+    let mut expansions = Vec::new();
+    for relation in 0..derivation.relations.len() {
+        let row = &derivation.relations[relation];
+        if let Some(event) = incident_to
+            && row.source_event != event
+            && row.target_event != event
+        {
+            continue;
+        }
+        if !flow_state::flow_relation_filter_matches(filter, row) {
+            continue;
+        }
+        expansions.push(pipeline_expansion(PipelineValue::FlowRelation(Box::new(
+            FlowRelationValue {
+                file_state: Arc::clone(file_state),
+                procedure_index,
+                relation,
+                file: file.clone(),
+                procedure_id: Arc::clone(procedure_id),
+            },
+        ))));
+    }
+    expansions
+}
+
+/// Derive one seed procedure's file, locate the seed inside it, and report the
+/// derivation's completeness. `None` when the file's derivation produced no
+/// procedures at all -- which the reported diagnostics already explain.
+fn seed_derivation(
+    workspace: &WorkspaceAnalyzer,
+    flow_state_cache: &mut FlowStateTraversalCache,
+    procedure: &SemanticProcedureValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Option<(
+    Arc<super::super::flow_state::FileFlowState>,
+    usize,
+    Arc<str>,
+    ProjectFile,
+)> {
+    let file = procedure.file().clone();
+    let language = crate::analyzer::common::language_for_file(&file);
+    let file_state = flow_state_cache.for_file(workspace, &file, cancellation);
+    flow_state_cache.report_completeness(
+        &rel_path_string(&file),
+        language,
+        &file_state.completeness,
+        file_state.generation,
+        diagnostics,
+    );
+    let wanted = procedure.handle.id();
+    let procedure_index = file_state
+        .procedures
+        .iter()
+        .position(|derivation| derivation.procedure == wanted)?;
+    flow_state_cache.report_completeness(
+        &rel_path_string(&file),
+        language,
+        &file_state.procedures[procedure_index].completeness,
+        file_state.procedures[procedure_index].generation,
+        diagnostics,
+    );
+    let procedure_id: Arc<str> = Arc::from(procedure.wire_id());
+    Some((file_state, procedure_index, procedure_id, file))
+}
+
+/// The bounded rewrite paths one file engages.
+///
+/// The file's whole derivation is computed (and memoised) once; this applies
+/// the author's filter. The derivation's completeness is reported *before* the
+/// filter runs, so a filter that drops every row still leaves the reason the
+/// answer is partial on the response.
+pub(super) fn rewrite_path_expansions(
+    analyzer: &dyn IAnalyzer,
+    rewrite_path_cache: &mut RewritePathTraversalCache,
+    file: &ProjectFile,
+    filter: &RewritePathFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let file_paths = rewrite_path_cache.for_file(analyzer, file, cancellation);
+    rewrite_path_cache.report_completeness(
+        &rel_path_string(file),
+        language,
+        &file_paths.completeness,
+        file_paths.generation,
+        diagnostics,
+    );
+    let mut expansions = Vec::new();
+    for index in 0..file_paths.paths.len() {
+        if !rewrite_paths::rewrite_path_filter_matches(filter, &file_paths.paths[index]) {
+            continue;
+        }
+        expansions.push(pipeline_expansion(PipelineValue::RewritePath(Box::new(
+            RewritePathValue {
+                file_paths: Arc::clone(&file_paths),
+                index,
+                file: file.clone(),
+            },
+        ))));
+    }
+    expansions
 }
 
 /// The canonical forward edges of one reference occurrence: the file's forward

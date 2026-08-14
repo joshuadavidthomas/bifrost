@@ -91,6 +91,7 @@ mod edges;
 mod environment;
 mod execution;
 pub(crate) mod expansions;
+mod flow_state;
 mod imports;
 mod materialization;
 mod member_family;
@@ -108,13 +109,18 @@ use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
 };
+use flow_state::{
+    FlowRelationKey, FlowRelationValue, FlowStateTraversalCache, StateEventKey, StateEventValue,
+};
 use member_family::{MemberFamilyEdgeValue, MemberFamilyValue};
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 use paths::{
     PATH_QUERY_AXES, PathKey, PathTraversalCache, PathValue, RESOLVED_PATH_QUERY_AXES, SegmentKey,
     SegmentValue, public_path, public_segment,
 };
+use rewrite_paths::{RewritePathKey, RewritePathTraversalCache, RewritePathValue};
 mod results;
+mod rewrite_paths;
 mod row_relations;
 mod seeds;
 mod semantic;
@@ -161,13 +167,14 @@ use expansions::{
 // Re-export the exact previous public/pub(crate) surface of `search.rs` so
 // that `crate::analyzer::structural::search::X` keeps resolving for every
 // existing consumer path unchanged.
-use super::lexical_environment::ReachingBindingOutcome;
+use super::lexical_environment::BindingOfOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::{OccurrenceClass, OccurrenceRole};
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
 use brokk_bifrost_rql::{
-    BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
+    BindingFilter, CandidateFilter, EdgeFilter, FlowRelationFilter, OccurrenceFilter,
+    OccurrenceSeed, RewritePathFilter, ScopeFilter, StateEventFilter,
 };
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
@@ -283,6 +290,8 @@ pub use results::DetailedCodeQueryProvenanceRefEvidence;
 pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
 pub(crate) use results::DetailedCodeQueryResult;
 pub(crate) use results::UnionExecutionStrategy;
+pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
+pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -579,6 +588,9 @@ enum PipelineValue {
     Export(materialization::ExportValue),
     DeclarationState(materialization::DeclarationStateValue),
     ReferenceEdge(Box<EdgeValue>),
+    StateEvent(Box<StateEventValue>),
+    FlowRelation(Box<FlowRelationValue>),
+    RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
 }
@@ -659,6 +671,9 @@ enum PipelineKey {
     Export(materialization::ExportKey),
     DeclarationState(materialization::DeclarationStateKey),
     ReferenceEdge(EdgeKey),
+    StateEvent(StateEventKey),
+    FlowRelation(FlowRelationKey),
+    RewritePath(RewritePathKey),
     QualifiedPath(PathKey),
     PathSegment(SegmentKey),
 }
@@ -729,6 +744,9 @@ impl PipelineValue {
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
             Self::CandidateHop(value) => PipelineKey::CandidateHop(value.key()),
             Self::ReferenceEdge(value) => PipelineKey::ReferenceEdge(value.key()),
+            Self::StateEvent(value) => PipelineKey::StateEvent(value.key()),
+            Self::FlowRelation(value) => PipelineKey::FlowRelation(value.key()),
+            Self::RewritePath(value) => PipelineKey::RewritePath(value.key()),
             Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
             Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
         }
@@ -967,6 +985,9 @@ enum PipelineTraceValue {
     Export(materialization::ExportValue),
     DeclarationState(materialization::DeclarationStateValue),
     ReferenceEdge(Box<EdgeValue>),
+    StateEvent(Box<StateEventValue>),
+    FlowRelation(Box<FlowRelationValue>),
+    RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
 }
@@ -1696,6 +1717,8 @@ struct QueryExecutionState<'a> {
     environment_cache: EnvironmentTraversalCache,
     materialization_cache: materialization::MaterializationTraversalCache,
     edge_cache: EdgeTraversalCache,
+    flow_state_cache: FlowStateTraversalCache,
+    rewrite_path_cache: RewritePathTraversalCache,
     path_cache: PathTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
@@ -2446,6 +2469,8 @@ fn execute_internal_with_analysis_strategy(
         environment_cache: EnvironmentTraversalCache::default(),
         materialization_cache: materialization::MaterializationTraversalCache::default(),
         edge_cache: EdgeTraversalCache::default(),
+        flow_state_cache: FlowStateTraversalCache::default(),
+        rewrite_path_cache: RewritePathTraversalCache::default(),
         path_cache: PathTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
@@ -3213,6 +3238,69 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::StateEvent(value) => {
+            let row = value.row();
+            let byte_span = row.site.range.start_byte..row.site.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::StateEvent,
+                key: DetailedCodeQueryKey::StateEvent {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    procedure_id: value.procedure_id.to_string(),
+                    event_class: row.event_class.label().to_string(),
+                },
+                file: row.site.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::RewritePath(value) => {
+            let row = value.row();
+            let byte_span = row.origin.range.start_byte..row.origin.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::RewritePath,
+                key: DetailedCodeQueryKey::RewritePath {
+                    id: value.id(),
+                    domain: row.domain.label().to_string(),
+                    origin_specifier: row.origin.specifier.clone(),
+                    outcome: row.outcome.kind().label().to_string(),
+                },
+                file: row.origin.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::FlowRelation(value) => {
+            let target = value.target();
+            let byte_span = target.site.range.start_byte..target.site.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::FlowRelation,
+                key: DetailedCodeQueryKey::FlowRelation {
+                    id: value.id(),
+                    procedure_id: value.procedure_id.to_string(),
+                    relation: value.row().relation.label().to_string(),
+                    certainty: value.row().certainty.label().to_string(),
+                },
+                file: target.site.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ReferenceEdge(value) => {
             let row = &value.row;
             let byte_span = row.site.range.start_byte..row.site.range.end_byte;
@@ -3461,6 +3549,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::Export(value) => Some(value.file()),
         PipelineValue::DeclarationState(value) => Some(value.file()),
         PipelineValue::ReferenceEdge(value) => Some(value.file()),
+        PipelineValue::StateEvent(value) => Some(value.file()),
+        PipelineValue::FlowRelation(value) => Some(value.file()),
+        PipelineValue::RewritePath(value) => Some(value.file()),
         PipelineValue::ReceiverOutcome(value) => Some(&value.report.site.file),
         PipelineValue::ReceiverEvidence(value) => Some(&value.receiver.report.site.file),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
@@ -3622,6 +3713,16 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
             files.insert(value.file().clone());
         }
         PipelineValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
+        PipelineValue::StateEvent(value) => {
+            files.insert(value.row().site.file.clone());
+        }
+        PipelineValue::FlowRelation(value) => {
+            files.insert(value.source().site.file.clone());
+            files.insert(value.target().site.file.clone());
+        }
+        PipelineValue::RewritePath(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::QualifiedPath(value) => {
             files.insert(value.file().clone());
         }
@@ -3711,6 +3812,16 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
+        PipelineTraceValue::StateEvent(value) => {
+            files.insert(value.row().site.file.clone());
+        }
+        PipelineTraceValue::FlowRelation(value) => {
+            files.insert(value.source().site.file.clone());
+            files.insert(value.target().site.file.clone());
+        }
+        PipelineTraceValue::RewritePath(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineTraceValue::QualifiedPath(value) => {
             files.insert(value.file().clone());
         }
@@ -4135,6 +4246,51 @@ fn detailed_trace_provenance_ref(
                 },
                 &row.file,
                 row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::StateEvent(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::StateEvent,
+                DetailedCodeQueryKey::StateEvent {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    procedure_id: value.procedure_id.to_string(),
+                    event_class: row.event_class.label().to_string(),
+                },
+                &row.site.file,
+                row.site.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::RewritePath(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::RewritePath,
+                DetailedCodeQueryKey::RewritePath {
+                    id: value.id(),
+                    domain: row.domain.label().to_string(),
+                    origin_specifier: row.origin.specifier.clone(),
+                    outcome: row.outcome.kind().label().to_string(),
+                },
+                &row.origin.file,
+                row.origin.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::FlowRelation(value) => {
+            let target = value.target();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::FlowRelation,
+                DetailedCodeQueryKey::FlowRelation {
+                    id: value.id(),
+                    procedure_id: value.procedure_id.to_string(),
+                    relation: value.row().relation.label().to_string(),
+                    certainty: value.row().certainty.label().to_string(),
+                },
+                &target.site.file,
+                target.site.range,
                 cache,
             )
         }
@@ -4672,6 +4828,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::DeclarationState(value) => {
             Some(PipelineTraceValue::DeclarationState(value.clone()))
         }
+        PipelineValue::StateEvent(value) => Some(PipelineTraceValue::StateEvent(value.clone())),
+        PipelineValue::FlowRelation(value) => Some(PipelineTraceValue::FlowRelation(value.clone())),
+        PipelineValue::RewritePath(value) => Some(PipelineTraceValue::RewritePath(value.clone())),
         PipelineValue::ReferenceEdge(value) => {
             Some(PipelineTraceValue::ReferenceEdge(value.clone()))
         }

@@ -978,7 +978,11 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                 }
             }
         }
-        sample_diagnostics.truncate(6);
+        let sample_cap = std::env::var("BIFROST_OWASP_SAMPLE_DIAGS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(6);
+        sample_diagnostics.truncate(sample_cap);
         category_runs.push(CategoryRunStatus {
             category: category.label().to_owned(),
             completion: completion_label,
@@ -1040,6 +1044,30 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                 .unwrap_or(CaseCompletion::NotAnalyzed),
         })
         .collect();
+
+    // Optional per-case dump for diagnosing corpus-scale abstention: one line
+    // per case in benchmark order, so a `not_analyzed` cluster at the tail of the
+    // run points at an accumulation budget while a scattered one points at a
+    // per-case cause. Gated on an env var so it never affects normal runs.
+    if let Ok(path) = std::env::var("BIFROST_OWASP_PER_CASE") {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (index, observation) in observations.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "{index}\t{}\t{}\treal={}\tflagged={}\t{:?}",
+                observation.name,
+                observation.category.label(),
+                observation.is_real,
+                observation.flagged,
+                observation.completion,
+            );
+        }
+        if let Err(error) = std::fs::write(&path, out) {
+            eprintln!("[per-case] failed to write {path}: {error}");
+        }
+    }
+
     let scoreboard = score(&observations);
 
     Ok(RunResult {

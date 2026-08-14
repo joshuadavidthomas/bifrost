@@ -30,9 +30,10 @@ use crate::graph_support::RustFactSource;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::cache::{
-    build_weighted_cache, weight_alias_routes, weight_forward_import_edges, weight_include_routes,
-    weight_macro_scope_edges, weight_macro_visible_ranges, weight_module_bindings,
-    weight_module_domains, weight_module_probe, weight_origin_routes, weight_project_file_list,
+    build_weighted_cache, weight_alias_routes, weight_binding_edges, weight_forward_import_edges,
+    weight_include_routes, weight_macro_scope_edges, weight_macro_visible_ranges,
+    weight_module_bindings, weight_module_domains, weight_module_probe, weight_origin_routes,
+    weight_project_file_list,
 };
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use crate::declarations::rust_package_name;
@@ -87,6 +88,7 @@ pub struct RustWalkCaches {
     module_domains: Cache<ModuleKey, Option<Arc<Vec<Domain>>>>,
     alias_routes: Cache<ModuleKey, Arc<Vec<RustModuleAliasRoute>>>,
     forward_import_edges: Cache<ProjectFile, Arc<Vec<RustImportEdge>>>,
+    binding_edges: Cache<RustSymbolIdentity, Arc<Vec<RustImportEdge>>>,
     module_bindings: Cache<RustModuleBindingKey, Arc<Vec<RustModuleBinding>>>,
     origin_routes: Cache<ProjectFile, Arc<HashMap<String, Vec<RustOriginRoute>>>>,
     macro_scope_edges: Cache<ProjectFile, Arc<Vec<RustMacroScopeEdge>>>,
@@ -106,6 +108,7 @@ impl RustWalkCaches {
             module_domains: build_weighted_cache(share, weight_module_domains),
             alias_routes: build_weighted_cache(share, weight_alias_routes),
             forward_import_edges: build_weighted_cache(share, weight_forward_import_edges),
+            binding_edges: build_weighted_cache(share, weight_binding_edges),
             module_bindings: build_weighted_cache(share, weight_module_bindings),
             origin_routes: build_weighted_cache(share, weight_origin_routes),
             macro_scope_edges: build_weighted_cache(share, weight_macro_scope_edges),
@@ -1294,12 +1297,24 @@ impl<'a> RustUsageWalks<'a> {
     /// The import edges that bind `identity`, computed from candidate files
     /// rather than from a workspace-wide reverse map.
     pub fn edges_binding_identity(&self, identity: &RustSymbolIdentity) -> Vec<RustImportEdge> {
+        let _scope = brokk_bifrost_core::profiling::scope("rust_usage_walks::binding_edges");
+        if let Some(cached) = self.caches.binding_edges.get(identity) {
+            return cached.as_ref().clone();
+        }
         let mut edges = Vec::new();
         // One candidate is one full forward-edge computation, and a common
         // identifier offers thousands of them on a large workspace: this is
         // the longest single region a usage query spends in the walk layer,
         // so it is the one that most has to stop when the budget expires.
-        for candidate in self.importer_candidates_for(identity) {
+        let candidates = self.importer_candidates_for(identity);
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "rust binding identity={} candidates={}",
+                identity.name,
+                candidates.len()
+            )
+        });
+        for candidate in candidates {
             if self.cancelled() {
                 break;
             }
@@ -1309,6 +1324,11 @@ impl<'a> RustUsageWalks<'a> {
                     .filter(|edge| edge_matches_single_seed(edge, identity))
                     .cloned(),
             );
+        }
+        if !self.cancelled() {
+            self.caches
+                .binding_edges
+                .insert(identity.clone(), Arc::new(edges.clone()));
         }
         edges
     }
@@ -1535,6 +1555,7 @@ impl<'a> RustUsageWalks<'a> {
                         importer_module: edge.importer_module.clone(),
                         extent: edge.extent.clone(),
                         path,
+                        is_glob_import: matches!(edge.kind, RustImportEdgeKind::Glob),
                         namespace: target.namespace,
                         origin: binding.origin,
                         domain: effective,

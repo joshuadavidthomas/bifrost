@@ -16,6 +16,9 @@
 //!   rebuilding them wholesale.
 
 use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq, node_text};
+use crate::graph::resolver::{
+    cpp_type_name_components, declarator_name_node, qualified_name_has_concrete_scope_separators,
+};
 use crate::graph_support::CppSource;
 use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
@@ -757,8 +760,9 @@ pub fn cpp_reconcile_group(
 
 /// Reconcile one out-of-line member definition's provisional identity against
 /// the class table visible to its file. Returns `None` for anything that is
-/// not a re-keyable out-of-line member (free functions with no owner, single
-/// segment qualifiers) or that the class table does not confirm.
+/// not a re-keyable out-of-line member or that the class table does not
+/// confirm. A one-segment class qualifier is valid when a structured using
+/// namespace and the visible class table confirm its package.
 fn cpp_reconcile_definition_identity(
     cpp: &dyn CppSource,
     unit: &CodeUnit,
@@ -774,7 +778,7 @@ fn cpp_reconcile_definition_identity(
     // table, so extraction need not have decided where the namespace ends and
     // the class chain begins.
     let interner = segment_interner();
-    let mut owner_segments: Vec<&str> = Vec::new();
+    let mut provisional_owner_segments: Vec<&str> = Vec::new();
     let mut member: Option<&str> = None;
     for &segment in unit.fq().segments() {
         let (text, kind) = interner.resolve(segment);
@@ -787,7 +791,7 @@ fn cpp_reconcile_definition_identity(
                     return None;
                 }
                 if !text.is_empty() {
-                    owner_segments.push(text);
+                    provisional_owner_segments.push(text);
                 }
             }
             SegmentKind::Member => member = Some(text),
@@ -795,7 +799,17 @@ fn cpp_reconcile_definition_identity(
         }
     }
     let member = member?;
-    if owner_segments.len() < 2 {
+    // Existing multi-segment reconciliation uses the provisional structured
+    // FqName because it preserves template-owner normalization. Read the
+    // declarator only for the previously unsupported one-segment shape, where
+    // extraction can prepend a guessed using namespace.
+    let structured_owner_segments =
+        cpp_structured_out_of_line_owner_segments(cpp, unit).filter(|segments| segments.len() == 1);
+    let owner_segments = structured_owner_segments.as_ref().map_or_else(
+        || provisional_owner_segments,
+        |segments| segments.iter().map(String::as_str).collect(),
+    );
+    if owner_segments.is_empty() {
         return None;
     }
 
@@ -833,6 +847,43 @@ fn cpp_reconcile_definition_identity(
         &namespace_candidates,
         &class_table,
     )
+}
+
+/// Read the owner qualifier from the definition declarator itself.
+///
+/// Per-file extraction can prepend one guessed using namespace to a bare
+/// `Class::member` definition. That provisional package is not source syntax.
+/// Reconciliation must compare the real qualifier against every structured
+/// using target and let the visible class table select the namespace.
+fn cpp_structured_out_of_line_owner_segments(
+    cpp: &dyn CppSource,
+    unit: &CodeUnit,
+) -> Option<Vec<String>> {
+    let prepared = cpp.prepared_syntax(unit.source())?;
+    let root = prepared.tree().root_node();
+    for range in cpp.ranges(unit) {
+        let mut current = cpp_declaration_node_for_range(root, &range)?;
+        let function = loop {
+            if current.kind() == "function_definition" {
+                break current;
+            }
+            current = current.parent()?;
+        };
+        if function.child_by_field_name("body").is_none() {
+            continue;
+        }
+        let declarator = function.child_by_field_name("declarator")?;
+        let name = declarator_name_node(declarator)?;
+        if !qualified_name_has_concrete_scope_separators(name) {
+            continue;
+        }
+        let mut components = cpp_type_name_components(name, prepared.source())?;
+        components.pop()?;
+        if !components.is_empty() {
+            return Some(components);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

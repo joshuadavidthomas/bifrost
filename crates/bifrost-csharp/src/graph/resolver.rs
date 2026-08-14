@@ -823,13 +823,13 @@ fn using_aliases_for_file_in_session(
         .collect()
 }
 
-fn using_namespaces_for_file_in_session(
+fn file_using_namespaces_for_file_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     session: &ResolutionSession,
 ) -> Vec<String> {
     session.query_limited_rows(|limit| {
-        csharp.using_namespaces_of_limited(file, limit, &mut || session.observe_cancellation())
+        graph_support::file_using_namespaces_limited(csharp, file, limit)
     })
 }
 
@@ -850,8 +850,15 @@ fn visible_type_candidates_in_session(
             .into_iter()
             .next()
     };
-    let mut using_namespaces = || {
-        let namespaces = using_namespaces_for_file_in_session(csharp, file, session);
+    let mut file_using_namespaces = || {
+        let namespaces = file_using_namespaces_for_file_in_session(csharp, file, session);
+        session.observe_cancellation().then_some(namespaces)
+    };
+    let mut global_using_namespaces = || {
+        let mut namespaces: Vec<_> = session.query_limited_rows(|limit| {
+            csharp.global_using_namespaces_limited(limit, &mut || session.observe_cancellation())
+        });
+        namespaces.sort();
         session.observe_cancellation().then_some(namespaces)
     };
     // No budget of its own: a namespace this cannot decide answers `true`, which
@@ -870,7 +877,8 @@ fn visible_type_candidates_in_session(
         resolve_aliases,
         &mut using_aliases,
         &mut namespace_of_file,
-        &mut using_namespaces,
+        &mut file_using_namespaces,
+        &mut global_using_namespaces,
         &mut namespace_exists,
         &mut type_candidates_by_fqn,
     )

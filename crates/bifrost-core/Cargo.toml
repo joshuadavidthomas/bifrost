@@ -41,8 +41,9 @@ walkdir = "2.5.0"
 
 [features]
 default = []
+# CI-only mode that exposes accidental dependence on hash iteration order.
+randomized-hash = []
 # Mirrors `brokk-bifrost-analysis`'s feature of the same name: the analysis
 # crate's `test-support` turns this on so the cancellation hooks stay a single
 # implementation rather than a copy on each side of the seam.
 test-support = []
-

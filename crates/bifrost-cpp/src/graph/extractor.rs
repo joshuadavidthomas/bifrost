@@ -14,7 +14,7 @@ use crate::graph::hits::{
     push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::graph::resolver::*;
-use crate::graph::syntax::explicit_qualified_callable_value;
+use crate::graph::syntax::qualified_callable_value;
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
@@ -345,9 +345,45 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
         "for_range_loop" => seed_range_binding(node, ctx),
+        "expression_statement" => seed_function_macro_local_binding(node, ctx),
         "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
     }
+}
+
+fn seed_function_macro_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(binding) = ctx
+        .visibility
+        .function_macro_local_binding(ctx.file, node, ctx.source)
+    else {
+        return;
+    };
+    if ctx.spec.kind == TargetKind::Type {
+        ctx.bindings.declare_shadow(binding.name);
+        return;
+    }
+    let normalized = normalize_cpp_type_name(&binding.type_name);
+    let unit = binding
+        .type_node
+        .and_then(|type_node| {
+            ctx.visibility
+                .resolve_type_node_result(ctx.file, type_node, ctx.source)
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            ctx.visibility
+                .canonical_type_for_reference(ctx.file, &normalized)
+        })
+        .or_else(|| ctx.visibility.resolve_type(ctx.file, &normalized));
+    ctx.bindings.seed_symbol(
+        binding.name,
+        CppScanBinding::from_type_name(
+            normalized,
+            unit,
+            binding.pointer_depth + cpp_type_text_pointer_depth(&binding.type_name),
+        ),
+    );
 }
 
 fn indexed_recovered_class_field_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -657,6 +693,36 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node_text(node, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    if is_ordinary_macro_reference_node(node) {
+        match ctx.visibility.resolve_ordinary_macro_reference(
+            &ctx.analyzer,
+            ctx.file,
+            node,
+            ctx.source,
+        ) {
+            OrdinaryMacroReferenceResolution::Resolved(unit)
+                if ctx.target_group.contains(&unit) =>
+            {
+                *ctx.raw_match_count += 1;
+                push_hit(node, ctx);
+            }
+            OrdinaryMacroReferenceResolution::Ambiguous
+                if ctx
+                    .visibility
+                    .macro_target_is_visible_candidate(ctx.file, &ctx.spec.target) =>
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(node, ctx);
+            }
+            OrdinaryMacroReferenceResolution::Resolved(_)
+            | OrdinaryMacroReferenceResolution::Ambiguous
+            | OrdinaryMacroReferenceResolution::Missing => {}
+        }
+        return;
+    }
     if !matches!(
         node.kind(),
         "identifier"
@@ -664,14 +730,12 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "type_identifier"
             | "namespace_identifier"
             | "preproc_arg"
-    ) || node_text(node, ctx.source) != ctx.spec.member_name
-        || node.parent().is_some_and(|parent| {
-            matches!(parent.kind(), "preproc_def" | "preproc_function_def")
-                && parent
-                    .child_by_field_name("name")
-                    .is_some_and(|name| same_node(name, node))
-        })
-    {
+    ) || node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "preproc_def" | "preproc_function_def")
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| same_node(name, node))
+    }) {
         return;
     }
     if ctx.visibility.macro_binding_matches_target_at(
@@ -920,6 +984,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !recovered_type && is_nested_type_node(node) {
+        if let Some(hit) = target_guided_nested_type_terminal_hit(node, ctx) {
+            *ctx.raw_match_count += 1;
+            push_type_hit(hit, ctx);
+            return;
+        }
         // A concrete template specialization can be absent from the coarse
         // per-file component-name index: that index contains the primary name
         // while this recovered child may expose only the malformed template
@@ -1329,6 +1398,78 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(hit_node, ctx);
         }
     }
+}
+
+/// Resolve the terminal of `Owner::Nested` when the owner name reaches a base
+/// class through C++ inherited-type lookup. The complete type lookup cannot
+/// express that injected owner as its first qualified component, but the owner
+/// prefix can. Keep the complete reference range after the owner proves the
+/// target's direct nested declaration.
+fn target_guided_nested_type_terminal_hit<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let qualified = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(node)
+    })?;
+    let owner = qualified_owner_components(qualified, ctx.source)?;
+    let mut complete = qualified;
+    while let Some(parent) = complete.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        )
+    }) {
+        complete = parent;
+    }
+
+    if let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = resolve_type_node_lexically_for_target(
+        complete,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &ctx.spec.target,
+        Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(complete).as_deref(),
+    ) && type_resolution_matches_target(complete, &unit, &candidates, ctx)
+    {
+        return None;
+    }
+
+    let enclosing_owner = structured_enclosing_owner(node, ctx)?;
+    let lexical_scope = canonical_cpp_scope_components(&enclosing_owner);
+    let owner_resolution = ctx.visibility.resolve_type_components_lexically(
+        &ctx.analyzer,
+        ctx.file,
+        &owner.names,
+        owner.global,
+        &lexical_scope,
+    );
+    let owner_unit = match owner_resolution {
+        LexicalTypeResolution::Resolved { unit, .. } => unit,
+        LexicalTypeResolution::Missing if !owner.global && owner.names.len() == 1 => {
+            ctx.visibility.inherited_injected_class_owner(
+                &ctx.analyzer,
+                ctx.file,
+                &enclosing_owner,
+                owner.names.first()?,
+            )?
+        }
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => return None,
+    };
+    let name = node_text(node, ctx.source);
+    ctx.visibility
+        .visible_members_for_owner_name(ctx.file, &owner_unit, name)
+        .into_iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+        .then_some(complete)
 }
 
 fn push_guarded_owner_hit(
@@ -1929,6 +2070,12 @@ pub enum BareCallTargetResolution {
     Missing,
 }
 
+pub enum BlockUsingCallTargetResolution {
+    Target(BareCallTargetResolution),
+    Unindexed(Vec<String>),
+    Ambiguous,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_qualified_call_target(
     call: Node<'_>,
@@ -2151,6 +2298,135 @@ fn resolve_direct_type_candidates(
     }
 }
 
+/// Resolve a direct using-declaration in the nearest concrete block before
+/// class-member lookup. A block declaration such as `using std::swap;` adds
+/// that name to the block scope and hides a same-named member. If the imported
+/// target is not indexed, retain its structured path as boundary evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_block_using_call_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> Option<BlockUsingCallTargetResolution> {
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return None;
+    }
+    let name = node_text(function_terminal_node(function), source);
+    if name.is_empty() {
+        return None;
+    }
+    let bindings = effective_using_bindings_for_name(
+        visibility,
+        ordinary_type_imports,
+        file,
+        function,
+        source,
+        name,
+    );
+    let block_bindings = bindings
+        .iter()
+        .filter(|binding| {
+            binding.namespace_scope.is_none()
+                && binding.block_scope
+                && matches!(binding.target, EffectiveUsingTarget::Ordinary { .. })
+        })
+        .collect::<Vec<_>>();
+    if block_bindings.is_empty() {
+        return None;
+    }
+    let lexical_scope =
+        match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => {
+                return Some(BlockUsingCallTargetResolution::Ambiguous);
+            }
+            LexicalScopeResolution::Missing => return None,
+        };
+    let reference_guards = preprocessor_guard_environment(function, source);
+    let active = block_bindings
+        .into_iter()
+        .filter(|binding| {
+            effective_using_binding_active(
+                binding,
+                function,
+                &lexical_scope,
+                reference_guards.as_ref(),
+                visibility,
+                file,
+            )
+        })
+        .collect::<Vec<_>>();
+    let depth = active.iter().map(|binding| binding.scope_depth).max()?;
+    let at_tier = active
+        .into_iter()
+        .filter(|binding| binding.scope_depth == depth)
+        .collect::<Vec<_>>();
+    let callable_candidates = at_tier
+        .iter()
+        .flat_map(|binding| {
+            binding_free_function_candidates(
+                binding,
+                &[],
+                analyzer,
+                visibility,
+                file,
+                name,
+                call.start_byte(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !callable_candidates.is_empty() {
+        return Some(BlockUsingCallTargetResolution::Target(
+            resolve_callable_candidates(
+                callable_candidates,
+                visibility.call_arity_evidence(file, call, source).exact(),
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            ),
+        ));
+    }
+    let type_candidates = at_tier
+        .iter()
+        .flat_map(|binding| {
+            binding_type_candidates(
+                binding,
+                &[],
+                visibility,
+                file,
+                name,
+                None,
+                call.start_byte(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !type_candidates.is_empty() {
+        return Some(BlockUsingCallTargetResolution::Target(
+            resolve_direct_type_candidates(type_candidates, analyzer, visibility, file),
+        ));
+    }
+
+    let mut unindexed = Vec::new();
+    for binding in at_tier {
+        let Some(components) = binding.resolved_target_components.as_ref() else {
+            continue;
+        };
+        if !unindexed.contains(components) {
+            unindexed.push(components.clone());
+        }
+    }
+    match unindexed.as_slice() {
+        [target] => Some(BlockUsingCallTargetResolution::Unindexed(target.clone())),
+        [] => None,
+        _ => Some(BlockUsingCallTargetResolution::Ambiguous),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_bare_call_target(
     call: Node<'_>,
@@ -2203,10 +2479,18 @@ pub fn resolve_bare_call_target(
         visibility,
         ordinary_type_imports,
         file,
-        root_node(function),
+        function,
         source,
         name,
     );
+    // Guard ancestry climbs the whole ancestor chain and each `Node::parent`
+    // step re-descends from the root (#1927): with no bindings both filters
+    // below select nothing, so the environment is never consulted.
+    let function_guards = if bindings.is_empty() {
+        None
+    } else {
+        preprocessor_guard_environment(function, source)
+    };
     let active_bindings = bindings
         .iter()
         .filter(|binding| {
@@ -2214,13 +2498,12 @@ pub fn resolve_bare_call_target(
                 binding,
                 function,
                 &lexical_scope,
-                source,
+                function_guards.as_ref(),
                 visibility,
                 file,
             )
         })
         .collect::<Vec<_>>();
-    let function_guards = preprocessor_guard_environment(function, source);
     let transitive_bindings = bindings
         .iter()
         .filter(|binding| {
@@ -3236,45 +3519,15 @@ fn inherited_injected_class_qualifier_scope<'tree>(
         return None;
     }
     let enclosing_owner = structured_enclosing_owner(node, ctx)?;
-    let hierarchy = ctx.analyzer.type_hierarchy_provider()?;
-    let mut frontier = hierarchy.get_direct_ancestors(&enclosing_owner);
-    let mut visited = HashSet::default();
-    while !frontier.is_empty() {
-        let mut level_matches = Vec::new();
-        let mut next_frontier = Vec::new();
-        for raw_owner in frontier {
-            let owner = ctx.visibility.canonical_visible_full_type_unit(
-                &ctx.analyzer,
-                ctx.file,
-                &raw_owner,
-            )?;
-            if !visited.insert(owner.clone()) {
-                continue;
-            }
-            if owner.identifier() == injected_name
-                && !level_matches
-                    .iter()
-                    .any(|existing| same_logical_symbol(existing, &owner))
-            {
-                level_matches.push(owner.clone());
-            }
-            next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
-        }
-        if let Some(first) = level_matches.first() {
-            if level_matches
-                .iter()
-                .all(|candidate| same_logical_symbol(candidate, first))
-                && same_visible_symbol(first, &ctx.spec.target)
-            {
-                return qualified.nodes.first().copied();
-            }
-            // A distinct matching base at the nearest hierarchy tier makes
-            // the injected class name ambiguous and hides deeper tiers.
-            return None;
-        }
-        frontier = next_frontier;
-    }
-    None
+    let owner = ctx.visibility.inherited_injected_class_owner(
+        &ctx.analyzer,
+        ctx.file,
+        &enclosing_owner,
+        injected_name,
+    )?;
+    same_visible_symbol(&owner, &ctx.spec.target)
+        .then(|| qualified.nodes.first().copied())
+        .flatten()
 }
 
 /// Resolve each qualified type component against the inverse target while
@@ -5039,16 +5292,25 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_using_member_hit(node, ctx);
         return;
     }
-    if let Some(member) = recovered_direct_initializer_qualified_callable(node) {
-        maybe_record_qualified_method_value_hit(node, member, ctx);
-        return;
-    }
-    if let Some(value) = explicit_qualified_callable_value(node) {
-        maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
+    if has_ancestor_kind(node, "using_declaration") {
         return;
     }
     if node.kind() == "function_definition" {
         maybe_record_method_definition_hit(node, ctx);
+        return;
+    }
+    if node_inside_function_definition_declarator(node) {
+        return;
+    }
+    if is_declaration_name(node) {
+        return;
+    }
+    if let Some(member) = recovered_direct_initializer_qualified_callable(node) {
+        maybe_record_qualified_method_value_hit(node, member, ctx);
+        return;
+    }
+    if let Some(value) = qualified_callable_value(node) {
+        maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
         return;
     }
     if node.kind() != "call_expression" {
@@ -5075,7 +5337,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         }
         match explicit_receiver_target_resolution(receiver, ctx) {
-            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver) => {
+            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver, ctx.file) => {
                 push_self_receiver_hit(operator, ctx);
             }
             MethodReceiverTargetResolution::Target => push_hit(operator, ctx),
@@ -5133,7 +5395,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match call_function_target_resolution(function, ctx) {
         MethodReceiverTargetResolution::Target
-            if call_function_has_direct_self_receiver(function) =>
+            if call_function_has_direct_self_receiver(function, ctx.file) =>
         {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
@@ -5172,6 +5434,22 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         MethodReceiverTargetResolution::Missing => {}
     }
+}
+
+fn node_inside_function_definition_declarator(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            return parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    node.start_byte() >= declarator.start_byte()
+                        && node.end_byte() <= declarator.end_byte()
+                });
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn recovered_direct_initializer_qualified_callable(node: Node<'_>) -> Option<Node<'_>> {
@@ -6116,9 +6394,15 @@ fn receiver_type_units_with_budget(
                     .into_iter()
                     .collect();
             }
-            "this" => {
-                break enclosing_context(current, ctx).owner.into_iter().collect();
+            "this" if is_c_source_file(ctx.file) => {
+                let name = node_text(current, source);
+                let local = ctx.bindings.resolve_symbol(name);
+                if let Some(bindings) = local.as_precise() {
+                    break receiver_units_from_bindings(current, bindings, ctx);
+                }
+                return Vec::new();
             }
+            "this" => break enclosing_context(current, ctx).owner.into_iter().collect(),
             "qualified_identifier" | "scoped_identifier" => {
                 let reference = node_text(current, source);
                 let fields = ctx
@@ -6564,7 +6848,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
             .is_some_and(|receiver| {
-                receiver_is_self_like(receiver) && same_owner_context(receiver, ctx)
+                receiver_is_self_like(receiver, ctx.file) && same_owner_context(receiver, ctx)
                     || receiver_type_units(receiver, ctx.source, ctx)
                         .iter()
                         .any(|target| {
@@ -6578,7 +6862,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_matches_target(child, ctx)),
-        "identifier" => ctx
+        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
@@ -6599,7 +6883,7 @@ fn declaring_owner_for_explicit_receiver(
     receiver: Node<'_>,
     ctx: &ScanCtx<'_>,
 ) -> EnclosingMemberOwnerResolution {
-    if receiver_is_self_like(receiver) {
+    if receiver_is_self_like(receiver, ctx.file) {
         return EnclosingMemberOwnerResolution::Missing;
     }
     let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
@@ -6795,24 +7079,24 @@ fn visible_target_peer_matches_owner(
             })
 }
 
-fn receiver_is_self_like(node: Node<'_>) -> bool {
+fn receiver_is_self_like(node: Node<'_>, file: &ProjectFile) -> bool {
     match node.kind() {
-        "this" => true,
+        "this" => !is_c_source_file(file),
         "pointer_expression" | "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
-            .is_some_and(receiver_is_self_like),
+            .is_some_and(|inner| receiver_is_self_like(inner, file)),
         _ => false,
     }
 }
 
-fn call_function_has_direct_self_receiver(function: Node<'_>) -> bool {
+fn call_function_has_direct_self_receiver(function: Node<'_>, file: &ProjectFile) -> bool {
     match function.kind() {
         "field_expression" => function
             .child_by_field_name("argument")
             .or_else(|| function.child_by_field_name("object"))
-            .is_some_and(receiver_is_self_like),
-        _ => receiver_is_self_like(function),
+            .is_some_and(|receiver| receiver_is_self_like(receiver, file)),
+        _ => receiver_is_self_like(function, file),
     }
 }
 
@@ -6838,7 +7122,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_has_known_non_target(child, ctx)),
-        "identifier" => ctx
+        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
@@ -6886,6 +7170,7 @@ fn qualified_owner_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
 
 fn is_structurally_qualified(node: Node<'_>) -> bool {
     matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        && qualified_name_has_concrete_scope_separators(node)
 }
 
 fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwnerResolution {
@@ -6943,7 +7228,9 @@ fn qualified_callable_owner_components(
     node: Node<'_>,
     source: &str,
 ) -> Option<(Vec<String>, bool)> {
-    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier") {
+    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        || !qualified_name_has_concrete_scope_separators(node)
+    {
         return None;
     }
     let global = is_globally_qualified_cpp_name(node);
@@ -7079,29 +7366,54 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
 ) -> LexicalScopeResolution {
     #[cfg(any(test, feature = "test-support"))]
     LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(count.get() + 1));
-    let namespace = enclosing_namespace_components(node, source);
-    let mut scope = namespace.clone();
+    // One ancestor climb collects the namespace chain, the class chain, the
+    // nearest function definition and both displaced-class-shape facts.
+    // `Node::parent` re-descends from the root on every call (tree-sitter
+    // 0.24+), so the four separate climbs this replaces each cost another
+    // near-full-AST scan per reconstruction on a large flat file (#1927).
+    let mut namespaces = Vec::new();
     let mut classes = Vec::new();
     let mut function_definition = None;
+    let mut displaced_class_scope = false;
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(
-            parent.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) && let Some(name) = parent.child_by_field_name("name")
-        {
-            let mut components = Vec::new();
-            if append_cpp_name_components(name, source, &mut components).is_some() {
-                classes.push(components);
+        match parent.kind() {
+            "namespace_definition" => {
+                if let Some(name) = parent.child_by_field_name("name") {
+                    let mut components = Vec::new();
+                    if append_cpp_name_components(name, source, &mut components).is_some() {
+                        namespaces.push(components);
+                    }
+                }
             }
-        }
-        if function_definition.is_none() && parent.kind() == "function_definition" {
-            function_definition = Some(parent);
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name) = parent.child_by_field_name("name") {
+                    let mut components = Vec::new();
+                    if append_cpp_name_components(name, source, &mut components).is_some() {
+                        classes.push(components);
+                    }
+                }
+            }
+            "function_definition" => {
+                if function_definition.is_none() {
+                    function_definition = Some(parent);
+                }
+                displaced_class_scope = displaced_class_scope
+                    || parent.child_by_field_name("type").is_some_and(|type_node| {
+                        matches!(
+                            type_node.kind(),
+                            "class_specifier" | "struct_specifier" | "union_specifier"
+                        )
+                    })
+                    || is_malformed_wrapper_function_definition(parent);
+            }
+            _ => {}
         }
         current = parent.parent();
     }
-    let displaced_class_scope = has_recovered_class_shape_ancestor(node)
-        || has_malformed_wrapper_function_definition_ancestor(node);
+    namespaces.reverse();
+    let namespace: Vec<String> = namespaces.into_iter().flatten().collect();
+    let mut scope = namespace.clone();
     let has_qualified_function_owner = function_definition
         .and_then(function_definition_owner_lookup_node)
         .is_some_and(|owner| {
@@ -7172,42 +7484,75 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
         let Some((owner, global)) = qualified_callable_owner_components(function, source) else {
             return LexicalScopeResolution::Missing;
         };
-        match visibility.resolve_type_components_lexically(analyzer, file, &owner, global, &scope) {
-            LexicalTypeResolution::Resolved { components, .. } => scope = components,
-            LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
-            LexicalTypeResolution::Missing if allow_structured_unresolved_owner => {
-                if let Some(indexed) = indexed_scope.as_ref().filter(|indexed| {
-                    qualified_owner_scope_is_recoverable(
-                        indexed,
-                        &namespace,
-                        &classes,
-                        Some(owner.clone()),
-                    )
-                }) {
-                    scope = indexed.clone();
-                } else {
-                    scope = if global || owner.starts_with(&namespace) {
-                        owner
-                    } else {
-                        let mut relative = namespace;
-                        relative.extend(owner);
-                        relative
-                    };
-                }
+        // Resolve the out-of-line owner from the parser namespace before the
+        // provisional indexed parent can influence the answer. Per-file
+        // extraction can assign the first same-depth using namespace to a
+        // bare owner. The structured using resolver instead selects the
+        // namespace whose visible class has the owner name (#1838).
+        let imports = visibility.ordinary_type_import_cell(file);
+        let owner_resolution = resolve_type_components_lexically_at_scoped(
+            function,
+            &owner,
+            global,
+            analyzer,
+            visibility,
+            &imports,
+            file,
+            source,
+            None,
+            false,
+            false,
+            namespace.clone(),
+        );
+        match owner_resolution {
+            LexicalTypeResolution::Resolved {
+                unit, components, ..
+            } if is_indexed_class_owner(analyzer, &unit) => {
+                scope = components;
+                classes.clear();
             }
-            LexicalTypeResolution::Missing => {
-                // Structural lexical resolution cannot see an owner class that
-                // is reachable only through an in-scope `using namespace`
-                // directive, so it would otherwise hard-fail here. The indexed
-                // definition already carries the true fully-qualified owner
-                // (its package reflects the directive), so recover the real
-                // enclosing scope from the analyzer graph -- exactly the scope
-                // chain real C++ unqualified lookup traverses. Only the strict
-                // callers reach this arm; the best-effort callers above keep
-                // their existing structural guess (and its query profile).
-                match indexed_enclosing_owner_scope(analyzer, visibility, file, node) {
-                    Some(indexed) => scope = indexed,
-                    None => return LexicalScopeResolution::Missing,
+            LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
+            LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {
+                match visibility
+                    .resolve_type_components_lexically(analyzer, file, &owner, global, &scope)
+                {
+                    LexicalTypeResolution::Resolved { components, .. } => scope = components,
+                    LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
+                    LexicalTypeResolution::Missing if allow_structured_unresolved_owner => {
+                        if let Some(indexed) = indexed_scope.as_ref().filter(|indexed| {
+                            qualified_owner_scope_is_recoverable(
+                                indexed,
+                                &namespace,
+                                &classes,
+                                Some(owner.clone()),
+                            )
+                        }) {
+                            scope = indexed.clone();
+                        } else {
+                            scope = if global || owner.starts_with(&namespace) {
+                                owner
+                            } else {
+                                let mut relative = namespace;
+                                relative.extend(owner);
+                                relative
+                            };
+                        }
+                    }
+                    LexicalTypeResolution::Missing => {
+                        // Structural lexical resolution cannot see an owner class that
+                        // is reachable only through an in-scope `using namespace`
+                        // directive, so it would otherwise hard-fail here. The indexed
+                        // definition already carries the true fully-qualified owner
+                        // (its package reflects the directive), so recover the real
+                        // enclosing scope from the analyzer graph -- exactly the scope
+                        // chain real C++ unqualified lookup traverses. Only the strict
+                        // callers reach this arm; the best-effort callers above keep
+                        // their existing structural guess (and its query profile).
+                        match indexed_enclosing_owner_scope(analyzer, visibility, file, node) {
+                            Some(indexed) => scope = indexed,
+                            None => return LexicalScopeResolution::Missing,
+                        }
+                    }
                 }
             }
         }
@@ -7963,7 +8308,7 @@ fn using_named_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     Some(enclosing_namespace_components(node, source))
 }
 
-fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
+fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize, bool)> {
     let mut current = node.parent();
     while let Some(scope) = current {
         if matches!(
@@ -7979,101 +8324,139 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
                 depth += 1;
                 ancestor = parent.parent();
             }
-            return Some((scope.start_byte(), scope.end_byte(), depth));
+            return Some((
+                scope.start_byte(),
+                scope.end_byte(),
+                depth,
+                scope.kind() == "compound_statement",
+            ));
         }
         current = scope.parent();
     }
     None
 }
 
+/// Build the per-file structured using index for `file`.
+///
+/// The result is a pure function of the file's parsed content, which is what
+/// lets `CppSource::source_using_index` memoize it on the analyzer (#1927):
+/// a `VisibilityIndex` is rebuilt per usage query, and rebuilding this index
+/// per query re-walked a 9.5 MB amalgamation's AST for every candidate.
+pub fn build_source_using_index(cpp: &dyn CppSource, file: &ProjectFile) -> SourceUsingIndex {
+    let Some(prepared) = cpp.prepared_syntax(file) else {
+        return SourceUsingIndex::default();
+    };
+    collect_source_using_index(cpp, file, prepared.tree().root_node(), prepared.source())
+}
+
 fn collect_source_using_index(
+    cpp: &dyn CppSource,
     source_file: &ProjectFile,
     root: Node<'_>,
     source: &str,
 ) -> SourceUsingIndex {
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = cpp;
     let mut index = SourceUsingIndex::default();
     let orphaned_namespaces = collect_orphaned_namespace_envelopes(root, source);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let required_guards = if callable_preprocessor_context_is_visible(node, source) {
-            Some(HashSet::default())
-        } else {
-            preprocessor_guard_environment(node, source)
-        };
-        let Some(required_guards) = required_guards else {
-            let mut cursor = node.walk();
-            stack.extend(node.children(&mut cursor));
-            continue;
-        };
-        let target = if let Some(namespace_node) = using_namespace_directive_name_node(node) {
-            let mut namespace_components = Vec::new();
-            append_cpp_name_components(namespace_node, source, &mut namespace_components).map(
-                |_| EffectiveUsingTarget::Namespace {
-                    namespace_components,
-                    global: is_globally_qualified_cpp_name(namespace_node),
+        let target = match node.kind() {
+            "using_directive" | "using_declaration" => {
+                if let Some(namespace_node) = using_namespace_directive_name_node(node) {
+                    let mut namespace_components = Vec::new();
+                    append_cpp_name_components(namespace_node, source, &mut namespace_components)
+                        .map(|_| EffectiveUsingTarget::Namespace {
+                            namespace_components,
+                            global: is_globally_qualified_cpp_name(namespace_node),
+                        })
+                } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+                    let mut target_components = Vec::new();
+                    (append_cpp_name_components(type_node, source, &mut target_components)
+                        .is_some()
+                        && target_components.len() >= 2)
+                        .then(|| EffectiveUsingTarget::Ordinary {
+                            name: target_components
+                                .last()
+                                .expect("ordinary using has a terminal component")
+                                .clone(),
+                            target_components,
+                            global: is_globally_qualified_cpp_name(type_node),
+                        })
+                } else {
+                    None
+                }
+            }
+            "declaration" => recovered_macro_using_declaration_type_node(node, source).and_then(
+                |(type_node, global)| {
+                    let mut target_components = Vec::new();
+                    (append_cpp_name_components(type_node, source, &mut target_components)
+                        .is_some()
+                        && target_components.len() >= 2)
+                        .then(|| EffectiveUsingTarget::Ordinary {
+                            name: target_components
+                                .last()
+                                .expect("recovered ordinary using has a terminal component")
+                                .clone(),
+                            target_components,
+                            global,
+                        })
                 },
-            )
-        } else if let Some((type_node, global)) =
-            recovered_macro_using_declaration_type_node(node, source)
-        {
-            let mut target_components = Vec::new();
-            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
-                && target_components.len() >= 2)
-                .then(|| EffectiveUsingTarget::Ordinary {
-                    name: target_components
-                        .last()
-                        .expect("recovered ordinary using has a terminal component")
-                        .clone(),
-                    target_components,
-                    global,
-                })
-        } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
-            let mut target_components = Vec::new();
-            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
-                && target_components.len() >= 2)
-                .then(|| EffectiveUsingTarget::Ordinary {
-                    name: target_components
-                        .last()
-                        .expect("ordinary using has a terminal component")
-                        .clone(),
-                    target_components,
-                    global: is_globally_qualified_cpp_name(type_node),
-                })
-        } else {
-            None
+            ),
+            _ => None,
         };
-        if let Some(target) = target
-            && let Some((scope_start, scope_end, scope_depth)) = ordinary_using_scope(node)
-        {
-            let declaration_namespace = enclosing_namespace_components(node, source);
-            let declaration_namespace = if declaration_namespace.is_empty() {
-                recovered_orphaned_namespace_components(node, source, &orphaned_namespaces)
-                    .unwrap_or(declaration_namespace)
+        if let Some(target) = target {
+            // Guard ancestry is one of the most expensive tree-sitter operations: Node::parent
+            // searches from the root. The project index visits every AST node, but only these
+            // structured using declarations need a guard environment. Keep the cheap target
+            // classification ahead of both ancestor walks so non-using nodes remain a one-pass
+            // walk and the total cost is O(nodes + using declarations * ancestor depth).
+            #[cfg(any(test, feature = "test-support"))]
+            cpp.record_using_guard_context_inspection_for_test();
+            let required_guards = if callable_preprocessor_context_is_visible(node, source) {
+                Some(HashSet::default())
             } else {
-                declaration_namespace
+                preprocessor_guard_environment(node, source)
             };
-            let namespace_scope = using_named_scope(node, source);
-            let lexical_depth = declaration_namespace.len();
-            let binding = OrdinaryTypeImport {
-                target,
-                source: source_file.clone(),
-                declaration_byte: node.end_byte(),
-                scope_start,
-                scope_end,
-                scope_depth,
-                lexical_depth,
-                declaration_namespace,
-                namespace_scope,
-                resolved_target_components: None,
-                required_guards,
+            let Some(required_guards) = required_guards else {
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+                continue;
             };
-            match &binding.target {
-                EffectiveUsingTarget::Ordinary { name, .. } => index
-                    .ordinary_by_name
-                    .entry(name.clone())
-                    .or_default()
-                    .push(binding),
-                EffectiveUsingTarget::Namespace { .. } => index.directives.push(binding),
+            if let Some((scope_start, scope_end, scope_depth, block_scope)) =
+                ordinary_using_scope(node)
+            {
+                let declaration_namespace = enclosing_namespace_components(node, source);
+                let declaration_namespace = if declaration_namespace.is_empty() {
+                    recovered_orphaned_namespace_components(node, source, &orphaned_namespaces)
+                        .unwrap_or(declaration_namespace)
+                } else {
+                    declaration_namespace
+                };
+                let namespace_scope = using_named_scope(node, source);
+                let lexical_depth = declaration_namespace.len();
+                let binding = OrdinaryTypeImport {
+                    target,
+                    source: source_file.clone(),
+                    declaration_byte: node.end_byte(),
+                    scope_start,
+                    scope_end,
+                    scope_depth,
+                    block_scope,
+                    lexical_depth,
+                    declaration_namespace,
+                    namespace_scope,
+                    resolved_target_components: None,
+                    required_guards,
+                };
+                match &binding.target {
+                    EffectiveUsingTarget::Ordinary { name, .. } => index
+                        .ordinary_by_name
+                        .entry(name.clone())
+                        .or_default()
+                        .push(binding),
+                    EffectiveUsingTarget::Namespace { .. } => index.directives.push(binding),
+                }
             }
         }
         let mut cursor = node.walk();
@@ -8264,25 +8647,35 @@ fn orphaned_using_owner_name(node: Node<'_>, source: &str) -> Option<String> {
 fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIndex {
     let mut project = ProjectUsingIndex::default();
     for source_file in visibility.all_visible_source_files() {
-        visibility.note_using_source_index_walk_for_test();
-        let Some(prepared) = visibility.cpp().prepared_syntax(&source_file) else {
-            continue;
-        };
-        let source_index = collect_source_using_index(
-            &source_file,
-            prepared.tree().root_node(),
-            prepared.source(),
-        );
-        for (name, bindings) in source_index.ordinary_by_name {
+        // The per-file index is memoized on the analyzer, so assembling the
+        // project index for a fresh `VisibilityIndex` copies bindings instead
+        // of re-walking each file's AST (#1927).
+        let source_index = visibility.cpp().source_using_index(&source_file);
+        for (name, bindings) in &source_index.ordinary_by_name {
             project
                 .ordinary_by_name
-                .entry(name)
+                .entry(name.clone())
                 .or_default()
-                .extend(bindings);
+                .extend(bindings.iter().cloned());
         }
-        project.directives.extend(source_index.directives);
+        project
+            .directives
+            .extend(source_index.directives.iter().cloned());
     }
     project
+}
+
+fn project_using_index<'a>(visibility: &'a VisibilityIndex<'_>) -> &'a ProjectUsingIndex {
+    visibility.project_using_index(|| build_project_using_index(visibility))
+}
+
+/// Build the immutable project-wide using index before a parallel file scan.
+///
+/// Keeping the `OnceLock` publication here avoids making every scanner carry
+/// an eager index, while callers that are about to fan out can prevent one
+/// worker from doing the whole build as its peers wait on the lock.
+pub fn prewarm_project_using_index(visibility: &VisibilityIndex<'_>) {
+    let _ = project_using_index(visibility);
 }
 
 fn effective_using_target_tiers(binding: &OrdinaryTypeImport) -> Vec<Vec<String>> {
@@ -8448,16 +8841,18 @@ fn project_using_binding_at_activation(
         let mut projected = prefix;
         projected.extend(binding.namespace_scope.take().unwrap_or_default());
         binding.scope_depth = projected.len();
+        binding.block_scope = false;
         binding.lexical_depth = projected.len();
         binding.namespace_scope = Some(projected);
         binding.scope_start = 0;
         binding.scope_end = usize::MAX;
         Some(binding)
-    } else if let Some((start, end, depth)) = ordinary_using_scope(include) {
+    } else if let Some((start, end, depth, block_scope)) = ordinary_using_scope(include) {
         binding.namespace_scope = None;
         binding.scope_start = start;
         binding.scope_end = end;
         binding.scope_depth = depth;
+        binding.block_scope = block_scope;
         binding.lexical_depth = include_namespace.len();
         Some(binding)
     } else {
@@ -8465,22 +8860,30 @@ fn project_using_binding_at_activation(
     }
 }
 
+/// `node` may be any node of `file`'s tree; the projection reaches the tree
+/// root itself when it needs one. `Node::parent` re-descends from the root on
+/// every call (tree-sitter 0.24+), so climbing to the root eagerly at each
+/// call site cost a near-full-AST scan per reference on a large flat file
+/// (#1927); a name with no candidate bindings never pays for it.
 pub fn effective_using_bindings_for_name(
     visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
-    root: Node<'_>,
+    node: Node<'_>,
     source: &str,
     name: &str,
 ) -> Arc<[OrdinaryTypeImport]> {
     imports
         .projection_cell(name)
         .get_or_init(|| {
-            let project = visibility.project_using_index(|| build_project_using_index(visibility));
+            let project = project_using_index(visibility);
+            let name_bindings = project.ordinary_by_name.get(name);
+            if name_bindings.is_none() && project.directives.is_empty() {
+                return Arc::from(Vec::new());
+            }
+            let root = root_node(node);
             let mut projected = Vec::new();
-            for binding in project
-                .ordinary_by_name
-                .get(name)
+            for binding in name_bindings
                 .into_iter()
                 .flatten()
                 .chain(project.directives.iter())
@@ -8488,9 +8891,19 @@ pub fn effective_using_bindings_for_name(
                 if !visibility.source_is_visible(file, &binding.source) {
                     continue;
                 }
-                let Some(target_components) = using_binding_target_components_for_name(
+                let target_components = using_binding_target_components_for_name(
                     binding, project, visibility, file, name,
-                ) else {
+                )
+                .or_else(|| match &binding.target {
+                    EffectiveUsingTarget::Ordinary {
+                        name: imported_name,
+                        target_components,
+                        ..
+                    } if imported_name == name => Some(target_components.clone()),
+                    EffectiveUsingTarget::Ordinary { .. }
+                    | EffectiveUsingTarget::Namespace { .. } => None,
+                });
+                let Some(target_components) = target_components else {
                     continue;
                 };
                 let mut binding = binding.clone();
@@ -8523,17 +8936,20 @@ fn root_node(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
+/// `reference_guards` is the reference node's guard environment, computed once
+/// by the caller and shared across every binding: recomputing it per binding
+/// repeated a full ancestor climb whose every `Node::parent` step re-descends
+/// from the root (#1927).
 fn effective_using_binding_active(
     binding: &OrdinaryTypeImport,
     node: Node<'_>,
     lexical_scope: &[String],
-    source: &str,
+    reference_guards: Option<&HashSet<PreprocessorGuard>>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> bool {
     binding.declaration_byte <= node.start_byte()
-        && preprocessor_guard_environment(node, source)
-            .is_some_and(|active| binding.required_guards.is_subset(&active))
+        && reference_guards.is_some_and(|active| binding.required_guards.is_subset(active))
         && visibility.preprocessor_guards_stable_between(
             file,
             0,
@@ -8737,15 +9153,27 @@ fn ordinary_type_import_resolution(
         return OrdinaryTypeImportResolution::Missing;
     }
     let name = &components[0];
-    let bindings =
-        effective_using_bindings_for_name(visibility, imports, file, root_node(node), source, name);
+    let bindings = effective_using_bindings_for_name(visibility, imports, file, node, source, name);
+    // Guard ancestry climbs the whole ancestor chain, and each `Node::parent`
+    // step re-descends from the root (#1927). A name with no bindings needs
+    // none of it, and one environment serves every binding of the reference.
+    if bindings.is_empty() {
+        return OrdinaryTypeImportResolution::Missing;
+    }
+    let reference_guards = preprocessor_guard_environment(node, source);
     let active = bindings
         .iter()
         .filter(|binding| {
-            effective_using_binding_active(binding, node, lexical_scope, source, visibility, file)
+            effective_using_binding_active(
+                binding,
+                node,
+                lexical_scope,
+                reference_guards.as_ref(),
+                visibility,
+                file,
+            )
         })
         .collect::<Vec<_>>();
-    let reference_guards = preprocessor_guard_environment(node, source);
     let transitive = bindings
         .iter()
         .filter(|binding| {
@@ -9108,6 +9536,12 @@ fn resolve_type_components_lexically_at_scoped(
     }
     if !global
         && components.len() == 1
+        // The two constant-time conditions run before the ancestor climb: each
+        // `Node::parent` step re-descends from the root (#1927).
+        && let Some(target) = direct_target
+        && lexical_scope
+            .last()
+            .is_none_or(|last| last != &components[0])
         // A recovered class may contain a real member function nested inside
         // the malformed outer wrapper (for example tinyxml2's macro-prefixed
         // XMLConstHandle).  The nearest function_definition is then the
@@ -9115,13 +9549,9 @@ fn resolve_type_components_lexically_at_scoped(
         // leaves an unqualified return type outside its namespace.  Walk the
         // complete ancestor chain for the malformed wrapper instead.
         && has_malformed_wrapper_function_definition_ancestor(node)
-        && let Some(target) = direct_target
         && let Some(indexed_namespace) =
             visibility.target_preserving_reference_namespace(analyzer, file, &components[0], target)
         && (lexical_scope.is_empty() || !lexical_scope.starts_with(&indexed_namespace))
-        && lexical_scope
-            .last()
-            .is_none_or(|last| last != &components[0])
     {
         // A malformed wrapper can make the indexed enclosing owner look like
         // the lexical namespace (for example XMLHandle around tinyxml2

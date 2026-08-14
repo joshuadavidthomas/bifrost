@@ -1754,6 +1754,65 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         out.push_str(&format!("  resolves: {status}\n"));
                     }
                 }
+                CodeQueryResultValue::StateEvent { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "state event:", use_color),
+                        paint(Style::new().bold(), value.event_class, use_color),
+                        value.subject,
+                        match &value.member {
+                            Some(member) => format!(".{}", sanitize_terminal_text(member)),
+                            None => String::new(),
+                        },
+                    ));
+                    out.push_str(&format!(
+                        "  point {}, {}\n",
+                        value.program_point, value.completeness
+                    ));
+                }
+                CodeQueryResultValue::RewritePath { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}) {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "rewrite path:", use_color),
+                        paint(Style::new().bold(), value.outcome, use_color),
+                        value.domain,
+                        sanitize_terminal_text(&value.origin_specifier),
+                    ));
+                    out.push_str(&format!(
+                        "  {} of {} steps\n",
+                        value.step_count, value.declared_bound
+                    ));
+                    if !value.witness.is_empty() {
+                        out.push_str(&format!(
+                            "  cycle witness: {}\n",
+                            sanitize_terminal_text(&value.witness.join(" -> "))
+                        ));
+                    }
+                }
+                CodeQueryResultValue::FlowRelation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "flow relation:", use_color),
+                        paint(Style::new().bold(), value.relation, use_color),
+                        value.certainty,
+                    ));
+                    out.push_str(&format!(
+                        "  {} -> {}, {}\n",
+                        value.source.event_class, value.target.event_class, value.completeness
+                    ));
+                }
             }
             if let Some(summary) = result.provenance_summary() {
                 out.push_str(&format!("  {summary}\n"));

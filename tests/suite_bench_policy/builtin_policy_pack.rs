@@ -487,6 +487,77 @@ fn nested_deferred(rows: &[Vec<String>]) {
 }
 "#;
 
+const RUST_LAZY_INIT_POSITIVES: &str = r#"pub fn bad(cell: &OnceLock<usize>) -> usize {
+    *cell.get_or_init(|| (0..10usize).into_par_iter().map(|x| x + 1).sum())
+}
+
+pub fn bad_try(cell: &OnceLock<usize>, values: &[usize]) -> usize {
+    *cell.get_or_try_init(|| Ok::<usize, ()>(values.par_iter().copied().sum())).unwrap()
+}
+
+pub fn bad_once(once: &Once, values: &[usize]) {
+    once.call_once(|| {
+        let total: usize = values.par_iter().copied().sum();
+        drop(total);
+    });
+}
+
+pub fn bad_lazy() -> LazyLock<usize> {
+    LazyLock::new(|| (0..10usize).into_par_iter().sum())
+}
+
+pub fn bad_bridge(cell: &OnceLock<usize>, values: &[usize]) -> usize {
+    *cell.get_or_init(|| values.iter().par_bridge().count())
+}
+
+pub fn bad_chunks(cell: &OnceLock<usize>, values: &[usize]) -> usize {
+    *cell.get_or_init(|| values.par_chunks(4).count())
+}
+
+pub fn nested_bad(cell: &OnceLock<usize>) -> usize {
+    *cell.get_or_init(|| {
+        let helper = || (0..4usize).into_par_iter().sum::<usize>();
+        helper()
+    })
+}
+"#;
+
+const RUST_LAZY_INIT_NEAR_MISSES: &str = r#"pub fn fine_no_rayon(cell: &OnceLock<usize>) -> usize {
+    *cell.get_or_init(|| {
+        let value = 7usize;
+        value
+    })
+}
+
+pub fn fine_outside(cell: &OnceLock<usize>) -> usize {
+    let value: usize = (0..10usize).into_par_iter().sum();
+    let cached = cell.get_or_init(|| 3usize);
+    value + *cached
+}
+
+pub fn fine_pool_safe_memo(memo: &PoolSafeMemo<usize>, values: &[usize]) -> usize {
+    *memo.get_or_build_parallel(|| values.par_iter().copied().sum())
+}
+
+pub fn fine_pool_safe_memo_serial(memo: &PoolSafeMemo<usize>) -> usize {
+    *memo.get_or_build(|| 7usize)
+}
+
+pub fn fine_similar_name(cell: &OnceLock<usize>, source: &LocalSource) -> usize {
+    *cell.get_or_init(|| source.par_iter_like().count())
+}
+
+pub fn fine_get_set(cell: &OnceLock<usize>, values: &[usize]) -> usize {
+    let total: usize = values.par_iter().copied().sum();
+    cell.set(total).ok();
+    *cell.get().unwrap_or(&0)
+}
+
+pub fn fine_lazy_serial() -> LazyLock<usize> {
+    LazyLock::new(|| 7usize)
+}
+"#;
+
 const TSX_SORT_POSITIVE: &str = r#"export function SortedRows({ rows }: { rows: string[][] }) {
   for (const row of rows) {
     row.sort();
@@ -572,6 +643,9 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("Positive.java", &[12]),
             ("positive.rs", &[23]),
         ],
+        "bifrost.correctness.rayon-in-blocking-lazy-init" => {
+            &[("lazy_init_positive.rs", &[2, 6, 10, 17, 21, 25, 29])]
+        }
         "bifrost.performance.expensive-operation-in-nested-loop" => &[
             ("positive.py", &[30]),
             ("deferred.py", &[21]),
@@ -610,6 +684,8 @@ fn code_smell_pack_matches_every_selector_alternative_and_excludes_near_misses()
         .file("positive.rs", RUST_POSITIVES)
         .file("safe.rs", RUST_NEAR_MISSES)
         .file("deferred.rs", RUST_DEFERRED_LEXICAL_POSITIVES)
+        .file("lazy_init_positive.rs", RUST_LAZY_INIT_POSITIVES)
+        .file("lazy_init_safe.rs", RUST_LAZY_INIT_NEAR_MISSES)
         .file("positive.tsx", TSX_SORT_POSITIVE)
         .file("safe.tsx", TSX_SORT_NEAR_MISS)
         .file("tsx/positive.tsx", TSX_SORT_POSITIVE)
@@ -635,8 +711,8 @@ fn code_smell_pack_matches_every_selector_alternative_and_excludes_near_misses()
             .expect("evaluate built-in pack");
 
     assert!(outcome.report().diagnostics().is_empty());
-    assert_eq!(outcome.report().rules().len(), 12);
-    assert_eq!(outcome.report().runs().len(), 12);
+    assert_eq!(outcome.report().rules().len(), 13);
+    assert_eq!(outcome.report().runs().len(), 13);
     for run in outcome.report().runs() {
         assert!(
             matches!(run.completion(), PolicyRunCompletion::Complete),

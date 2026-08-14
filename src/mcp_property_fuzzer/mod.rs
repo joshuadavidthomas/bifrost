@@ -127,6 +127,22 @@ pub struct FuzzerConfig {
     /// Cap on `scan_usages_by_reference` probes, which are the most expensive
     /// service calls. Scanned symbols are a prefix of the service sample.
     pub max_scan_probes: usize,
+    /// Per-symbol-fq cumulative wall-clock budget for service probes, in
+    /// milliseconds; 0 disables the budget. Once a symbol's completed probes
+    /// consume the budget, its remaining probes are skipped unexecuted and
+    /// counted (`ProbeSummary::calls_skipped_time_budget`), so one
+    /// pathological selector family cannot hold a shard indefinitely.
+    #[serde(default)]
+    pub symbol_time_budget_ms: u64,
+    /// Percent of the service-probe cap reserved for anomaly-flagged symbols
+    /// (see [`AnomalySignals`]); the uniform hash draw fills the rest, and
+    /// leftovers from either pool flow to the other. 0 disables the priority
+    /// and reproduces the historical first-N census-order sample exactly.
+    /// Deserializes as 0 for ledger records written before this field
+    /// existed, so `--rerun` reproduces their original probe sets; new CLI
+    /// runs default to 50.
+    #[serde(default)]
+    pub anomaly_percent: u8,
     /// Optional substring filter restricting service probes to symbols whose
     /// fq name contains it (used by acceptance runs and `--rerun`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -314,6 +330,62 @@ pub struct I1File {
     pub parse_errors: Option<Vec<ParseError>>,
 }
 
+/// Cheap structural suspicion signals computed from census metadata (no tool
+/// calls). Flagged symbols are prioritized for service probes: seven tiers of
+/// campaign evidence say nearly every distinct failure family was weird by one
+/// of these criteria (duplicate-fq twins, generated code, exotic names,
+/// parse-error neighborhoods), so uniform sampling finds them only by luck.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AnomalySignals {
+    /// The symbol's fq name is declared more than once across the selectable
+    /// census (build-tag/version/fixture twins, macro-per-file families like
+    /// phalcon's `PHP_METHOD`).
+    pub duplicate_fq: bool,
+    /// The declaring file is generator output (`.zep.c`, `.pb.*`,
+    /// `.designer.cs`, ...); codegen is where extractors historically break.
+    pub generated_file: bool,
+    /// `$`-joined nested/local display names or CLR arity (`` `1 ``) spellings.
+    pub exotic_name: bool,
+    /// The declaring file has tree-sitter parse errors (the #1016 truncation
+    /// neighborhood).
+    pub parse_error_file: bool,
+}
+
+impl AnomalySignals {
+    pub fn any(self) -> bool {
+        self.duplicate_fq || self.generated_file || self.exotic_name || self.parse_error_file
+    }
+}
+
+/// Generated-code marker suffixes. A heuristic marker list, deliberately
+/// mechanical (suffix match on the lowercase path): `.zep.c`/`.php.c` zephir
+/// intermediates, protobuf, WinForms designer partials, dart codegen, and
+/// lemon/bison-style parser outputs. Tunable; false negatives only move a
+/// symbol back into the uniform pool.
+fn is_generated_path(path: &str) -> bool {
+    const GENERATED_SUFFIXES: &[&str] = &[
+        ".zep.c",
+        ".zep.h",
+        ".php.c",
+        ".pb.go",
+        ".pb.cc",
+        ".pb.h",
+        ".pb.cs",
+        ".designer.cs",
+        ".g.dart",
+        ".freezed.dart",
+        ".gen.go",
+        ".gen.rs",
+        ".parser.c",
+        ".parser.h",
+        "_parser.go",
+    ];
+    let lower = path.to_ascii_lowercase();
+    GENERATED_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
 /// The analyzer facts for one indexed symbol, flattened into an arena so the
 /// pure checker below never touches the analyzer and can be fixture-tested
 /// with fabricated inputs.
@@ -344,6 +416,10 @@ pub struct SymbolFacts {
     /// deterministic sampling. The class identifier legitimately never
     /// appears in the constructor's range text, so I1(b) skips these.
     pub aux_constructor: bool,
+    /// Cheap structural suspicion signals (see [`AnomalySignals`]), computed
+    /// from the pre-sampling census so the flags never depend on what
+    /// sampling kept. Drives anomaly-directed service-probe selection.
+    pub anomaly_signals: AnomalySignals,
 }
 
 /// Everything I1 needs, detached from the analyzer.
@@ -475,6 +551,9 @@ pub fn collect_i1_input(
     // file: the auxiliary-constructor convention (a callable carrying its
     // class's name) must be detectable regardless of what sampling keeps.
     let mut class_names_by_path: HashMap<String, HashSet<String>> = HashMap::new();
+    // Pre-sampling census of selectable fq-name occurrences: duplicate-fq
+    // anomaly flags must not depend on what sampling keeps either.
+    let mut fq_counts: HashMap<String, usize> = HashMap::new();
     for unit in analyzer.all_declarations() {
         summary.declarations_total += 1;
         if unit.kind() == CodeUnitType::Class {
@@ -491,11 +570,20 @@ pub fn collect_i1_input(
             summary.skipped_anonymous += 1;
             continue;
         }
+        *fq_counts.entry(unit.fq_name()).or_default() += 1;
         selected.push(unit);
     }
-    let selected = stable_sample(selected, max_symbols, seed, |unit| {
-        format!("{}\0{}", unit.fq_name(), rel_path(unit))
-    });
+    // `max_symbols == 0` opts into the full census: I1(a)/(b)/(d) are pure
+    // index walks and cost nothing next to tool calls. Note `I1Input` holds
+    // the indexed source text of every covered file, so uncapped censuses on
+    // whale repos are a memory decision, not a CPU one.
+    let selected = if max_symbols == 0 {
+        selected
+    } else {
+        stable_sample(selected, max_symbols, seed, |unit| {
+            format!("{}\0{}", unit.fq_name(), rel_path(unit))
+        })
+    };
     summary.symbols_selected = selected.len();
 
     let mut file_indexes: HashMap<String, usize> = HashMap::new();
@@ -537,6 +625,7 @@ pub fn collect_i1_input(
             child_indexes: Vec::new(),
             parent_index: None,
             aux_constructor,
+            anomaly_signals: AnomalySignals::default(),
         });
     }
 
@@ -556,6 +645,22 @@ pub fn collect_i1_input(
             input.symbols[parent_index].child_indexes.push(child_index);
             input.symbols[child_index].parent_index = Some(parent_index);
         }
+    }
+    // Anomaly flags, computed after every file is known so file-level signals
+    // (generated path, parse errors) are available. All four signals are
+    // census- or file-level facts, independent of the service sample.
+    for symbol in &mut input.symbols {
+        let file = &input.files[symbol.file_index];
+        let signals = &mut symbol.anomaly_signals;
+        signals.duplicate_fq = fq_counts
+            .get(&symbol.fq_name)
+            .is_some_and(|count| *count > 1);
+        signals.generated_file = is_generated_path(&file.path);
+        signals.exotic_name = symbol.identifier.contains('$') || symbol.fq_name.contains('`');
+        signals.parse_error_file = file
+            .parse_errors
+            .as_ref()
+            .is_some_and(|errors| !errors.is_empty());
     }
     input
 }
@@ -975,6 +1080,31 @@ mod tests {
         let first = stable_sample(items.clone(), 10, 1, |item| item.clone());
         let second = stable_sample(items, 10, 2, |item| item.clone());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn generated_path_markers_are_suffix_matched_case_insensitively() {
+        for generated in [
+            "build/phalcon/phalcon.zep.c",
+            "ext/phalcon/annotations/parser.PHP.C",
+            "src/gen/api.pb.go",
+            "proto/echo.pb.h",
+            "Forms/HelpForm.Designer.cs",
+            "lib/model.g.dart",
+            "third_party/lemon/query.parser.c",
+            "pkg/grammar_parser.go",
+        ] {
+            assert!(is_generated_path(generated), "{generated}");
+        }
+        for hand_written in [
+            "ext/phalcon/annotations/reader.zep",
+            "src/main.go",
+            "Forms/HelpForm.cs",
+            "lib/model.dart",
+            "src/designer.cs",
+        ] {
+            assert!(!is_generated_path(hand_written), "{hand_written}");
+        }
     }
 
     #[test]

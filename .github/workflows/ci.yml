@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci-impact:
@@ -213,6 +213,29 @@ jobs:
 
       - name: Check publishable workspace package set
         run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-workspace-packages.sh
+
+  extension-boundary:
+    name: extension boundary (${{ matrix.os }})
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.crate_package == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Test the stable extension boundary
+        run: cargo test -p brokk-bifrost-runtime --test extension
 
   rql-runtime:
     name: RQL runtime
@@ -425,7 +448,9 @@ jobs:
         run: node scripts/ci-timing.mjs --label agent-plugin-launcher -- node --test plugins/bifrost-agent/test/launcher.test.mjs
 
       - name: Validate manifests
-        run: node scripts/ci-timing.mjs --label agent-plugin-manifests -- node scripts/check-codex-plugin-manifest.mjs
+        run: |
+          node scripts/ci-timing.mjs --label agent-plugin-v1 -- node scripts/check-agent-plugins-v1.mjs
+          node scripts/ci-timing.mjs --label agent-plugin-manifests -- node scripts/check-codex-plugin-manifest.mjs
 
   external-fixture:
     name: ${{ matrix.name }} fixture provenance

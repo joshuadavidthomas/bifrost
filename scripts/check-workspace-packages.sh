@@ -167,6 +167,8 @@ require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manif
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
+require_archive_file brokk-bifrost-runtime src/extension/mod.rs
+require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 
 manifest_policy_files="$temporary/manifest-policy-files.txt"
 checked_in_policy_files="$temporary/checked-in-policy-files.txt"
@@ -283,4 +285,61 @@ EOF
 CARGO_TARGET_DIR="$temporary/consumer-target" \
   cargo check --quiet --manifest-path "$analysis_consumer/Cargo.toml"
 
-echo "Validated all ${#packages[@]} package archives and their unpacked facade and analysis-only consumers"
+readonly extension_consumer="$temporary/extension-consumer"
+mkdir -p "$extension_consumer/src"
+cat > "$extension_consumer/Cargo.toml" <<EOF
+[package]
+name = "bifrost-extension-package-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
+
+[patch.crates-io]
+brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
+brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
+brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
+brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
+brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
+brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
+brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
+brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
+brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
+brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
+EOF
+cat > "$extension_consumer/src/main.rs" <<'EOF'
+use brokk_bifrost_runtime::extension::{
+    ExtensionCompatibility, ExtensionLimits, ExtensionWorkspace, ExtensionWorkspaceOptions,
+    NormalizedRelativePath,
+};
+
+fn main() {
+    let root = std::env::args_os().nth(1).expect("fixture root");
+    let workspace = ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(root)).unwrap();
+    let path = NormalizedRelativePath::new("src/lib.rs").unwrap();
+    let _ = ExtensionCompatibility::default();
+    let _ = ExtensionLimits::default();
+    println!("{} {} {}", workspace.describe().api.major, workspace.generation(), path.as_str());
+}
+EOF
+mkdir -p "$extension_consumer/fixture/src"
+cat > "$extension_consumer/fixture/src/lib.rs" <<'EOF'
+pub fn package_seam() -> bool { true }
+EOF
+CARGO_TARGET_DIR="$temporary/consumer-target" \
+  cargo run --quiet --manifest-path "$extension_consumer/Cargo.toml" -- "$extension_consumer/fixture"
+extension_tree="$temporary/extension-tree.txt"
+CARGO_TARGET_DIR="$temporary/consumer-target" \
+  cargo tree --manifest-path "$extension_consumer/Cargo.toml" > "$extension_tree"
+if grep -Eq 'brokk-bifrost-(mcp|lsp)' "$extension_tree"; then
+  echo "Extension consumer unexpectedly depends on a transport host" >&2
+  cat "$extension_tree" >&2
+  exit 1
+fi
+
+echo "Validated all ${#packages[@]} package archives and their unpacked facade, analysis-only, and archive-only extension consumers"

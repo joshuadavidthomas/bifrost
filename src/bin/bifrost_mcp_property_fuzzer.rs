@@ -48,7 +48,11 @@ const CORPUS_LANGUAGES: [&str; 12] = [
     "c", "cpp", "csharp", "go", "java", "js", "kotlin", "php", "py", "rust", "scala", "ts",
 ];
 
-const DEFAULT_MAX_SYMBOLS: usize = 5_000;
+const DEFAULT_MAX_SYMBOLS: usize = 50_000;
+/// New runs reserve this share of the service-probe cap for anomaly-flagged
+/// symbols. `FuzzerConfig::anomaly_percent` deserializes to 0 for ledger
+/// records that predate the field, so only fresh CLI runs get the priority.
+const DEFAULT_ANOMALY_PERCENT: u8 = 50;
 // The measured --jobs curve on the pooled store (Terminal.Gui shard 1/10:
 // 1944/1827/1980/2058/1732s at 2/4/8/16/24) flattens at 4 with a contention
 // dip beyond it; 4 is the sweet spot.
@@ -127,6 +131,8 @@ struct FuzzerArgs {
     max_symbols: usize,
     max_service_symbols: usize,
     max_scan_probes: usize,
+    symbol_time_budget_ms: u64,
+    anomaly_percent: u8,
     symbol_filter: Option<String>,
     path_filter: Option<String>,
     shard: Option<ShardSpec>,
@@ -153,6 +159,8 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
     let mut max_symbols = DEFAULT_MAX_SYMBOLS;
     let mut max_service_symbols = DEFAULT_MAX_SERVICE_SYMBOLS;
     let mut max_scan_probes = DEFAULT_MAX_SCAN_PROBES;
+    let mut symbol_time_budget_ms = 0_u64;
+    let mut anomaly_percent = DEFAULT_ANOMALY_PERCENT;
     let mut symbol_filter = None;
     let mut path_filter = None;
     let mut shard = None;
@@ -198,15 +206,28 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
                     "--invariants",
                 )?)?)
             }
-            "--max-symbols" => {
-                max_symbols = take_positive_usize(args, &mut index, "--max-symbols")?
-            }
+            "--max-symbols" => max_symbols = take_usize(args, &mut index, "--max-symbols")?,
             "--max-service-symbols" => {
                 max_service_symbols =
                     take_positive_usize(args, &mut index, "--max-service-symbols")?
             }
             "--max-scan-probes" => {
                 max_scan_probes = take_usize(args, &mut index, "--max-scan-probes")?
+            }
+            "--symbol-time-budget-ms" => {
+                let value = take_value(args, &mut index, "--symbol-time-budget-ms")?;
+                symbol_time_budget_ms = value.parse::<u64>().map_err(|_| {
+                    format!("--symbol-time-budget-ms expects a non-negative integer, got `{value}`")
+                })?;
+            }
+            "--anomaly-percent" => {
+                let value = take_usize(args, &mut index, "--anomaly-percent")?;
+                anomaly_percent = u8::try_from(value)
+                    .ok()
+                    .filter(|percent| *percent <= 100)
+                    .ok_or_else(|| {
+                        format!("--anomaly-percent expects an integer in 0..=100, got `{value}`")
+                    })?;
             }
             "--symbol-filter" => {
                 symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
@@ -286,6 +307,8 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
         max_symbols,
         max_service_symbols,
         max_scan_probes,
+        symbol_time_budget_ms,
+        anomaly_percent,
         symbol_filter,
         path_filter,
         shard,
@@ -661,6 +684,8 @@ fn execute(args: &FuzzerArgs) -> Result<bool, String> {
             max_symbols: args.max_symbols,
             max_service_symbols: args.max_service_symbols,
             max_scan_probes: args.max_scan_probes,
+            symbol_time_budget_ms: args.symbol_time_budget_ms,
+            anomaly_percent: args.anomaly_percent,
             symbol_filter: args.symbol_filter.clone(),
             path_filter: args.path_filter.clone(),
             shard: args.shard.clone(),
@@ -1164,13 +1189,19 @@ fn print_help() {
     );
     println!("  --out PATH             JSONL ledger to append repository records to");
     println!(
-        "  --max-symbols N        Deterministically sampled symbols per repository (default: {DEFAULT_MAX_SYMBOLS})"
+        "  --max-symbols N        Deterministically sampled symbols per repository (default: {DEFAULT_MAX_SYMBOLS}; 0 = full census)"
     );
     println!(
         "  --max-service-symbols N  Sampled symbols receiving tool-call probes (default: {DEFAULT_MAX_SERVICE_SYMBOLS})"
     );
     println!(
         "  --max-scan-probes N    scan_usages_by_reference probes per repository (default: {DEFAULT_MAX_SCAN_PROBES})"
+    );
+    println!(
+        "  --symbol-time-budget-ms N  Skip a symbol's remaining probes once its executed probes exceed N ms cumulative (default: 0, unlimited)"
+    );
+    println!(
+        "  --anomaly-percent N    Reserve N% of the service-probe cap for anomaly-flagged symbols (default: {DEFAULT_ANOMALY_PERCENT}; 0 = historical uniform sample)"
     );
     println!(
         "  --symbol-filter TEXT   Restrict service probes to symbols whose fq name contains TEXT"

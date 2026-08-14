@@ -4,7 +4,7 @@ use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
@@ -31,9 +31,9 @@ pub fn record_usage_hit(
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = index.enclosing_code_unit(file, &enclosing_range) else {
-        return;
-    };
+    let enclosing = index
+        .enclosing_code_unit(file, &enclosing_range)
+        .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
     hits.insert(usage_hit(
         file, line_idx, start_byte, end_byte, enclosing, snippet,
     ));
@@ -80,9 +80,9 @@ pub fn record_unproven_usage_hit(
         start_line: line_idx,
         end_line: line_idx,
     };
-    let Some(enclosing) = index.enclosing_code_unit(file, &enclosing_range) else {
-        return;
-    };
+    let enclosing = index
+        .enclosing_code_unit(file, &enclosing_range)
+        .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
     hits.insert(
         usage_hit(file, line_idx, start_byte, end_byte, enclosing, snippet).into_unproven(),
     );

@@ -22,19 +22,21 @@ use crate::analyzer::store::AnalyzerStore;
 pub fn maybe_gc_for_analyzer(
     store: &AnalyzerStore,
     repo: &Repository,
+    workspace_root: &std::path::Path,
 ) -> Result<GcOutcome, String> {
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    maybe_gc(db_path, repo)
+    maybe_gc(db_path, repo, workspace_root)
 }
 
 pub fn force_gc_for_analyzer(
     store: &AnalyzerStore,
     repo: &Repository,
+    workspace_root: &std::path::Path,
 ) -> Result<GcOutcome, String> {
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    force_gc(db_path, repo)
+    force_gc(db_path, repo, workspace_root)
 }
