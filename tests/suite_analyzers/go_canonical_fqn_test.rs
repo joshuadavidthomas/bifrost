@@ -9,8 +9,9 @@ use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{
         DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams,
-        ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams, get_definitions_by_location,
-        get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
+        ScanUsagesStatus, SearchSymbolsParams, SummariesParams, SymbolLookupParams,
+        get_definitions_by_location, get_summaries, get_symbol_locations, get_symbol_sources,
+        scan_usages_by_reference, search_symbols,
     },
 };
 
@@ -136,6 +137,33 @@ fn get_symbol_sources_resolves_exact_canonical_and_flags_bare_ambiguity() {
         matches.contains("example.com/repo/a/list.TestListRun")
             && matches.contains("example.com/repo/b/list.TestListRun"),
         "ambiguity matches must be canonical: {matches:#?}"
+    );
+}
+
+#[test]
+fn get_summaries_resolves_slash_bearing_canonical_symbols() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    let symbol = "example.com/repo/a/list.TestListRun";
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec![symbol.to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    assert_eq!(symbol, result.summaries[0].label);
+    assert_eq!("a/list/list_test.go", result.summaries[0].path);
+    assert!(
+        result.summaries[0]
+            .elements
+            .iter()
+            .any(|element| element.symbol == symbol && element.text.contains("TestListRun")),
+        "{result:#?}"
     );
 }
 

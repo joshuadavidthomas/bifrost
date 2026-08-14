@@ -3257,8 +3257,45 @@ fn python_boundary_returns_most_relevant_files_json() {
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
     let signature = Signature::now("Test User", "test@example.com").unwrap();
-    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+    let initial = repo
+        .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .unwrap();
+
+    // A second commit that edits the same three files. These Java sources
+    // import nothing, so the ranking below comes entirely from history, and one
+    // commit shows no co-editing at all.
+    fs::write(
+        temp.path().join("A.java"),
+        "public class A { int v = 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("B.java"),
+        "public class B { int v = 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("tests/ATest.java"),
+        "public class ATest { @Test void testA() { int v = 2; } }\n",
+    )
+    .unwrap();
+    index.add_path(std::path::Path::new("A.java")).unwrap();
+    index.add_path(std::path::Path::new("B.java")).unwrap();
+    index
+        .add_path(std::path::Path::new("tests/ATest.java"))
+        .unwrap();
+    index.write().unwrap();
+    let second_tree_id = index.write_tree().unwrap();
+    let second_tree = repo.find_tree(second_tree_id).unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "edit together",
+        &second_tree,
+        &[&repo.find_commit(initial).unwrap()],
+    )
+    .unwrap();
 
     let service =
         SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();

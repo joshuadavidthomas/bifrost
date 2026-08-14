@@ -28,11 +28,21 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-// v10: `SignatureMetadata` gained the declaration-backed structured underlying
-// type identity used by Go named containers (#2069). Signature metadata is a
-// bincode blob, so every language generation must turn over when its wire shape
-// changes even though only Go currently publishes the new fact.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v10-underlying-type-identity";
+// v11: merge of two v10 bumps made independently on both sides of a branch.
+// One added `SignatureMetadata::field_has_initializer`; the other added the
+// declaration-backed structured underlying type identity for Go named
+// containers (#2069). The merged bincode shape matches rows written under
+// neither v10 salt, so both generations turn over here. Semantic chunks and
+// vectors have a separate identity and remain valid.
+//
+// v9: migration 0019 merged `import_details` into `import_statements`, so an
+// import is one row per binding instead of a raw statement plus a bincode
+// `ImportInfo`. What the writer records changed as well as where: Go segments
+// its import path, C# records a structured path and its `global using` flag,
+// and Scala and TypeScript now emit one row per binding rather than one per
+// declaration. `binder_span` (#1600) rides along as a column on that row
+// rather than as a bincode field, because the blob it used to live in is gone.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v11-signature-metadata-merge";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
