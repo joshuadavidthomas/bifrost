@@ -6967,7 +6967,80 @@ pub fn preprocessor_guard_environment(
         }
         ancestor = conditional.parent();
     }
+    if let Some(guard) = fragmented_statement_preprocessor_guard(node, source) {
+        match guard {
+            PreprocessorGuard::Constant(true) => {}
+            PreprocessorGuard::Constant(false) => return None,
+            _ => {
+                if guards.contains(&guard.negated()) {
+                    return None;
+                }
+                guards.insert(guard);
+            }
+        }
+    }
     Some(guards)
+}
+
+fn fragmented_statement_preprocessor_guard(
+    descendant: Node<'_>,
+    source: &str,
+) -> Option<PreprocessorGuard> {
+    // A conditional that starts before `} else if (...) {` crosses the
+    // enclosing statement's grammar boundary. tree-sitter leaves its opener
+    // as a `preproc_if` with a missing terminator in the consequence and
+    // reparses the real `#endif` as a `preproc_call` in the alternative. Pair
+    // those structured nodes before restoring the guard to intervening uses.
+    let mut ancestor = descendant.parent();
+    while let Some(statement) = ancestor {
+        if statement.kind() == "if_statement"
+            && let (Some(consequence), Some(alternative)) = (
+                statement.child_by_field_name("consequence"),
+                statement.child_by_field_name("alternative"),
+            )
+            && alternative.start_byte() <= descendant.start_byte()
+            && descendant.end_byte() <= alternative.end_byte()
+        {
+            let mut cursor = consequence.walk();
+            let openers = consequence
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    matches!(child.kind(), "preproc_if" | "preproc_ifdef")
+                        && child
+                            .child(child.child_count().saturating_sub(1))
+                            .is_some_and(|last| last.kind() == "#endif" && last.is_missing())
+                })
+                .collect::<Vec<_>>();
+            if openers.len() != 1 {
+                ancestor = statement.parent();
+                continue;
+            }
+
+            let mut terminators = Vec::new();
+            let mut stack = vec![alternative];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "preproc_call"
+                    && node.start_byte() >= descendant.end_byte()
+                    && node
+                        .child_by_field_name("directive")
+                        .is_some_and(|directive| node_text(directive, source).trim() == "#endif")
+                {
+                    terminators.push(node);
+                    continue;
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            if terminators.len() == 1 {
+                return simple_preprocessor_guard(openers[0], source);
+            }
+        }
+        ancestor = statement.parent();
+    }
+    None
 }
 
 fn preprocessor_guard_for_descendant(
@@ -11536,6 +11609,26 @@ mod tests {
             conditional,
             target_node
         ));
+    }
+
+    #[test]
+    fn fragmented_reference_guard_is_recovered() {
+        let source = "#if HAVE_ONE && HAVE_TWO\nstatic int helper(int value) { return value; }\n#endif\n\nint fragmented(int value) {\n    if (value == 0) {\n        return 0;\n#if HAVE_ONE && HAVE_TWO\n    } else if (value == 1) {\n        return helper(value);\n#endif\n    }\n    return 0;\n}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let start = source.rfind("helper").expect("reference byte");
+        let node = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + "helper".len())
+            .expect("reference node");
+        let mut expected = HashSet::default();
+        expected.insert(PreprocessorGuard::Expression(
+            "HAVE_ONE && HAVE_TWO".to_string(),
+        ));
+        assert_eq!(preprocessor_guard_environment(node, source), Some(expected));
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
