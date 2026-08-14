@@ -14,7 +14,7 @@ The Rust definition resolver can identify a physical nominal declaration through
 - [x] (2026-08-14 03:35Z) Corrected raw-identifier normalization in persisted and live Cargo module routes, added extractor/usage-walk pins, and rolled the Rust analysis epoch.
 - [x] (2026-08-14 04:45Z) Ran the full `brokk-bifrost-rust` suite (54 tests), focused analysis walk and issue integration tests, formatting, focused isolated Clippy, and the workspace dependency check; all passed.
 - [x] (2026-08-14 04:05Z) Rebuilt the release runner and completed a dirty-head three-repository target-complete comparison. It cleared 31 raw-module-owned rows and retained 22 unrelated residuals with zero skipped or truncated targets.
-- [ ] Commit and publish the fix, rebuild the runner from the clean pushed head, replay the 31 #2128-owned production rows, publish evidence, and close #2128.
+- [x] (2026-08-14 05:20Z) Published `a90be07345102840f153bbe09b03ba09b5463aa4` to `origin/master`, rebuilt the clean release runner, replayed all 31 owned Sway rows, preserved a checksummed disposition manifest, and closed #2128 with evidence.
 
 ## Surprises & Discoveries
 
@@ -48,7 +48,7 @@ The Rust definition resolver can identify a physical nominal declaration through
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. #2128 is open and assigned to `jbellis`.
+#2128 is complete and closed. Raw module identifiers are canonicalized in both persisted and live Cargo-route extraction, and the Rust epoch invalidates route facts written with the old spelling. The clean published-head Sway replay queried all 1,513 targets with no skipped or truncated targets. All 31 owned rows have resolved forward targets and exact inverse hits: 28 are `consistent` references and three are `editor_only` imports. The 22 surviving rows from the initial broad grouping were not credited to this fix and remain in the campaign residual audit.
 
 ## Context and Orientation
 
@@ -88,6 +88,12 @@ Tests and ephemeral exact replays are safe to repeat. Preserve the immutable ful
 ## Artifacts and Notes
 
 Exact Sway witness: `/mnt/optane/tmp/bifrost-fird/final-84bd058f/exact/17399bbbcb0241bb.jsonl`, SHA-256 `a4ca0968afb35b2c8700a1961d825a42e568a535042b5b4921c376599f1bf577`.
+
+Clean closure report: `/mnt/optane/tmp/bifrost-fird/final-a90be073/issue-2128-sway-target-complete-a90be073.jsonl`, SHA-256 `4a5672681de89efbed478dc853dc37c502bd5d220312e7c07b17ae041f384bcf`.
+
+Clean 31-row disposition manifest: `/mnt/optane/tmp/bifrost-fird/final-a90be073/issue-2128-owned-rows-a90be073.jsonl`, SHA-256 `9b3068d763c5b8e3bc75c41a23d90f90f05e57dcaff8060a3d2d09a2eb440533`.
+
+Clean release runner SHA-256: `730db6cc2ab56c06ea1608355fd9868959ce8ef352f48e14813a204631f475f3`.
 
 ## Interfaces and Dependencies
 
