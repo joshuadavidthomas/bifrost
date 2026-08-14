@@ -15,7 +15,7 @@ The forward-versus-inverse differential runner checks whether every exact invers
 - [x] (2026-08-13 21:31Z) Ran focused validation, committed `695339c9`, rebuilt the release runner, and exact-replayed six representative corpus witnesses with zero actionable findings and zero file errors.
 - [x] (2026-08-13 21:39Z) Pushed through merge tip `2fc2d1de`, published the focused test and six-report evidence, and closed #2089 without waiting for the complete C campaign.
 - [x] (2026-08-14) Reopened #2089 after the target-bound C supplement retained one StrongSwan `asn1_wrap` precision finding; reduced the missed role, extended the structured recovery frontier, and replayed the survivor with actionable zero on the dirty candidate.
-- [ ] Publish the underdelivery correction, repeat the StrongSwan replay on the clean pushed runner, record checksummed evidence, and close #2089 again.
+- [x] (2026-08-14) Published the underdelivery correction through merge head `34f3cbdc4`, repeated the StrongSwan replay on its clean release runner, and recorded checksummed evidence. Issue closure follows the documentation checkpoint.
 
 ## Surprises & Discoveries
 
@@ -67,7 +67,7 @@ The focused fixture proves the important non-vacuous case end to end: authoritat
 
 Six exact production replays now cover the original partial ledger and the completed-ledger supplement. strongSwan validates a recovered type, libarchive and Git validate selected members under large/preprocessor recovery envelopes, pgBackRest validates a macro token whose parser role resembles a declaration, SPDK validates definition-kind ineligibility, and CycloneDDS validates a supplemental recovered member. Every run completed with one consistent site, zero inverse-precision findings, zero candidate truncation, and zero file errors. This is sufficient focused acceptance for the requested push; the full 904-key replay remains intentionally deferred to the broader campaign.
 
-The target-bound supplement later exposed one underdelivery: StrongSwan's legal C variable `explicit` caused tree-sitter-cpp to classify the following `asn1_wrap` callee as a declaration-shaped direct `ERROR` descendant. The new parser-marker plus indexed-callable proof backs that exact range while an unindexed direct-recovery identifier remains excluded. The current dirty replay `/tmp/fird-c-strongswan-asn1-2089-dirty.jsonl` is consistent and exact with `inverse_precision_unbacked_hits=0` and every completeness counter clean. Clean pushed evidence remains pending.
+The target-bound supplement later exposed one underdelivery: StrongSwan's legal C variable `explicit` caused tree-sitter-cpp to classify the following `asn1_wrap` callee as a declaration-shaped direct `ERROR` descendant. The new parser-marker plus indexed-callable proof backs that exact range while an unindexed direct-recovery identifier remains excluded. The clean replay at Bifrost `34f3cbdc485fab9c0be1e706481be2d9d49ddcb3` is consistent and exact with `inverse_precision_unbacked_hits=0` and every completeness counter clean. The release runner SHA-256 is `ed930fa9bd68ef84964f44b9b6c40885270d064b29b673ce4bc0dad3eb75d0ab`. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-34f3cbdc/issue-2089-clean-replay-manifest-34f3cbdc.jsonl` (SHA-256 `713ae92c09353772b36988f5ceb089f4aea92b6bb198043cc2397b9721a97d76`), with checksums at `/mnt/optane/tmp/bifrost-fird/final-34f3cbdc/issue-2089-clean-replay-checksums-34f3cbdc.sha256` (SHA-256 `714522aa406519135a7748326e11e1e25235e091e4f444f2e31c58fe142252ed`).
 
 ## Context and Orientation
 
