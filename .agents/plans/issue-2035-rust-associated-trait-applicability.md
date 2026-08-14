@@ -16,7 +16,7 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 - [x] (2026-08-14 00:44Z) Passed the focused issue tests, neighboring definition and usage controls, all 53 `brokk-bifrost-rust` tests, formatting, focused isolated Clippy, dependency validation, and `git diff --check`.
 - [x] (2026-08-14 00:45Z) Rebuilt the release differential runner and obtained a dirty-head precommit serde-json proof: one `From<f32>` target, one exact inverse hit, `consistent=1`, and actionable zero.
 - [x] (2026-08-14 00:49Z) Rebuilt from implementation commit `ca2edcc240eefab6e7d86c34867d57a2a694e364` and preserved a clean exact serde-json replay with consistent/exact inverse recovery and actionable zero.
-- [ ] Push directly to `master`, close #2035 with evidence, and record publication.
+- [x] (2026-08-14 00:49Z) Pushed implementation and evidence commits through `8cbd43941` directly to `origin/master` and closed #2035 with the clean replay evidence.
 
 ## Surprises & Discoveries
 
@@ -51,7 +51,7 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 
 ## Outcomes & Retrospective
 
-The implementation, validation, and clean-head production acceptance are complete. Publication and issue closure remain pending.
+The implementation, validation, clean-head production acceptance, publication, and issue closure are complete. The shared selector now narrows forward definition lookup and inverse usage lookup only when structured argument evidence uniquely proves an implementation; generic and tied cases remain plural or ambiguous. The serde-json witness selects `From<f32>` and round-trips at its exact byte range with zero actionable findings.
 
 ## Context and Orientation
 
@@ -113,3 +113,5 @@ Plan revision, 2026-08-13: Created the living #2035 plan after confirming issue 
 Plan revision, 2026-08-14: Recorded the implemented shared forward/inverse selector, the necessary Rust epoch bump, the Cargo-scoping and inverse-identity discoveries, complete focused/static validation, and the successful dirty-head production proof. Clean-head proof and publication remain required.
 
 Plan revision, 2026-08-14: Recorded clean-head replay provenance and checksums for implementation commit `ca2edcc24`. Only publication and issue closure remain.
+
+Plan revision, 2026-08-14: Recorded publication through `8cbd43941` and verified GitHub issue #2035 closed at `2026-08-14T00:49:16Z`.
