@@ -978,7 +978,11 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                 }
             }
         }
-        sample_diagnostics.truncate(6);
+        let sample_cap = std::env::var("BIFROST_OWASP_SAMPLE_DIAGS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(6);
+        sample_diagnostics.truncate(sample_cap);
         category_runs.push(CategoryRunStatus {
             category: category.label().to_owned(),
             completion: completion_label,

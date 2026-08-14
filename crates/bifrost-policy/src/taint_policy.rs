@@ -1584,9 +1584,17 @@ fn solve_and_project_batch(
                         .filter_map(|segment| segment.name())
                         .collect::<Vec<_>>()
                         .join(".");
-                    let status = cause
-                        .status()
-                        .map_or("incomplete coverage", SemanticInputStatus::label);
+                    // Name the missing capability when the input is unsupported,
+                    // so a corpus abstention report says which value-flow
+                    // capability the procedure lacked rather than a bare
+                    // "unsupported".
+                    let status = match cause.status() {
+                        Some(status @ SemanticInputStatus::Unsupported { capability }) => {
+                            format!("{} ({})", status.label(), capability.label())
+                        }
+                        Some(status) => status.label().to_owned(),
+                        None => "incomplete coverage".to_owned(),
+                    };
                     if let Ok(diagnostic) = PolicyDiagnostic::try_new(
                         PolicyDiagnosticCode::EvaluationFailure,
                         PolicyDiagnosticSeverity::Warning,
