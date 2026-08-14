@@ -11,8 +11,8 @@ When a C source includes a project-root-relative header such as `"config/parse.h
 - [x] (2026-08-14) Reduced pgBackRest `cfgParseOptionKeyIdxName` bytes 24353..24377 to a three-file fixture and filed self-assigned #2138.
 - [x] (2026-08-14) Added the structured include-root selection and focused unit/integration regressions.
 - [x] (2026-08-14) Passed the imports unit tests, issue integration, ambiguous-include controls, C++ crate, formatting, focused Clippy, dependency-boundary, and diff checks; the dirty-runner production candidate is exact and actionable zero.
-- [ ] Rebuild at the clean pushed head and replay the production row into checksummed final evidence.
-- [ ] Commit, push, preserve checksummed evidence, and close #2138.
+- [x] (2026-08-14) Rebuilt at clean pushed head `cf45b0675` and replayed the production row into checksummed final evidence.
+- [x] (2026-08-14) Committed, pushed, preserved checksummed evidence, and closed #2138 at `https://github.com/BrokkAi/bifrost/issues/2138#issuecomment-5291406944`.
 
 ## Surprises & Discoveries
 
@@ -29,7 +29,7 @@ When a C source includes a project-root-relative header such as `"config/parse.h
 
 ## Outcomes & Retrospective
 
-The implementation and regressions are complete. The pgBackRest candidate replay resolves the declaration/definition group, returns a consistent exact inverse hit, and exits with actionable zero; clean pushed-head evidence remains before closure.
+The implementation and regressions landed in `cf45b0675`. The exact pgBackRest row passes from that clean pushed head with the expected header declaration/source definition group, a consistent exact inverse hit, and actionable zero. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-cf45b067/issue-2138-clean-replay-manifest-cf45b067.jsonl` (SHA-256 `870721b5cdec4a469ef20ac328d6990f246457b27ee0a998507ca6b0684fe0ee`), and its checksum inventory has SHA-256 `fa616d822f67a5b3c29e28f15fc78d0d512d3af0a6474d4fcc4a2efd39db8abc`.
 
 ## Context and Orientation
 
@@ -71,6 +71,8 @@ The raw source row is in `/mnt/optane/tmp/bifrost-fird/final-3643963/c-target-co
 Plan revision note (2026-08-14): Created after the C target-bound audit separated the preceding external-libc `atexit` disposition from the live pgBackRest include-visibility defect.
 
 Plan revision note (2026-08-14): Recorded the implemented source-reachable-root filter, its fail-closed controls, all focused gate results, and the successful candidate replay.
+
+Plan revision note (2026-08-14): Finalized clean-head evidence and closure. The release runner SHA-256 is `6bbe0ee0ff6fcdd0dc215ba18e14fba46e8594c13de9ff307e929341cb7f8058`, and the raw report SHA-256 is `651a121e12f8ab5381899292e901ed038e902f39d83d2c46ea8ee8fe9afdc107`.
 
 ## Interfaces and Dependencies
 
