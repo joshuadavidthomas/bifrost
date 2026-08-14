@@ -62,6 +62,23 @@ def relevant(holder):
     sink(holder.slot)
 "#;
 
+const PYTHON_REBOUND_CALLABLE_SOURCE: &str = r#"
+def source():
+    return "tainted"
+
+def other():
+    return "other"
+
+def sink(value):
+    pass
+
+def positive():
+    global source
+    source = other
+    data = source()
+    sink(data)
+"#;
+
 const JAVA_SOURCE: &str = r#"
 final class BalancedFlowFixture {
   static String source() {
@@ -366,6 +383,35 @@ fn python_balanced_positive_completes_with_a_proven_meeting() {
 #[test]
 fn python_balanced_negative_completes_without_a_finding() {
     assert_complete_negative(Language::Python, "app.py", PYTHON_SOURCE);
+}
+
+/// A resolver candidate for the module declaration does not prove the runtime
+/// target after the callable name has been rebound in the caller (#1993).
+#[test]
+fn python_rebound_callable_name_keeps_discovery_open() {
+    let case = balanced_case(
+        Language::Python,
+        "app.py",
+        PYTHON_REBOUND_CALLABLE_SOURCE,
+        "positive",
+    );
+    assert_ne!(
+        case.plan.discovery_status(),
+        SemanticInputStatus::Complete,
+        "a rebound callable name must not produce complete discovery"
+    );
+    let cause = case
+        .plan
+        .first_incomplete_cause()
+        .expect("incomplete discovery retains the rebound call");
+    assert!(
+        matches!(
+            cause,
+            ValueFlowIncompleteCause::Snapshot { .. }
+                | ValueFlowIncompleteCause::CallBinding { .. }
+        ),
+        "the rebound call is the first incomplete cause: {cause:?}"
+    );
 }
 
 #[test]
