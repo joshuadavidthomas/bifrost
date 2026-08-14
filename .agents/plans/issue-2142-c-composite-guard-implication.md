@@ -11,8 +11,8 @@ C callables declared for a set of build configurations must be visible from refe
 - [x] (2026-08-14) Reduced libarchive `match_owner_name_mbs` and `compression_unsupported_encoder` to Boolean equivalence/implication fixtures and filed self-assigned #2142.
 - [x] (2026-08-14) Added the canonical structured Boolean guard form and sound implication check to both ordinary and callable-specific guard visibility.
 - [x] (2026-08-14) Added low-level normalization/implication coverage and an InlineTestProject with equivalence, implication, contradictory, and unrelated cases.
-- [ ] Run focused and broad gates; replay both production rows from a clean pushed-head runner. Dirty-head focused tests, all 90 C/C++ crate tests, all seven callable-activation controls, formatting, focused Clippy, dependency validation, and both exact production replays pass; clean pushed-head evidence remains.
-- [ ] Commit, push, preserve checksummed evidence, and close #2142.
+- [x] (2026-08-14) Ran focused and broad gates and replayed both production rows from the clean pushed head. The focused tests, all 90 C/C++ crate tests, all seven callable-activation controls, formatting, focused Clippy, dependency validation, and both exact production replays pass.
+- [x] (2026-08-14) Committed and pushed implementation commit `dc1b8c5a6`; preserved compact checksummed clean-head evidence. Issue closure follows the evidence-plan commit.
 
 ## Surprises & Discoveries
 
@@ -31,7 +31,7 @@ C callables declared for a set of build configurations must be visible from refe
 
 ## Outcomes & Retrospective
 
-Implementation is pending. Acceptance requires both issue-owned libarchive rows to resolve consistently with exact inverse hits and actionable zero.
+Implementation commit `dc1b8c5a6` is pushed to `origin/master`. The clean release runner SHA-256 is `c000f93ce4ce5d594cfa7bde05e32455e9dbd4dadff28a882c8eebfa41ae0e3e`. Both issue-owned libarchive rows completed as resolved and consistent with exact inverse hits, actionable zero, no skipped or truncated targets, no candidate-limit overflow, no inverse-precision findings, and no file errors. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-dc1b8c5a/issue-2142-clean-replay-manifest-dc1b8c5a.jsonl` (SHA-256 `9c48d4025c77011ad41cdc4cc71fc6b54f04db25171ac2b546957c8169a51276`); its checksum inventory has SHA-256 `e95a1a7546e84254b8437b2417325869d9a3bdf16db6e8d723a0a91663cfda56`. The purpose is met.
 
 ## Context and Orientation
 
@@ -73,6 +73,8 @@ Tests are read-only and replays use ephemeral caches. Preserve raw outputs until
 The raw rows are in `/mnt/optane/tmp/bifrost-fird/final-3643963/c-target-complete-supplement-3643963-raw-ledger.jsonl`. Current exact failures are `/tmp/fird-libarchive-match-owner-current.jsonl` and `/tmp/fird-libarchive-compression-current.jsonl`.
 
 Plan revision note (2026-08-14): Created after closing #2139 and reducing the remaining libarchive guarded-call rows.
+
+Plan revision note (2026-08-14): Recorded implementation commit, complete local gates, and checksummed clean pushed-head production evidence.
 
 ## Interfaces and Dependencies
 
