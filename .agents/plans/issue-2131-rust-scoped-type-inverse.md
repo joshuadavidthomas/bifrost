@@ -11,7 +11,7 @@ Rust forward lookup resolves structured `self::module::Type`, imported-module `m
 - [x] (2026-08-14) Preserved the three production witnesses and filed/assigned #2131.
 - [x] (2026-08-14) Replayed all three witnesses on clean master after #2130; each now has an exact, consistent inverse hit.
 - [x] (2026-08-14) Added and validated a reduced regression covering all three structured path shapes and same-name near misses.
-- [ ] Publish the regression, replay clean closure evidence, and close #2131.
+- [x] (2026-08-14) Published the regression, replayed clean closure evidence, and prepared #2131 for closure.
 
 ## Surprises & Discoveries
 
@@ -26,7 +26,9 @@ Rust forward lookup resolves structured `self::module::Type`, imported-module `m
 
 ## Outcomes & Retrospective
 
-Pending clean pushed-head closure evidence.
+The regression landed and was pushed as `c318e3c884fe64b5bb75ffc334c86bfdf8fe5542`. A freshly rebuilt clean release runner at that head had SHA-256 `a1b900cafcdb3e0b0ec5c18031aebcdbc28cfd040f88d98bff725e245eb3e4df`.
+
+The clean replay manifest is `/mnt/optane/tmp/bifrost-fird/final-c318e3c8/issue-2131-clean-replay-manifest-c318e3c8.jsonl`, SHA-256 `1b4614c937edf777014e876059b21ae4107957fde41f055f8124523aeea443e9`. All three rows pin `c318e3c884fe64b5bb75ffc334c86bfdf8fe5542` with `bifrost_dirty=false`, are `consistent`, and contain exact inverse ranges. No row has skipped targets, target truncation, candidate-limit exclusion, or file errors. The checksum inventory is `/mnt/optane/tmp/bifrost-fird/final-c318e3c8/issue-2131-clean-replay-checksums-c318e3c8.sha256`, SHA-256 `aa88e73022fd33b87e982c5f01d5d3a4f08910e6ba5d750df0e2231b93b9b555`.
 
 The focused regression, three relevant inverse routing controls, all 54 `brokk-bifrost-rust` tests, formatting, focused Clippy for `brokk-bifrost-rust` and `brokk-bifrost-analysis`, and the workspace dependency check pass at the implementation candidate.
 
