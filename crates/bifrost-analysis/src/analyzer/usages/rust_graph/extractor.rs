@@ -19,9 +19,10 @@ use crate::analyzer::usages::common::{
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
 use crate::analyzer::usages::get_definition::{
-    RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    RustTypeLookupCache, rust_associated_call_applicable_candidates,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
@@ -3177,6 +3178,9 @@ fn structured_static_member_matches_target(
     let exact_candidates = [ctx.requested_target, ctx.scan_target]
         .into_iter()
         .filter(|candidate| {
+            if is_rust_trait_impl_member_declaration(ctx.rust, candidate) {
+                return false;
+            }
             let name_matches = candidate.identifier() == ctx.member_name;
             let role_matches = item_matches(candidate);
             let parent = ctx
@@ -3193,6 +3197,22 @@ fn structured_static_member_matches_target(
         .collect::<BTreeSet<_>>();
     let outcome = if !exact_candidates.is_empty() {
         ReceiverAnalysisOutcome::Precise(exact_candidates.into_iter().collect())
+    } else if is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target) {
+        let candidates = ctx
+            .support
+            .fqn(&format!("{}.{}", owner.fq_name(), ctx.member_name))
+            .into_iter()
+            .filter(&item_matches)
+            .filter(|candidate| {
+                ctx.rust
+                    .structural_parent_of(candidate)
+                    .or_else(|| ctx.rust.parent_of(candidate))
+                    .map(|parent| canonical_member_owner(ctx.rust, parent))
+                    .as_ref()
+                    == Some(&owner)
+            })
+            .collect();
+        ReceiverAnalysisOutcome::Precise(candidates)
     } else {
         resolve_exact_owner_associated_item_matching(
             ctx.rust,
@@ -3397,47 +3417,89 @@ fn associated_candidates_match_target(
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
     match outcome {
-        ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            let parent = ctx
-                .rust
-                .structural_parent_of(&candidate)
-                .or_else(|| ctx.rust.parent_of(&candidate));
-            let owner_matches = expected_owner.is_none_or(|expected| {
-                parent.as_ref().is_some_and(|parent| {
-                    is_rust_trait_declaration(ctx.rust, parent)
-                        || canonical_member_owner(ctx.rust, parent.clone()) == *expected
+        ReceiverAnalysisOutcome::Precise(candidates) => {
+            let applicable = owner_node
+                .parent()
+                .filter(|scoped| {
+                    matches!(
+                        scoped.kind(),
+                        "scoped_identifier" | "scoped_type_identifier"
+                    )
                 })
-            });
-            let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
-                .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
-                .flatten();
-            let enum_parent = ctx
-                .target_is_enum_variant
-                .then_some(parent.as_ref())
-                .flatten()
-                .filter(|parent| is_rust_enum_declaration(ctx.rust, parent));
-            let visibility_declaration =
-                mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
-            let directly_visible = usage_declaration_visible_at(
-                ctx.rust,
-                visibility_declaration,
-                ctx.file,
-                owner_node.start_byte(),
-            );
-            let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
-                && is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
-                && is_graph_visible_member_target(ctx.rust, &candidate)
-                && parent.as_ref().is_some_and(|owner| {
-                    usage_declaration_visible_at(ctx.rust, owner, ctx.file, owner_node.start_byte())
+                .and_then(|scoped| {
+                    rust_associated_call_applicable_candidates(
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.source,
+                        ctx.root,
+                        scoped,
+                        candidates.clone(),
+                    )
                 });
-            let identity_matches = same_rust_declaration_identity(&candidate, ctx.requested_target)
-                || mapped_trait.as_ref().is_some_and(|trait_member| {
-                    same_rust_declaration_identity(trait_member, ctx.requested_target)
+            if applicable
+                .as_ref()
+                .is_some_and(|applicable| applicable.len() != 1)
+            {
+                return false;
+            }
+            let applicability_selected = applicable.is_some();
+            let candidates = applicable.unwrap_or(candidates);
+            candidates.into_iter().any(|candidate| {
+                let parent = ctx
+                    .rust
+                    .structural_parent_of(&candidate)
+                    .or_else(|| ctx.rust.parent_of(&candidate));
+                let owner_matches = expected_owner.is_none_or(|expected| {
+                    parent.as_ref().is_some_and(|parent| {
+                        is_rust_trait_declaration(ctx.rust, parent)
+                            || canonical_member_owner(ctx.rust, parent.clone()) == *expected
+                    })
                 });
-            (directly_visible || unindexed_trait_impl_visible_through_owner)
-                && owner_matches
-                && identity_matches
-        }),
+                let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
+                    .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
+                    .flatten();
+                let enum_parent = ctx
+                    .target_is_enum_variant
+                    .then_some(parent.as_ref())
+                    .flatten()
+                    .filter(|parent| is_rust_enum_declaration(ctx.rust, parent));
+                let visibility_declaration =
+                    mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
+                let directly_visible = usage_declaration_visible_at(
+                    ctx.rust,
+                    visibility_declaration,
+                    ctx.file,
+                    owner_node.start_byte(),
+                );
+                let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
+                    && is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
+                    && is_graph_visible_member_target(ctx.rust, &candidate)
+                    && parent.as_ref().is_some_and(|owner| {
+                        usage_declaration_visible_at(
+                            ctx.rust,
+                            owner,
+                            ctx.file,
+                            owner_node.start_byte(),
+                        )
+                    });
+                let identity_matches = if applicability_selected {
+                    candidate == *ctx.requested_target
+                        || mapped_trait
+                            .as_ref()
+                            .is_some_and(|trait_member| trait_member == ctx.requested_target)
+                } else {
+                    same_rust_declaration_identity(&candidate, ctx.requested_target)
+                        || mapped_trait.as_ref().is_some_and(|trait_member| {
+                            same_rust_declaration_identity(trait_member, ctx.requested_target)
+                        })
+                };
+                (applicability_selected
+                    || directly_visible
+                    || unindexed_trait_impl_visible_through_owner)
+                    && owner_matches
+                    && identity_matches
+            })
+        }
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }

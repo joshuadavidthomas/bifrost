@@ -239,22 +239,25 @@ pub(super) fn resolve_rust(
     if !support.observe_cancellation() {
         return outcome;
     }
-    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-        return outcome;
+    let cargo_scope = resolve_analyzer::<RustAnalyzer>(analyzer).and_then(|rust| {
+        rust_cargo_reference_scope(rust, file, source, tree, site).map(|scope| (rust, scope))
+    });
+    let outcome = match cargo_scope {
+        Some((rust, scope)) => {
+            let direct_crate_reference =
+                tree.and_then(|tree| rust_direct_crate_root_reference(source, tree, site));
+            rust_scope_forward_candidates_to_cargo_target(
+                rust,
+                support,
+                file,
+                scope,
+                direct_crate_reference,
+                outcome,
+            )
+        }
+        None => outcome,
     };
-    let Some(scope) = rust_cargo_reference_scope(rust, file, source, tree, site) else {
-        return outcome;
-    };
-    let direct_crate_reference =
-        tree.and_then(|tree| rust_direct_crate_root_reference(source, tree, site));
-    rust_scope_forward_candidates_to_cargo_target(
-        rust,
-        support,
-        file,
-        scope,
-        direct_crate_reference,
-        outcome,
-    )
+    rust_filter_associated_call_outcome(analyzer, support, source, tree, site, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3677,6 +3680,230 @@ fn rust_focused_terminal_scoped_declaration_outcome(
     sort_units(&mut candidates);
     candidates.dedup();
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RustCallTypeMatch {
+    Coercion,
+    Exact,
+}
+
+fn rust_filter_associated_call_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
+    if outcome.definitions.len() < 2 {
+        return outcome;
+    }
+    let Some(tree) = tree else {
+        return outcome;
+    };
+    let Some(focused) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return outcome;
+    };
+    let Some(scoped) =
+        rust_enclosing_scoped_terminal_name(focused, site.focus_start_byte, site.focus_end_byte)
+    else {
+        return outcome;
+    };
+    let original_len = outcome.definitions.len();
+    let filtered = rust_associated_call_applicable_candidates(
+        analyzer,
+        support,
+        source,
+        tree.root_node(),
+        scoped,
+        outcome.definitions.clone(),
+    )
+    .filter(|filtered| !filtered.is_empty());
+    if let Some(filtered) = filtered.filter(|filtered| filtered.len() < original_len) {
+        candidates_outcome(filtered)
+    } else {
+        outcome
+    }
+}
+
+/// The positively applicable declarations for a one-argument scoped call.
+/// `None` means the node is not such a call; an empty vector means it is a call
+/// whose argument type provides no positive narrowing evidence.
+pub(crate) fn rust_associated_call_applicable_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    source: &str,
+    root: Node<'_>,
+    scoped: Node<'_>,
+    candidates: Vec<CodeUnit>,
+) -> Option<Vec<CodeUnit>> {
+    let argument = rust_single_scoped_call_argument(support, scoped)?;
+    let Some(actual) = rust_call_argument_type_spellings(support, root, source, argument) else {
+        return Some(Vec::new());
+    };
+    let scored = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_signature = candidate.signature()?;
+            let expected = support
+                .signature_metadata(analyzer, candidate)
+                .into_iter()
+                .find_map(|metadata| {
+                    if !candidate_signature.ends_with(metadata.label()) {
+                        return None;
+                    }
+                    match metadata.callable_parameter_types()? {
+                        [expected] => Some(expected.to_owned()),
+                        _ => None,
+                    }
+                })?;
+            actual
+                .iter()
+                .find_map(|(spelling, rank)| (spelling == &expected).then_some(*rank))
+                .map(|rank| (candidate.clone(), rank))
+        })
+        .collect::<Vec<_>>();
+    let Some(best) = scored.iter().map(|(_, rank)| *rank).max() else {
+        return Some(Vec::new());
+    };
+    Some(
+        scored
+            .into_iter()
+            .filter_map(|(candidate, rank)| (rank == best).then_some(candidate))
+            .collect(),
+    )
+}
+
+fn rust_single_scoped_call_argument<'tree>(
+    support: &dyn RustDefinitionProvider,
+    scoped: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut function = scoped;
+    while let Some(parent) = function.parent()
+        && parent.kind() == "generic_function"
+        && parent.child_by_field_name("function") == Some(function)
+    {
+        if !support.scope_step() {
+            return None;
+        }
+        function = parent;
+    }
+    let call = function.parent()?;
+    if call.kind() != "call_expression"
+        || call.child_by_field_name("function") != Some(function)
+        || !support.scope_step()
+    {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut values = arguments
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "attribute_item");
+    let argument = values.next()?;
+    values.next().is_none().then_some(argument)
+}
+
+fn rust_call_argument_type_spellings(
+    support: &dyn RustDefinitionProvider,
+    root: Node<'_>,
+    source: &str,
+    argument: Node<'_>,
+) -> Option<Vec<(String, RustCallTypeMatch)>> {
+    let type_node = match argument.kind() {
+        "identifier" => {
+            let name = rust_node_text(argument, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            rust_binding_type_node_at(support, root, source, name, argument.start_byte())?
+        }
+        "cast_expression" => argument.child_by_field_name("type")?,
+        _ => return None,
+    };
+    let exact = rust_node_text(type_node, source).trim();
+    if exact.is_empty()
+        || (matches!(type_node.kind(), "identifier" | "type_identifier")
+            && rust_type_parameter_visible_from(type_node, source, exact))
+    {
+        return None;
+    }
+    let mut spellings = vec![(exact.to_string(), RustCallTypeMatch::Exact)];
+    if type_node.kind() == "reference_type" {
+        let inner = type_node.child_by_field_name("type")?;
+        let mutable = (0..type_node.named_child_count()).any(|index| {
+            type_node
+                .named_child(index)
+                .is_some_and(|child| child.kind() == "mutable_specifier")
+        });
+        let inner_text = rust_node_text(inner, source).trim();
+        if mutable && !inner_text.is_empty() {
+            spellings.push((format!("&{inner_text}"), RustCallTypeMatch::Coercion));
+        }
+        if inner.kind() == "array_type"
+            && inner.child_by_field_name("length").is_some()
+            && let Some(element) = inner.child_by_field_name("element")
+        {
+            let element = rust_node_text(element, source).trim();
+            if !element.is_empty() {
+                spellings.push((format!("&[{element}]"), RustCallTypeMatch::Coercion));
+            }
+        }
+    }
+    Some(spellings)
+}
+
+fn rust_binding_type_node_at<'tree>(
+    support: &dyn RustDefinitionProvider,
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> Option<Node<'tree>> {
+    let mut found = None;
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        match node.kind() {
+            "parameter" => {
+                if let Some((binding, type_node)) = rust_typed_binding(support, node, source)
+                    && binding == name
+                {
+                    found = Some(type_node);
+                }
+            }
+            "let_declaration" if node.end_byte() <= before_byte => {
+                if node
+                    .child_by_field_name("pattern")
+                    .and_then(|pattern| rust_simple_identifier_text(pattern, source))
+                    .is_some_and(|binding| binding == name)
+                    && let Some(type_node) = node.child_by_field_name("type")
+                {
+                    found = Some(type_node);
+                }
+            }
+            _ => {}
+        }
+        for index in (0..node.named_child_count()).rev() {
+            let Some(child) = node.named_child(index) else {
+                continue;
+            };
+            if child.start_byte() < before_byte
+                && !rust_scope_boundary_excludes_reference(child, before_byte)
+            {
+                pending.push(child);
+            }
+        }
+    }
+    found
 }
 
 fn rust_scoped_owner_and_member(

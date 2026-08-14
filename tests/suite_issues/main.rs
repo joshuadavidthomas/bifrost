@@ -85,6 +85,7 @@ mod issue_2027_php_qualified_ancestry;
 mod issue_2028_2084_symbolic_reference_site;
 mod issue_2031_rust_physical_module_scope;
 mod issue_2033_rust_enum_variant_fields;
+mod issue_2035_rust_associated_trait_applicability;
 mod issue_2038_typescript_export_alias;
 mod issue_2040_typescript_enum_initializer;
 mod issue_2047_java_nested_plain_type_names;
