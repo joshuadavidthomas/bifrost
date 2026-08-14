@@ -1083,6 +1083,18 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    // An explicitly named anonymous-object member (`new { Name = value }`)
+    // declares the output member name. The grammar leaves that name as a
+    // direct identifier child rather than wrapping it in a declarator node;
+    // the following `=` token distinguishes it from shorthand
+    // `new { value }`, where the identifier remains a real value reference.
+    if parent.kind() == "anonymous_object_creation_expression"
+        && node
+            .next_sibling()
+            .is_some_and(|sibling| sibling.kind() == "=")
+    {
+        return true;
+    }
     if matches!(
         parent.kind(),
         "class_declaration"

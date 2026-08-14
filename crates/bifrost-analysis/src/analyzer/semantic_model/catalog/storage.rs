@@ -1,12 +1,16 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use super::CatalogError;
+
+const PATH_INSPECTION_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const PATH_INSPECTION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+const PATH_INSPECTION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) fn prepare_root(root: &Path) -> Result<PathBuf, CatalogError> {
     reject_symlink(root, "catalog root")?;
@@ -358,13 +362,33 @@ fn reject_object_tree(root: &Path, prefix: &Path) -> Result<(), CatalogError> {
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<(), CatalogError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(CatalogError::Integrity(format!(
-            "refusing to use symlinked {label}: {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CatalogError::io("inspect catalog path", error)),
+    // Concurrent SQLite/catalog creation can briefly make Windows metadata
+    // inspection report ERROR_ACCESS_DENIED. Keep the no-follow check, but give
+    // that transient state the same bounded settling window as WAL setup.
+    let started = Instant::now();
+    let mut backoff = PATH_INSPECTION_RETRY_BACKOFF;
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CatalogError::Integrity(format!(
+                    "refusing to use symlinked {label}: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && started.elapsed() < PATH_INSPECTION_RETRY_DEADLINE =>
+            {
+                let remaining = PATH_INSPECTION_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                std::thread::sleep(backoff.min(remaining));
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(PATH_INSPECTION_RETRY_MAX_BACKOFF);
+            }
+            Err(error) => return Err(CatalogError::io("inspect catalog path", error)),
+        }
     }
 }

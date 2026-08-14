@@ -82,13 +82,20 @@ pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<Stri
     Some(display_symbol_name(language_for_target(target), &parent_fq))
 }
 
+/// The user-facing terminal name of `target`: its recorded terminal segment,
+/// respelled the way its language displays a name.
+///
+/// The terminal boundary is read from the `CodeUnit`'s [`FqName`], never
+/// re-derived by splitting the rendered short name on `.`. A terminal segment
+/// may legitimately contain a dot or a slash -- a JS/TS object-literal key such
+/// as `"data/web-interface.csv"` is one recorded `Member` segment -- and the
+/// re-split named such a declaration `csv`, a name that addresses nothing:
+/// outlines, document symbols, completion labels and the selector an agent
+/// copies from them all pointed at a segment fragment (#2111).
+///
+/// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
 pub fn display_identifier_for_target(target: &CodeUnit) -> String {
-    let display_name = display_symbol_name(language_for_target(target), target.short_name());
-    display_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(&display_name)
-        .to_string()
+    display_symbol_name(language_for_target(target), target.identifier())
 }
 
 pub fn source_identifier_for_target(target: &CodeUnit) -> &str {

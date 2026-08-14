@@ -19,9 +19,10 @@ use crate::analyzer::usages::common::{
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
 use crate::analyzer::usages::get_definition::{
-    RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    RustTypeLookupCache, rust_associated_call_applicable_candidates,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
@@ -51,7 +52,8 @@ pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
 use brokk_bifrost_rust::graph_support::{
-    RustSource, is_rust_macro_export_declaration, resolve_module_package,
+    RustSource, is_rust_enum_variant_declaration, is_rust_macro_export_declaration,
+    resolve_module_package,
 };
 use brokk_bifrost_rust::imports::rust_crate_root_package;
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
@@ -59,7 +61,8 @@ use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn effective_scan_files(
@@ -68,6 +71,7 @@ pub(super) fn effective_scan_files(
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
+    let _scope = crate::profiling::scope("rust_graph::effective_scan_files");
     let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
     let filtered_candidates: HashSet<_> = candidate_files
@@ -79,6 +83,7 @@ pub(super) fn effective_scan_files(
     let include_files: HashSet<_> = if scan_scope.is_authoritative() {
         HashSet::default()
     } else {
+        let _scope = crate::profiling::scope("rust_graph::include_candidate_discovery");
         RustIncludeRoutes::new(analyzer)
             .all_included_files()
             .iter()
@@ -95,6 +100,17 @@ pub(super) fn effective_scan_files(
             .collect()
     };
 
+    crate::profiling::note_with(|| {
+        format!(
+            "rust_graph candidates supplied={} analyzed={} filtered={} includes={} authoritative={}",
+            candidate_files.len(),
+            analyzed.len(),
+            filtered_candidates.len(),
+            include_files.len(),
+            scan_scope.is_authoritative()
+        )
+    });
+
     if scan_scope.is_authoritative() {
         return filtered_candidates;
     }
@@ -105,31 +121,69 @@ pub(super) fn effective_scan_files(
             .collect();
     }
 
+    let referencing_files = {
+        let _scope = crate::profiling::scope("rust_graph::reference_candidate_discovery");
+        analyzer.referencing_files_of(target.source())
+    };
     if !filtered_candidates.is_empty() {
+        let importers: HashSet<_> = if target.is_module() {
+            usage_importers(analyzer, seeds)
+        } else {
+            seeds.verified_importer_files().cloned().collect()
+        };
+        crate::profiling::note_with(|| {
+            format!(
+                "rust_graph augmented supplied candidates with importers={} referencing={}",
+                importers.len(),
+                referencing_files.len()
+            )
+        });
         return filtered_candidates
             .into_iter()
+            .chain(importers)
+            .chain(referencing_files)
             .chain(include_files)
+            .chain(std::iter::once(target.source().clone()))
             .collect();
     }
 
-    let textual_candidates = analyzed.into_iter().filter(|file| {
-        if scan_scope.is_cancelled() {
-            return false;
-        }
-        file.read_to_string().ok().is_some_and(|source| {
-            if scan_scope.is_cancelled() {
-                return false;
-            }
-            source.contains(target.identifier())
-                || seed_names
-                    .iter()
-                    .any(|seed_name| source.contains(seed_name))
-        })
+    let importers = {
+        let _scope = crate::profiling::scope("rust_graph::importer_candidate_discovery");
+        usage_importers(analyzer, seeds)
+    };
+
+    let textual_candidates: HashSet<_> = {
+        let _scope = crate::profiling::scope("rust_graph::textual_candidate_fallback");
+        analyzed
+            .into_iter()
+            .filter(|file| {
+                if scan_scope.is_cancelled() {
+                    return false;
+                }
+                file.read_to_string().ok().is_some_and(|source| {
+                    if scan_scope.is_cancelled() {
+                        return false;
+                    }
+                    source.contains(target.identifier())
+                        || seed_names
+                            .iter()
+                            .any(|seed_name| source.contains(seed_name))
+                })
+            })
+            .collect()
+    };
+    crate::profiling::note_with(|| {
+        format!(
+            "rust_graph inferred importers={} referencing={} textual={}",
+            importers.len(),
+            referencing_files.len(),
+            textual_candidates.len()
+        )
     });
 
-    usage_importers(analyzer, seeds)
+    importers
         .into_iter()
-        .chain(analyzer.referencing_files_of(target.source()))
+        .chain(referencing_files)
         .chain(include_files)
         .chain(textual_candidates)
         .chain(std::iter::once(target.source().clone()))
@@ -139,6 +193,41 @@ pub(super) fn effective_scan_files(
 struct UsageCapStop {
     proven_external_hits: AtomicUsize,
     max_usages: usize,
+}
+
+#[derive(Default)]
+struct RustScanPhaseTimings {
+    prepared_syntax_ns: AtomicU64,
+    reference_context_ns: AtomicU64,
+    lexical_scope_ns: AtomicU64,
+    ast_scan_ns: AtomicU64,
+}
+
+impl RustScanPhaseTimings {
+    fn start() -> Option<Instant> {
+        crate::profiling::enabled().then(Instant::now)
+    }
+
+    fn record(counter: &AtomicU64, started: Option<Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counter.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    fn report(&self, candidate_count: usize) {
+        crate::profiling::note_with(|| {
+            format!(
+                "rust_graph scan candidates={} prepared_syntax_ms={:.1} reference_context_ms={:.1} lexical_scope_ms={:.1} ast_scan_ms={:.1}",
+                candidate_count,
+                self.prepared_syntax_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.reference_context_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.lexical_scope_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.ast_scan_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            )
+        });
+    }
 }
 
 impl UsageCapStop {
@@ -180,6 +269,7 @@ pub(super) fn scan_files_for_target(
     let hits = Mutex::new(BTreeSet::new());
     let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
+    let timings = RustScanPhaseTimings::default();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
     // universe a hit can be written under.
@@ -196,9 +286,12 @@ pub(super) fn scan_files_for_target(
             return;
         }
         rust.note_scanned_candidate_file();
+        let started = RustScanPhaseTimings::start();
         let Some(prepared) = rust.prepared_syntax(file) else {
+            RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
+        RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
         let source = prepared.source();
         let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -212,11 +305,15 @@ pub(super) fn scan_files_for_target(
         // and every route it composes is memoized on the analyzer, so the
         // repeated construction costs no repeated work.
         let include_routes = RustIncludeRoutes::new(rust);
+        let started = RustScanPhaseTimings::start();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
+        RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        let started = RustScanPhaseTimings::start();
         let refs = rust.reference_context_of(file);
+        RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -269,11 +366,13 @@ pub(super) fn scan_files_for_target(
             cancellation_checks_remaining: 0,
             hits: &mut local_hits,
         };
+        let started = RustScanPhaseTimings::start();
         scan_node(tree.root_node(), &mut ctx);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         record_module_qualified_hits(tree.root_node(), &mut ctx);
+        RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -285,6 +384,8 @@ pub(super) fn scan_files_for_target(
             sink.extend(local_hits);
         }
     });
+
+    timings.report(files_vec.len());
 
     hits.into_inner().expect("poisoned Rust graph collector")
 }
@@ -1461,6 +1562,7 @@ pub(super) fn scan_files_for_member_target(
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
 
     let files_vec = files.into_iter().collect::<Vec<_>>();
+    let timings = RustScanPhaseTimings::default();
     // Parsing each file inside the scan, rather than prefetching every candidate
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
@@ -1469,20 +1571,27 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         rust.note_scanned_candidate_file();
+        let started = RustScanPhaseTimings::start();
         let Some(prepared) = rust.prepared_syntax(file) else {
+            RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
+        RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
         let source = prepared.source();
         let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         let line_starts = prepared.line_starts();
+        let started = RustScanPhaseTimings::start();
         let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
+        RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        let started = RustScanPhaseTimings::start();
         let refs = rust.reference_context_of(file);
+        RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -1580,7 +1689,9 @@ pub(super) fn scan_files_for_member_target(
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
+        let started = RustScanPhaseTimings::start();
         scan_member_node(tree.root_node(), &mut ctx);
+        RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -1598,6 +1709,8 @@ pub(super) fn scan_files_for_member_target(
             sink.extend(local_unproven_hits);
         }
     });
+
+    timings.report(files_vec.len());
 
     RustMemberScanResult {
         hits: hits.into_inner().expect("poisoned Rust member collector"),
@@ -2489,7 +2602,7 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
-    if !resolved_type_matches_owner(type_node, ctx) {
+    if !resolved_struct_field_owner_matches(type_node, ctx) {
         return;
     }
     for field in fields {
@@ -2513,6 +2626,17 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             ctx.hits,
         );
     }
+}
+
+fn resolved_struct_field_owner_matches(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    if !is_rust_enum_variant_declaration(ctx.rust, ctx.owner) {
+        return resolved_type_matches_owner(type_node, ctx);
+    }
+    let Some(segments) = rust_path_segments(type_node) else {
+        return false;
+    };
+    structured_owner_candidate_fqn(type_node, &segments, ctx)
+        .is_some_and(|owner| owner == ctx.owner.fq_name())
 }
 
 enum ReceiverOwnerProof {
@@ -3054,6 +3178,9 @@ fn structured_static_member_matches_target(
     let exact_candidates = [ctx.requested_target, ctx.scan_target]
         .into_iter()
         .filter(|candidate| {
+            if is_rust_trait_impl_member_declaration(ctx.rust, candidate) {
+                return false;
+            }
             let name_matches = candidate.identifier() == ctx.member_name;
             let role_matches = item_matches(candidate);
             let parent = ctx
@@ -3070,6 +3197,22 @@ fn structured_static_member_matches_target(
         .collect::<BTreeSet<_>>();
     let outcome = if !exact_candidates.is_empty() {
         ReceiverAnalysisOutcome::Precise(exact_candidates.into_iter().collect())
+    } else if is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target) {
+        let candidates = ctx
+            .support
+            .fqn(&format!("{}.{}", owner.fq_name(), ctx.member_name))
+            .into_iter()
+            .filter(&item_matches)
+            .filter(|candidate| {
+                ctx.rust
+                    .structural_parent_of(candidate)
+                    .or_else(|| ctx.rust.parent_of(candidate))
+                    .map(|parent| canonical_member_owner(ctx.rust, parent))
+                    .as_ref()
+                    == Some(&owner)
+            })
+            .collect();
+        ReceiverAnalysisOutcome::Precise(candidates)
     } else {
         resolve_exact_owner_associated_item_matching(
             ctx.rust,
@@ -3274,47 +3417,93 @@ fn associated_candidates_match_target(
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
     match outcome {
-        ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            let parent = ctx
-                .rust
-                .structural_parent_of(&candidate)
-                .or_else(|| ctx.rust.parent_of(&candidate));
-            let owner_matches = expected_owner.is_none_or(|expected| {
-                parent.as_ref().is_some_and(|parent| {
-                    is_rust_trait_declaration(ctx.rust, parent)
-                        || canonical_member_owner(ctx.rust, parent.clone()) == *expected
+        ReceiverAnalysisOutcome::Precise(candidates) => {
+            let applicable = is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target)
+                .then(|| {
+                    owner_node
+                        .parent()
+                        .filter(|scoped| {
+                            matches!(
+                                scoped.kind(),
+                                "scoped_identifier" | "scoped_type_identifier"
+                            )
+                        })
+                        .and_then(|scoped| {
+                            rust_associated_call_applicable_candidates(
+                                ctx.analyzer,
+                                ctx.support,
+                                ctx.source,
+                                ctx.root,
+                                scoped,
+                                candidates.clone(),
+                            )
+                        })
                 })
-            });
-            let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
-                .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
                 .flatten();
-            let enum_parent = ctx
-                .target_is_enum_variant
-                .then_some(parent.as_ref())
-                .flatten()
-                .filter(|parent| is_rust_enum_declaration(ctx.rust, parent));
-            let visibility_declaration =
-                mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
-            let directly_visible = usage_declaration_visible_at(
-                ctx.rust,
-                visibility_declaration,
-                ctx.file,
-                owner_node.start_byte(),
-            );
-            let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
-                && is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
-                && is_graph_visible_member_target(ctx.rust, &candidate)
-                && parent.as_ref().is_some_and(|owner| {
-                    usage_declaration_visible_at(ctx.rust, owner, ctx.file, owner_node.start_byte())
+            if applicable
+                .as_ref()
+                .is_some_and(|applicable| applicable.len() != 1)
+            {
+                return false;
+            }
+            let applicability_selected = applicable.is_some();
+            let candidates = applicable.unwrap_or(candidates);
+            candidates.into_iter().any(|candidate| {
+                let parent = ctx
+                    .rust
+                    .structural_parent_of(&candidate)
+                    .or_else(|| ctx.rust.parent_of(&candidate));
+                let owner_matches = expected_owner.is_none_or(|expected| {
+                    parent.as_ref().is_some_and(|parent| {
+                        is_rust_trait_declaration(ctx.rust, parent)
+                            || canonical_member_owner(ctx.rust, parent.clone()) == *expected
+                    })
                 });
-            let identity_matches = same_rust_declaration_identity(&candidate, ctx.requested_target)
-                || mapped_trait.as_ref().is_some_and(|trait_member| {
-                    same_rust_declaration_identity(trait_member, ctx.requested_target)
-                });
-            (directly_visible || unindexed_trait_impl_visible_through_owner)
-                && owner_matches
-                && identity_matches
-        }),
+                let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
+                    .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
+                    .flatten();
+                let enum_parent = ctx
+                    .target_is_enum_variant
+                    .then_some(parent.as_ref())
+                    .flatten()
+                    .filter(|parent| is_rust_enum_declaration(ctx.rust, parent));
+                let visibility_declaration =
+                    mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
+                let directly_visible = usage_declaration_visible_at(
+                    ctx.rust,
+                    visibility_declaration,
+                    ctx.file,
+                    owner_node.start_byte(),
+                );
+                let unindexed_trait_impl_visible_through_owner = mapped_trait.is_none()
+                    && is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
+                    && is_graph_visible_member_target(ctx.rust, &candidate)
+                    && parent.as_ref().is_some_and(|owner| {
+                        usage_declaration_visible_at(
+                            ctx.rust,
+                            owner,
+                            ctx.file,
+                            owner_node.start_byte(),
+                        )
+                    });
+                let identity_matches = if applicability_selected {
+                    candidate == *ctx.requested_target
+                        || mapped_trait
+                            .as_ref()
+                            .is_some_and(|trait_member| trait_member == ctx.requested_target)
+                } else {
+                    same_rust_declaration_identity(&candidate, ctx.requested_target)
+                        || mapped_trait.as_ref().is_some_and(|trait_member| {
+                            same_rust_declaration_identity(trait_member, ctx.requested_target)
+                        })
+                };
+                (applicability_selected
+                    || directly_visible
+                    || unindexed_trait_impl_visible_through_owner)
+                    && owner_matches
+                    && identity_matches
+            })
+        }
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }

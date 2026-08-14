@@ -11,7 +11,7 @@ use crate::graph::resolver::{
     qualified_candidate_text, receiver_type_matches, static_receiver_matches,
 };
 use crate::graph::syntax::{
-    assignment_parts, declared_callable_return_type_fq_name, instance_receiver_type_fq_name,
+    assignment_parts, direct_call_return_type_fq_name, instance_receiver_type_fq_name,
     is_local_scope, literal_member_identifier, object_creation_type, seed_parameter_types,
     static_member_parts, static_property_identifier, static_scope_type_fq_name,
     variable_identifier,
@@ -615,51 +615,26 @@ fn assignment_receiver_type(
     match node.kind() {
         "object_creation_expression" => object_creation_type(node)
             .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
-        "function_call_expression" => {
-            let function = node.child_by_field_name("function")?;
-            let raw = qualified_candidate_text(function, source);
-            let candidates = resolve_php_function(&raw, ctx)?;
-            let callable_fqn = bound_callable(&candidates, analyzer);
-            let mut definitions = analyzer
-                .index
-                .definitions(callable_fqn)
-                .filter(|unit| unit.is_function());
-            let callable = definitions.next()?;
-            if definitions.next().is_some() {
-                return None;
-            }
-            declared_callable_return_type_fq_name(php, analyzer, &callable)
-        }
-        "scoped_call_expression" => {
-            let (scope, name) = static_member_parts(node)?;
-            let enclosing_owner = enclosing_owner_fq_name_at(
-                analyzer,
-                file,
-                scope.start_byte(),
-                scope.end_byte(),
-                line_starts,
-            );
-            let owner = static_scope_type_fq_name(
+        "function_call_expression" | "scoped_call_expression" => {
+            let enclosing_owner = (node.kind() == "scoped_call_expression")
+                .then(|| {
+                    enclosing_owner_fq_name_at(
+                        analyzer,
+                        file,
+                        node.start_byte(),
+                        node.end_byte(),
+                        line_starts,
+                    )
+                })
+                .flatten();
+            direct_call_return_type_fq_name(
                 php,
                 analyzer,
-                node_text(scope, source),
+                node,
+                source,
                 ctx,
                 enclosing_owner.as_deref(),
-            )?;
-            let method = node_text(name, source);
-            if method.is_empty() {
-                return None;
-            }
-            let callable_fqn = format!("{owner}.{method}");
-            let mut definitions = analyzer
-                .index
-                .definitions(&callable_fqn)
-                .filter(|unit| unit.is_function());
-            let callable = definitions.next()?;
-            if definitions.next().is_some() {
-                return None;
-            }
-            declared_callable_return_type_fq_name(php, analyzer, &callable)
+            )
         }
         "parenthesized_expression" => node.named_child(0).and_then(|inner| {
             assignment_receiver_type(inner, php, analyzer, file, source, line_starts, ctx)

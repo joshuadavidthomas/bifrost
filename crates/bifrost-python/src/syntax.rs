@@ -1,7 +1,7 @@
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Default)]
 pub struct PythonOverloadDecoratorBindings {
@@ -191,6 +191,39 @@ pub fn python_deferred_annotation_identifier_ranges(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Vec<Range>> {
+    let tree = python_deferred_annotation_tree(string, source, cancellation)?;
+
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(current) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        if current.kind() == "identifier" {
+            ranges.push(Range {
+                start_byte: current.start_byte(),
+                end_byte: current.end_byte(),
+                start_line: current.start_position().row + 1,
+                end_line: current.end_position().row + 1,
+            });
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(ranges)
+}
+
+/// Parse one quoted annotation expression while preserving its original source
+/// byte coordinates. Literal string values and arbitrary strings are rejected
+/// by the same structured gate used by inverse membership.
+pub fn python_deferred_annotation_tree(
+    string: Node<'_>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Tree> {
     if string.kind() != "string"
         || string
             .parent()
@@ -221,28 +254,7 @@ pub fn python_deferred_annotation_identifier_ranges(
     if tree.root_node().has_error() {
         return None;
     }
-
-    let mut ranges = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(current) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return None;
-        }
-        if current.kind() == "identifier" {
-            ranges.push(Range {
-                start_byte: current.start_byte(),
-                end_byte: current.end_byte(),
-                start_line: current.start_position().row + 1,
-                end_line: current.end_position().row + 1,
-            });
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    Some(ranges)
+    Some(tree)
 }
 
 /// Whether `string` is a value argument of `Literal[...]`, rather than a

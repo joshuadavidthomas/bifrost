@@ -492,6 +492,39 @@ pub fn compute_using_namespaces_of(source: &dyn CSharpSource, file: &ProjectFile
     namespaces
 }
 
+/// The ordinary namespace `using` directives written in `file`, excluding
+/// workspace `global using` directives. Visible-type lookup keeps this set as
+/// a distinct precedence tier so a global directive from another compilation
+/// cannot make a file-local import ambiguous (#2060).
+pub fn file_using_namespaces(source: &dyn CSharpSource, file: &ProjectFile) -> Vec<String> {
+    source
+        .import_info_of(file)
+        .iter()
+        .filter(|import| !import.is_global)
+        .filter_map(csharp_using_namespace)
+        .collect()
+}
+
+/// [`file_using_namespaces`] under a store-row budget.
+pub fn file_using_namespaces_limited(
+    source: &dyn CSharpSource,
+    file: &ProjectFile,
+    limit: usize,
+) -> LimitedQueryRows<String> {
+    let imports = source.import_info_of_limited(file, limit);
+    let namespaces = imports
+        .rows
+        .into_iter()
+        .filter(|import| !import.is_global)
+        .filter_map(|import| csharp_using_namespace(&import))
+        .collect();
+    if imports.complete {
+        LimitedQueryRows::complete(namespaces, imports.inspected)
+    } else {
+        LimitedQueryRows::incomplete(namespaces, imports.inspected)
+    }
+}
+
 /// The uncached half of the analyzer's `using_namespaces_of_limited`.
 pub fn compute_using_namespaces_of_limited(
     source: &dyn CSharpSource,
@@ -1047,7 +1080,12 @@ fn visible_type_candidates_inner(
 ) -> Vec<CodeUnit> {
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
-    let mut using_namespaces = || Some(source.using_namespaces_of(file));
+    let mut file_using_namespaces = || Some(file_using_namespaces(source, file));
+    let mut global_using_namespaces = || {
+        let mut namespaces: Vec<_> = source.global_using_namespaces().iter().cloned().collect();
+        namespaces.sort();
+        Some(namespaces)
+    };
     let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
     let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, fqn, usage));
     visible_type_candidates_with_lookups(
@@ -1055,7 +1093,8 @@ fn visible_type_candidates_inner(
         resolve_aliases,
         &mut using_aliases,
         &mut namespace_of_file,
-        &mut using_namespaces,
+        &mut file_using_namespaces,
+        &mut global_using_namespaces,
         &mut namespace_exists,
         &mut type_candidates,
     )
@@ -1073,7 +1112,8 @@ fn visible_type_candidates_inner(
 pub fn visible_type_candidates_with_lookups<
     Aliases,
     Namespace,
-    Usings,
+    FileUsings,
+    GlobalUsings,
     NamespaceExists,
     Candidates,
 >(
@@ -1081,14 +1121,16 @@ pub fn visible_type_candidates_with_lookups<
     resolve_aliases: bool,
     using_aliases: &mut Aliases,
     namespace_of_file: &mut Namespace,
-    using_namespaces: &mut Usings,
+    file_using_namespaces: &mut FileUsings,
+    global_using_namespaces: &mut GlobalUsings,
     namespace_exists: &mut NamespaceExists,
     type_candidates_by_fqn: &mut Candidates,
 ) -> Vec<CodeUnit>
 where
     Aliases: FnMut() -> Option<Arc<HashMap<String, String>>>,
     Namespace: FnMut() -> Option<String>,
-    Usings: FnMut() -> Option<Vec<String>>,
+    FileUsings: FnMut() -> Option<Vec<String>>,
+    GlobalUsings: FnMut() -> Option<Vec<String>>,
     NamespaceExists: FnMut(&str) -> bool,
     Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
 {
@@ -1124,7 +1166,8 @@ where
             false,
             using_aliases,
             namespace_of_file,
-            using_namespaces,
+            file_using_namespaces,
+            global_using_namespaces,
             namespace_exists,
             type_candidates_by_fqn,
         );
@@ -1155,26 +1198,32 @@ where
         }
     }
 
-    let mut visible = Vec::new();
-    let Some(namespaces) = using_namespaces() else {
+    let Some(namespaces) = file_using_namespaces() else {
         return Vec::new();
     };
-    for using_namespace in namespaces {
-        // This one is gated whatever `normalized` looks like: the filter below
-        // already keeps only candidates whose namespace is the `using` itself.
-        if !namespace_exists(&using_namespace) {
-            continue;
-        }
-        let Some(candidates) = type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"))
-        else {
-            return Vec::new();
-        };
-        visible.extend(
-            candidates
-                .into_iter()
-                .filter(|candidate| candidate.package_name() == using_namespace),
-        );
+    let Some(visible) = visible_types_from_using_namespaces(
+        namespaces,
+        &normalized,
+        namespace_exists,
+        type_candidates_by_fqn,
+    ) else {
+        return Vec::new();
+    };
+    if !visible.is_empty() {
+        return visible;
     }
+
+    let Some(namespaces) = global_using_namespaces() else {
+        return Vec::new();
+    };
+    let Some(visible) = visible_types_from_using_namespaces(
+        namespaces,
+        &normalized,
+        namespace_exists,
+        type_candidates_by_fqn,
+    ) else {
+        return Vec::new();
+    };
     if !visible.is_empty() {
         return visible;
     }
@@ -1193,6 +1242,33 @@ where
     }
 
     type_candidates_by_fqn(&normalized).unwrap_or_default()
+}
+
+fn visible_types_from_using_namespaces<NamespaceExists, Candidates>(
+    namespaces: Vec<String>,
+    normalized: &str,
+    namespace_exists: &mut NamespaceExists,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<Vec<CodeUnit>>
+where
+    NamespaceExists: FnMut(&str) -> bool,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let mut visible = Vec::new();
+    for using_namespace in namespaces {
+        // This one is gated whatever `normalized` looks like: the filter below
+        // already keeps only candidates whose namespace is the `using` itself.
+        if !namespace_exists(&using_namespace) {
+            continue;
+        }
+        let candidates = type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"))?;
+        visible.extend(
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.package_name() == using_namespace),
+        );
+    }
+    Some(visible)
 }
 
 pub fn resolve_visible_type(

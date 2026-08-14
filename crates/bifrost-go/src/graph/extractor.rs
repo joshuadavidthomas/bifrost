@@ -15,11 +15,12 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::graph::ast::{
-    NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_type_for_key,
-    field_owner_token, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, is_method_receiver_type_name, lhs_identifier_slots,
-    parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
-    type_ref_from_node, var_spec_name_slots, var_spec_names,
+    NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_path_for_key,
+    composite_literal_owner_type_for_key, field_owner_token, for_each_var_spec,
+    is_definition_identifier, is_identifier_node, is_method_receiver_parameter,
+    is_method_receiver_type_name, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_name_slots, var_spec_names,
 };
 use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
 use crate::graph::reference::go_is_top_level_decl;
@@ -646,22 +647,34 @@ fn scan_direct_identifier(
 /// distinguishes `Owner{Field: value}` from `map[string]T{Field: value}` and
 /// from another struct with a same-named field.
 fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
-    let Some(type_node) = composite_literal_owner_type_for_key(node) else {
+    let Some(path) = composite_literal_owner_path_for_key(node) else {
         return false;
     };
+    let direct_owner = composite_literal_owner_type_for_key(node);
     // A keyed element in a map, array, or slice literal is an ordinary key or
     // index expression, not a struct-field label. Let the normal identifier or
     // selector scanners resolve it. The explicit composite-literal type is the
     // structured distinction; guessing from the key spelling would conflate
     // same-named fields and constants.
-    if matches!(type_node.kind(), "map_type" | "array_type" | "slice_type") {
+    if direct_owner.is_some_and(|type_node| {
+        matches!(type_node.kind(), "map_type" | "array_type" | "slice_type")
+    }) {
         return false;
     }
-    if node_text(node, ctx.source) == ctx.spec.identifier
-        && type_ref_from_node(type_node, ctx.source)
-            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
-    {
-        record_hit(node, ctx);
+    if node_text(node, ctx.source) == ctx.spec.identifier {
+        let direct_match = direct_owner
+            .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty));
+        let indexed_match = type_ref_from_node(path.type_node, ctx.source).is_some_and(|outer| {
+            ctx.graph
+                .edge_index
+                .composite_literal_owner_fqns(ctx.file, &outer, &path.steps)
+                .into_iter()
+                .any(|owner| ctx.spec.matches_receiver_fqn(&owner))
+        });
+        if direct_match || indexed_match {
+            record_hit(node, ctx);
+        }
     }
     true
 }

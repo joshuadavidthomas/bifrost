@@ -1,5 +1,6 @@
 use crate::aliases::{PhpFileContext, resolve_php_type};
 use crate::graph::PhpGraphSource;
+use crate::graph::syntax::static_member_parts;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_is_interface;
 use brokk_bifrost_core::analyzer::model::Range;
@@ -275,6 +276,75 @@ pub fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
 pub fn is_const_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "const_element")
+}
+
+/// Whether this terminal is a PHP namespace or constant declaration name.
+///
+/// Namespace declarations establish the file's scope but do not declare a
+/// navigable CodeUnit for each path segment. Constant declaration names are
+/// likewise binders rather than references. Keep this interpretation in the
+/// PHP crate so census and graph consumers share the grammar contract.
+pub fn is_declaration_name(node: Node<'_>) -> bool {
+    if is_const_declaration_name(node) {
+        return true;
+    }
+
+    let mut path = node;
+    while path
+        .parent()
+        .is_some_and(|parent| matches!(parent.kind(), "namespace_name" | "qualified_name"))
+    {
+        path = path.parent().expect("checked PHP name parent");
+    }
+    path.parent().is_some_and(|parent| {
+        parent.kind() == "namespace_definition" && parent.child_by_field_name("name") == Some(path)
+    })
+}
+
+/// Whether a PHP identifier recovered below an ERROR node still has a precise
+/// reference role suitable for inverse-membership backing.
+///
+/// This is deliberately narrower than the ordinary PHP reference frontier.
+/// The grammar retains the static scope and nullsafe member-name fields even
+/// when newer surrounding syntax recovers as ERROR. Arbitrary recovery leaves
+/// and dynamic names remain excluded.
+pub fn is_recovered_membership_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if matches!(
+        parent.kind(),
+        "nullsafe_member_access_expression" | "nullsafe_member_call_expression"
+    ) && parent.child_by_field_name("name") == Some(node)
+    {
+        return node.kind() == "name";
+    }
+
+    if node.kind() != "name" {
+        return false;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "scoped_call_expression" {
+            if static_member_parts(parent).is_some_and(|(scope, _)| {
+                scope.start_byte() <= node.start_byte() && scope.end_byte() >= node.end_byte()
+            }) {
+                return true;
+            }
+            return (0..parent.child_count()).any(|index| {
+                parent.child(index) == Some(current)
+                    && parent
+                        .child(index.saturating_add(1))
+                        .is_some_and(|separator| separator.kind() == "::")
+                    && current.end_byte() == node.end_byte()
+            });
+        }
+        if !matches!(parent.kind(), "namespace_name" | "qualified_name" | "ERROR") {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 pub fn is_function_declaration_name(node: Node<'_>) -> bool {

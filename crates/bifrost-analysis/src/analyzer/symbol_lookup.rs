@@ -320,7 +320,7 @@ pub(crate) fn resolve_codeunit_fuzzy_bounded_with(
         let query = query_paths_by_language.entry(language).or_insert_with(|| {
             let paths: BTreeSet<Vec<String>> = query_inputs
                 .iter()
-                .flat_map(|query| query_symbol_interpretations(language, query))
+                .flat_map(|query| resolution_query_interpretations(language, query))
                 .collect();
             let terminals = paths
                 .iter()
@@ -532,7 +532,7 @@ fn suffix_stage_from_index(
     let query_paths_by_language: BTreeMap<_, BTreeSet<_>> = analyzer
         .languages()
         .into_iter()
-        .map(|language| (language, query_symbol_interpretations(language, symbol)))
+        .map(|language| (language, resolution_query_interpretations(language, symbol)))
         .collect();
     let terminal_identifiers: BTreeSet<_> = query_paths_by_language
         .values()
@@ -603,7 +603,7 @@ fn suffix_stage_from_index(
     let mut suffix_matches = BTreeMap::new();
     for language in analyzer.languages() {
         budget.keep_going()?;
-        let query_paths = query_symbol_interpretations(language, symbol);
+        let query_paths = resolution_query_interpretations(language, symbol);
         if query_paths.iter().all(|path| path.len() < 2) {
             continue;
         }
@@ -938,6 +938,42 @@ fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
     insert_path_variants(&mut paths, language, &code_unit.fq_name());
     insert_path_variants(&mut paths, language, code_unit.short_name());
     insert_path_variants(&mut paths, language, code_unit.identifier());
+    // The recorded segment boundaries, which the three re-parses above cannot
+    // recover. `parse_symbol_path` splits on `.`, `/`, `\` and `+` because it
+    // is reading a string with no structure attached; a real segment can
+    // contain all of them (a JS/TS object-literal key such as
+    // `"data/web-interface.csv"` is one recorded `Member` segment, a Go
+    // import-path head is one `Path` segment spelled `github.com`). Without
+    // this alias no query could ever match such a declaration by its terminal
+    // name, because both sides were being shredded the same wrong way (#2111).
+    let structured = code_unit.fq_segment_texts();
+    if !structured.is_empty() {
+        paths.insert(structured);
+    }
+    paths
+}
+
+/// The readings of a user-supplied selector that *resolution* compares against
+/// [`codeunit_lookup_aliases`]: [`query_symbol_interpretations`] plus, when
+/// every split reading is multi-segment, the input read as a single terminal
+/// segment.
+///
+/// The split readings alone cannot address a declaration whose terminal segment
+/// contains a delimiter character: `data/web-interface.csv` splits into three
+/// segments and seeks the identifier index for `csv`, which names nothing. The
+/// unsplit reading seeks the identifier the extractor actually recorded, so the
+/// declaration is matched on its structured boundary instead of a re-guessed
+/// one (#2111).
+///
+/// Only the resolution stages use this. [`symbol_selector_leaf`] and
+/// [`bare_query_leaf`] must keep answering with the *canonical* terminal of a
+/// qualified query, which is the split reading's leaf.
+fn resolution_query_interpretations(language: Language, input: &str) -> BTreeSet<Vec<String>> {
+    let mut paths = query_symbol_interpretations(language, input);
+    let trimmed = input.trim();
+    if !trimmed.is_empty() && paths.iter().all(|path| path.len() > 1) {
+        paths.insert(vec![trimmed.to_string()]);
+    }
     paths
 }
 

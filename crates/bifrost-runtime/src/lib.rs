@@ -1,9 +1,10 @@
 //! Protocol-neutral code-intelligence runtime for Bifrost hosts.
 //!
-//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
-//! depend on `brokk-bifrost` instead.
+//! [`extension`] is the supported application boundary. Other exports are host
+//! implementation interfaces and carry no compatibility guarantee.
 
 pub mod code_intelligence;
+pub mod extension;
 
 pub use brokk_bifrost_analysis::{CancellationToken, analyzer};
 pub use brokk_bifrost_policy as policy;

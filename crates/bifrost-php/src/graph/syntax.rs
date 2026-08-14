@@ -1,6 +1,6 @@
 use super::resolver::node_text;
 use crate::adapter::php_signature_return_type_text;
-use crate::aliases::{PhpFileContext, resolve_php_type};
+use crate::aliases::{PhpFileContext, resolve_php_function_node, resolve_php_type};
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
@@ -152,6 +152,61 @@ pub fn declared_callable_return_type_fq_name(
         .or_else(|| signature_declared_type_fq_name(php, analyzer, callable))
 }
 
+/// Resolve the declared object return type of one literal free or scoped PHP
+/// call. Dynamic callable names and ambiguous physical declarations fail
+/// closed. This is shared by direct receiver chains and assignment inference so
+/// both usage-graph surfaces apply the same namespace and relative-scope rules.
+pub fn direct_call_return_type_fq_name(
+    php: &dyn PhpSource,
+    analyzer: PhpGraphSource<'_>,
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    enclosing_owner: Option<&str>,
+) -> Option<String> {
+    let callable_fq_name = match node.kind() {
+        "function_call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            let candidates = resolve_php_function_node(function, source, ctx, || true)?;
+            candidates
+                .first_indexed(|candidate| {
+                    analyzer
+                        .index
+                        .definitions(candidate)
+                        .any(|unit| unit.is_function())
+                })
+                .to_string()
+        }
+        "scoped_call_expression" => {
+            let (scope, member) = static_member_parts(node)?;
+            let owner = static_scope_type_fq_name(
+                php,
+                analyzer,
+                node_text(scope, source),
+                ctx,
+                enclosing_owner,
+            )?;
+            let member = literal_member_identifier(member, source)?;
+            format!("{owner}.{member}")
+        }
+        _ => return None,
+    };
+
+    if let Some(return_type) = analyzer.facts.callable_return_type_fqn(&callable_fq_name) {
+        return Some(return_type);
+    }
+
+    let mut definitions = analyzer
+        .index
+        .definitions(&callable_fq_name)
+        .filter(CodeUnit::is_function);
+    let callable = definitions.next()?;
+    if definitions.next().is_some() {
+        return None;
+    }
+    declared_callable_return_type_fq_name(php, analyzer, &callable)
+}
+
 /// Resolve the declared object type of a PHP instance receiver without walking
 /// the source tree recursively. Method-call and field-access chains are reduced
 /// from their innermost receiver outward, and every step fails closed unless it
@@ -207,6 +262,21 @@ where
                             {
                                 resolved.insert(node.id(), value);
                             }
+                        }
+                    }
+                    "function_call_expression" | "scoped_call_expression" => {
+                        let owner = (node.kind() == "scoped_call_expression")
+                            .then(|| enclosing_owner(node.start_byte(), node.end_byte()))
+                            .flatten();
+                        if let Some(value) = direct_call_return_type_fq_name(
+                            php,
+                            analyzer,
+                            node,
+                            source,
+                            ctx,
+                            owner.as_deref(),
+                        ) {
+                            resolved.insert(node.id(), value);
                         }
                     }
                     "parenthesized_expression"

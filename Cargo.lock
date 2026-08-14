@@ -512,7 +512,9 @@ version = "0.9.5"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

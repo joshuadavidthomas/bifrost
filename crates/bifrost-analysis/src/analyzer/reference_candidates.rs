@@ -2,9 +2,15 @@ use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
+use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
+use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
+use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
 use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
+use brokk_bifrost_rust::declarations::rust_node_text;
+use brokk_bifrost_rust::graph::ast::is_rust_declaration_name;
+use brokk_bifrost_rust::lexical_scope::is_pattern_binding_identifier;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,10 +127,13 @@ pub fn census_identifier_ranges(
         .expect("non-cancellable collection cannot be cancelled")
 }
 
-/// The raw identifier membership used to validate inverse hits independently
-/// of probe eligibility. It retains the census contract and additionally
-/// includes grammar nodes that are simultaneous source references and binders,
-/// such as JS/TS shorthand destructuring properties (#2037).
+/// The identifier membership used to validate inverse hits independently of
+/// probe eligibility. It retains the census contract and additionally includes
+/// grammar nodes that are simultaneous source references and binders, such as
+/// JS/TS shorthand destructuring properties (#2037). Java membership also
+/// descends parser-recovery subtrees while excluding structured declaration and
+/// label roles: valid inverse references remain backed without proposing those
+/// recovery tokens as forward census sites (#2086).
 pub fn census_membership_identifier_ranges(
     root: Node<'_>,
     language: Language,
@@ -248,8 +257,8 @@ fn collect_candidate_ranges(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Option<ReferenceCandidateRanges> {
     let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, false)];
+    while let Some((node, inside_error)) = stack.pop() {
         if is_cancelled() {
             return None;
         }
@@ -263,13 +272,14 @@ fn collect_candidate_ranges(
         // leaves the rest of the file proposed. The index-filtered and
         // semantic-token frontiers keep their existing reach, because the LSP
         // still colors and resolves inside a broken edit.
-        if matches!(
-            frontier,
-            CandidateFrontier::Census | CandidateFrontier::CensusMembership
-        ) && node.is_error()
+        if (matches!(frontier, CandidateFrontier::Census)
+            || (matches!(frontier, CandidateFrontier::CensusMembership)
+                && !matches!(language, Language::Java | Language::Php)))
+            && node.is_error()
         {
             continue;
         }
+        let inside_error = inside_error || node.is_error();
         let compound = matches!(
             frontier,
             CandidateFrontier::References
@@ -293,6 +303,11 @@ fn collect_candidate_ranges(
                         && node.kind() == "shorthand_property_identifier_pattern")
             }
         };
+        let candidate = candidate
+            && !(inside_error
+                && language == Language::Php
+                && matches!(frontier, CandidateFrontier::CensusMembership)
+                && !php_is_recovered_membership_reference(node));
         if candidate
             && !is_excluded_reference_candidate(language, node, frontier)
             && (node.named_child_count() == 0 || compound)
@@ -313,7 +328,7 @@ fn collect_candidate_ranges(
 
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            stack.push(child);
+            stack.push((child, inside_error));
         }
     }
     ranges.sort_unstable();
@@ -345,6 +360,12 @@ fn is_excluded_reference_candidate(
     {
         return true;
     }
+    if language == Language::Java
+        && matches!(frontier, CandidateFrontier::CensusMembership)
+        && (java_is_declaration_name(node) || java_is_label_name(node))
+    {
+        return true;
+    }
     if !matches!(frontier, CandidateFrontier::References) {
         return false;
     }
@@ -357,6 +378,15 @@ fn is_excluded_reference_candidate(
         Language::JavaScript | Language::TypeScript => is_export_alias_identifier(node),
         _ => false,
     }
+}
+
+fn java_is_label_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "labeled_statement" | "break_statement" | "continue_statement"
+        )
+    })
 }
 
 /// Whether a Go identifier occupies a declaration or import binding role.
@@ -385,6 +415,36 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
             || (parent.kind() == "package_clause"
                 && matches!(node.kind(), "identifier" | "package_identifier"))
     })
+}
+
+/// Whether a PHP terminal is a namespace or constant declaration name rather
+/// than a definition probe. The language-owned helper remains the source of
+/// truth; this analysis facade keeps the root runner independent of language
+/// crate dependencies.
+pub fn php_is_declaration_name(node: Node<'_>) -> bool {
+    php_declaration_name(node)
+}
+
+/// Whether a Rust identifier is the name field of an indexed item declaration.
+///
+/// The language-owned AST helper is shared with diagnostics and usage scans;
+/// the analysis facade exposes it to the corpus runner without duplicating the
+/// Rust grammar's declaration-kind list.
+pub fn rust_is_declaration_name(node: Node<'_>) -> bool {
+    is_rust_declaration_name(node)
+}
+
+/// Whether the Rust parser reads this identifier as a local binding pattern.
+///
+/// Bare enum variants in match patterns share this syntax, so callers must
+/// retain a site when indexed enum-variant evidence exists for the spelling.
+pub fn rust_is_pattern_binding_name(node: Node<'_>) -> bool {
+    is_pattern_binding_identifier(node)
+}
+
+/// Canonical source spelling for one Rust identifier-like node.
+pub fn rust_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    rust_node_text(node, source)
 }
 
 fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
@@ -732,6 +792,76 @@ mod tests {
             python_deferred_annotation_membership_ranges(tree.root_node(), source, 4),
             ReferenceCandidateRanges::LimitExceeded { limit: 4, .. }
         ));
+    }
+
+    #[test]
+    fn java_census_membership_backs_recovered_references_without_proposing_them() {
+        let source = concat!(
+            "@interface Nullable {}\n",
+            "class Ticket {}\n",
+            "class Use {\n",
+            "  void trigger(Ticket @Nullable [] tickets) {}\n",
+            "  void recovered(Ticket @Nullable ... keys) {}\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::Java, "Use.java", source);
+        let membership = census_membership_offsets(Language::Java, "Use.java", source);
+        let recovered_type = source
+            .find("Ticket @Nullable ...")
+            .expect("recovered type reference");
+        let recovered_parameter = source.find("keys)").expect("recovered parameter");
+
+        assert!(
+            !census.contains(&recovered_type),
+            "the forward census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&recovered_type),
+            "the valid type reference must back inverse precision: {membership:?}"
+        );
+        assert!(
+            !membership.contains(&recovered_parameter),
+            "the recovered parameter declaration is not a reference: {membership:?}"
+        );
+    }
+
+    #[test]
+    fn php_census_membership_backs_only_structured_references_inside_recovery() {
+        let source = r#"<?php
+namespace App\Demo;
+
+class Id {
+    public static function make(): self { return new self(); }
+}
+
+class Result {
+    public ?Result $adjacent;
+    public function withInput(): self { return $this; }
+    public function copy(): self {
+        return clone($this, [
+            'id' => Id::make(),
+            'next' => $this->adjacent?->withInput(),
+            'noise' => unknown_token,
+        ]);
+    }
+}
+"#;
+        let census = census_offsets(Language::Php, "Use.php", source);
+        let membership = census_membership_offsets(Language::Php, "Use.php", source);
+        let static_scope = source.find("Id::make").expect("static scope");
+        let nullsafe_member = source.find("withInput(),").expect("nullsafe member call");
+        let arbitrary_recovery = source.rfind("unknown_token").expect("recovery noise");
+
+        assert!(
+            !census.contains(&static_scope) && !census.contains(&nullsafe_member),
+            "ordinary census must continue to skip ERROR subtrees: {census:?}"
+        );
+        assert!(membership.contains(&static_scope), "{membership:?}");
+        assert!(membership.contains(&nullsafe_member), "{membership:?}");
+        assert!(
+            !membership.contains(&arbitrary_recovery),
+            "arbitrary recovery leaves are not membership references: {membership:?}"
+        );
     }
 
     /// Tree-sitter error recovery destroys enclosing declaration nodes: a

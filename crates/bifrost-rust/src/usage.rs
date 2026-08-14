@@ -108,7 +108,7 @@ impl RustSymbolNamespace {
         }
     }
 
-    fn accepts(self, reference: RustReferenceNamespace) -> bool {
+    pub fn accepts(self, reference: RustReferenceNamespace) -> bool {
         matches!(reference, RustReferenceNamespace::Any)
             || matches!(
                 (self, reference),
@@ -318,6 +318,9 @@ pub struct RustOriginRoute {
     pub importer_module: ModuleKey,
     pub extent: RustImportExtent,
     pub path: Vec<String>,
+    /// Whether this route came from `use path::*`. Glob imports have lower
+    /// name-resolution precedence than explicit imports and local items.
+    pub is_glob_import: bool,
     pub namespace: RustSymbolNamespace,
     pub origin: RustSymbolIdentity,
     pub domain: Domain,
@@ -371,6 +374,10 @@ impl RustBindingSeeds {
         self.identities
             .iter()
             .map(|identity| identity.name.as_str())
+    }
+
+    pub fn verified_importer_files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.edges_by_importer.keys()
     }
 
     pub fn identities_in_file<'a>(
@@ -1523,7 +1530,7 @@ pub fn usage_reference_at(
     // import is the answer rather than one of two competing ones (#1377).
     let local_import_visible = origin_routes
         .iter()
-        .any(|route| route.extent.is_local_only());
+        .any(|route| !route.is_glob_import && route.extent.is_local_only());
     let mut matches: HashSet<RustSymbolIdentity> = origin_routes
         .iter()
         .map(|route| route.origin.clone())
@@ -1532,8 +1539,21 @@ pub fn usage_reference_at(
     // guards are proven disjoint read as alternatives of one declaration.
     let mut candidate_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
         HashMap::default();
+    let mut higher_precedence_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+        HashMap::default();
+    let mut glob_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+        HashMap::default();
     for route in &origin_routes {
         candidate_conditions
+            .entry(route.origin.clone())
+            .or_default()
+            .push(route.cfg_condition.clone());
+        let conditions = if route.is_glob_import {
+            &mut glob_conditions
+        } else {
+            &mut higher_precedence_conditions
+        };
+        conditions
             .entry(route.origin.clone())
             .or_default()
             .push(route.cfg_condition.clone());
@@ -1632,14 +1652,34 @@ pub fn usage_reference_at(
                 })
                 .map(|(identity, _)| identity)
             {
+                let declared_conditions = walks
+                    .declared_cfg_conditions_of(&identity)
+                    .unwrap_or_else(|| vec![RustCfgCondition::Unknown]);
                 candidate_conditions
                     .entry(identity.clone())
-                    .or_insert_with(|| {
-                        walks
-                            .declared_cfg_conditions_of(&identity)
-                            .unwrap_or_else(|| vec![RustCfgCondition::Unknown])
-                    });
+                    .or_insert_with(|| declared_conditions.clone());
+                higher_precedence_conditions
+                    .entry(identity.clone())
+                    .or_insert(declared_conditions);
                 matches.insert(identity);
+            }
+        }
+        // Rust glob imports are the lowest-precedence way to introduce a name.
+        // Keep a glob candidate only when no explicit import or same-module
+        // declaration can be active at the same time. Mutually exclusive cfg
+        // arms remain peers so each target can still receive the shared site.
+        for (identity, conditions) in &glob_conditions {
+            if higher_precedence_conditions.contains_key(identity) {
+                continue;
+            }
+            let shadowed = higher_precedence_conditions
+                .values()
+                .any(|higher_conditions| {
+                    !cfg_conditions_proven_disjoint(higher_conditions, conditions)
+                });
+            if shadowed {
+                matches.remove(identity);
+                candidate_conditions.remove(identity);
             }
         }
         if matches.is_empty() {

@@ -153,8 +153,29 @@ impl<'a> CSharpDefinitionProvider<'a> {
             self.observe_cancellation().then_some(aliases)
         };
         let mut namespace_of_file = || self.namespace_of_file(file);
-        let mut using_namespaces = || {
-            let namespaces = self.using_namespaces(file);
+        let mut file_using_namespaces = || {
+            let namespaces = match self.session {
+                Some(session) => session.query_limited_rows(|limit| {
+                    graph_support::file_using_namespaces_limited(self.csharp, file, limit)
+                }),
+                None => graph_support::file_using_namespaces(self.csharp, file),
+            };
+            self.observe_cancellation().then_some(namespaces)
+        };
+        let mut global_using_namespaces = || {
+            let mut namespaces: Vec<_> = match self.session {
+                Some(session) => session.query_limited_rows(|limit| {
+                    self.csharp
+                        .global_using_namespaces_limited(limit, || session.observe_cancellation())
+                }),
+                None => self
+                    .csharp
+                    .global_using_namespaces()
+                    .iter()
+                    .cloned()
+                    .collect(),
+            };
+            namespaces.sort();
             self.observe_cancellation().then_some(namespaces)
         };
         // Not `package_exists`: that answers `false` for a namespace the budget
@@ -177,7 +198,8 @@ impl<'a> CSharpDefinitionProvider<'a> {
             true,
             &mut using_aliases,
             &mut namespace_of_file,
-            &mut using_namespaces,
+            &mut file_using_namespaces,
+            &mut global_using_namespaces,
             &mut namespace_exists,
             &mut type_candidates_by_fqn,
         )
@@ -559,6 +581,14 @@ fn resolve_csharp_in_session(
         }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
+            if csharp_alias_qualified_boundary(definitions, file, type_node, source) {
+                // gated upstream: the alias target names neither an indexed
+                // type nor an indexed namespace, so the qualifier itself is
+                // structured evidence that this reference leaves the workspace.
+                return boundary_unchecked(format!(
+                    "`{reference}` appears to cross a C# using-alias boundary not indexed in this workspace"
+                ));
+            }
             if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
                 analyzer,
                 definitions,
@@ -1775,8 +1805,10 @@ fn csharp_reference_node<'tree>(
         if !definitions.scope_step() {
             return None;
         }
-        if (matches!(parent.kind(), "generic_name" | "qualified_name")
-            && parent.start_byte() <= current.start_byte()
+        if (matches!(
+            parent.kind(),
+            "generic_name" | "qualified_name" | "alias_qualified_name"
+        ) && parent.start_byte() <= current.start_byte()
             && parent.end_byte() >= current.end_byte())
             || (parent.kind() == "member_access_expression"
                 && !csharp_member_access_receiver(parent)
@@ -1831,9 +1863,11 @@ fn csharp_reference_node<'tree>(
         "generic_name" if csharp_is_unqualified_invocation_target(current) => {
             Some(CSharpReferenceNode::UnqualifiedMember(current))
         }
-        "qualified_name" | "generic_name" | "nullable_type" | "array_type" => {
-            Some(CSharpReferenceNode::Type(current))
-        }
+        "qualified_name"
+        | "alias_qualified_name"
+        | "generic_name"
+        | "nullable_type"
+        | "array_type" => Some(CSharpReferenceNode::Type(current)),
         _ => None,
     }
 }
@@ -2127,7 +2161,7 @@ fn csharp_attribute_outcome(
         return outcome;
     }
     let reference = names.first().map(String::as_str).unwrap_or_default();
-    let boundary = csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
+    let boundary = csharp_alias_qualified_boundary(definitions, file, name, source)
         || names
             .iter()
             .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name));
@@ -2167,8 +2201,7 @@ fn csharp_attribute_outcome(
     )
 }
 
-fn csharp_attribute_alias_boundary(
-    _csharp: &CSharpAnalyzer,
+fn csharp_alias_qualified_boundary(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: Node<'_>,
@@ -2185,11 +2218,22 @@ fn csharp_attribute_alias_boundary(
                 return false;
             };
             let alias = csharp_node_text(alias, source);
+            let suffix = current
+                .child_by_field_name("name")
+                .map(|name| csharp_reference_type_text(name, source))
+                .unwrap_or_default();
             return definitions
                 .using_aliases(file)
                 .get(alias)
                 .is_some_and(|target| {
-                    !definitions.type_exists(target) && !definitions.package_exists(target)
+                    let qualified = if suffix.is_empty() {
+                        target.clone()
+                    } else {
+                        format!("{target}.{suffix}")
+                    };
+                    !definitions.type_exists(target)
+                        && !definitions.package_exists(target)
+                        && !definitions.type_exists(&qualified)
                 });
         }
         let mut cursor = current.walk();
@@ -2809,6 +2853,13 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if parent.kind() == "parameter" {
+        // A parameter owns both its declaration name and its default-value
+        // expression. The former is filtered as a declaration before this
+        // helper runs; the latter is an ordinary value reference and can name
+        // an enclosing constant or field (#2061).
+        return parent.child_by_field_name("name") != Some(node);
+    }
     if parent.kind() == "member_access_expression" {
         return csharp_member_access_receiver(parent)
             .is_some_and(|receiver| same_node(receiver, node));
@@ -2840,7 +2891,6 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "local_function_statement"
             | "constructor_declaration"
             | "property_declaration"
-            | "parameter"
             | "using_directive"
     )
 }

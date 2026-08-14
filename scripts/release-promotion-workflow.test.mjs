@@ -26,6 +26,10 @@ const agentPluginSmoke = readFileSync(
   new URL("./smoke-agent-plugin-release.mjs", import.meta.url),
   "utf8",
 );
+const contributing = readFileSync(
+  new URL("../CONTRIBUTING.md", import.meta.url),
+  "utf8",
+);
 const semanticPacksManifest = readFileSync(
   new URL("../crates/bifrost-semantic-packs/Cargo.toml", import.meta.url),
   "utf8",
@@ -315,6 +319,11 @@ test("agent plugin release smoke follows the portable manifest and release asset
   for (const tool of ["search_symbols", "list_policies", "run_policy"]) {
     assert.ok(agentPluginSmoke.includes(`tool.name === "${tool}"`));
   }
+  assert.doesNotMatch(agentPluginSmoke, /policies\?\.length,\s*\d+/u);
+  assert.match(agentPluginSmoke, /new Set\(policyIds\)\.size/u);
+  assert.match(agentPluginSmoke, /bifrost\.correctness\.dynamic-evaluation/u);
+  assert.match(contributing, /scripts\/smoke-agent-plugin-release\.mjs/u);
+  assert.match(contributing, /--binary-path "\$\(pwd\)\/target\/release\/bifrost"/u);
   for (const jobName of ["agent-plugin-prepublish-smoke", "agent-plugin-release-smoke"]) {
     const smoke = jobBlock(release, jobName);
     assert.match(smoke, /scripts\/smoke-agent-plugin-release\.mjs/u);

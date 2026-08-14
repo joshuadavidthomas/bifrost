@@ -330,6 +330,22 @@ pub enum TooBroadMatch {
     Declarations,
 }
 
+impl TooBroadMatch {
+    /// The corrective next step for this overflow. One wording, read by both
+    /// the structured [`TooBroadScope::note`] and the rendered text, so the two
+    /// channels can never state different remedies.
+    pub(crate) fn remedy(self) -> &'static str {
+        match self {
+            TooBroadMatch::Files => {
+                "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match."
+            }
+            TooBroadMatch::Declarations => {
+                "Qualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call."
+            }
+        }
+    }
+}
+
 /// A single request target that matched more of the workspace than the
 /// tool will process. The work was skipped, not truncated: `sample`
 /// holds the first `FILE_PATTERN_FANOUT_SAMPLE` matched paths so the
@@ -341,6 +357,15 @@ pub struct TooBroadScope {
     pub cap: usize,
     pub matched_kind: TooBroadMatch,
     pub sample: Vec<String>,
+    /// The corrective next step ([`TooBroadMatch::remedy`]), carried in the
+    /// structured payload and not only in the rendered text.
+    ///
+    /// Every other failure shape a tool result carries states its remedy
+    /// structurally -- `not_found` has its `note`, `ambiguous` its `matches`
+    /// plus note. A too-broad target used to carry a bare count, so a caller
+    /// reading the structured channel got a refusal with no next step in it
+    /// (#2111).
+    pub note: String,
 }
 
 /// The #1908 resolution fan-out reply: the selector's true declaration count
@@ -356,6 +381,7 @@ pub(super) fn too_broad_resolution_candidates(
         cap,
         matched_kind: TooBroadMatch::Declarations,
         sample: Vec::new(),
+        note: TooBroadMatch::Declarations.remedy().to_string(),
     }
 }
 
@@ -375,6 +401,7 @@ fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroa
         cap,
         matched_kind: TooBroadMatch::Files,
         sample,
+        note: TooBroadMatch::Files.remedy().to_string(),
     }
 }
 
@@ -470,6 +497,7 @@ impl GlobFanout {
             cap,
             matched_kind: TooBroadMatch::Files,
             sample: self.sample,
+            note: TooBroadMatch::Files.remedy().to_string(),
         }
     }
 }

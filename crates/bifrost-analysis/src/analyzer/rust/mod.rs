@@ -67,6 +67,7 @@ type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid
 use brokk_bifrost_rust::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 pub(crate) use brokk_bifrost_rust::declarations::{rust_package_name, rust_type_identifiers};
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
+pub use brokk_bifrost_rust::graph::ast::rust_reference_namespace;
 pub(crate) use brokk_bifrost_rust::imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_focused_use_path,
@@ -80,6 +81,7 @@ pub use rustdoc_artifact::RustdocJsonPackProducer;
 
 use brokk_bifrost_rust::graph_support::RustPackageFileIndex;
 pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
+use brokk_bifrost_rust::graph_support::is_rust_enum_variant_declaration;
 pub(crate) use brokk_bifrost_rust::graph_support::{
     forward_export_fqn_from_files, has_rust_value_constructor, is_rust_const_or_static_declaration,
     is_rust_enum_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
@@ -95,13 +97,27 @@ pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
+pub use brokk_bifrost_rust::usage::RustReferenceNamespace;
+use brokk_bifrost_rust::usage::RustSymbolNamespace;
 pub(crate) use brokk_bifrost_rust::usage::{
-    RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
-    usage_binding_seeds, usage_candidate_files_while, usage_crate_export_targets,
-    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
-    usage_importers, usage_local_module_prefix_visible_at, usage_reference_at,
-    usage_root_declaration_matches_at,
+    RustBindingSeeds, usage_binding_local_names, usage_binding_names, usage_binding_seeds,
+    usage_candidate_files_while, usage_crate_export_targets, usage_declaration_visible_at,
+    usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
 };
+
+pub fn rust_declaration_matches_reference_namespace(
+    rust: &RustAnalyzer,
+    declaration: &CodeUnit,
+    reference: RustReferenceNamespace,
+) -> bool {
+    RustSymbolNamespace::of(rust, declaration)
+        .is_some_and(|symbol_namespace| symbol_namespace.accepts(reference))
+}
+
+pub fn rust_declaration_is_enum_variant(rust: &RustAnalyzer, declaration: &CodeUnit) -> bool {
+    is_rust_enum_variant_declaration(rust, declaration)
+}
 
 #[derive(Clone)]
 pub struct RustAnalyzer {
@@ -1352,6 +1368,15 @@ impl LanguageSupport for RustSupport {
         &RUST_USAGE_STRATEGY
     }
 
+    /// Protected: these are the files reached through Rust's re-export and binding graph,
+    /// which the generic import-graph walk cannot see, so a truncated query that dropped
+    /// them would report proven absence for a symbol used through a `pub use`.
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        Some(CandidateAugmentation::protected(
+            rust_usage_candidate_files(ctx.analyzer, ctx.target, ctx.cancellation),
+        ))
+    }
+
     fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
         Some(&RustEdgePass)
     }
@@ -1365,15 +1390,6 @@ impl LanguageSupport for RustSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&RustSupport)
-    }
-
-    /// Protected: these are the files reached through Rust's re-export and binding graph,
-    /// which the generic import-graph walk cannot see, so a truncated query that dropped
-    /// them would report proven absence for a symbol used through a `pub use`.
-    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
-        Some(CandidateAugmentation::protected(
-            rust_usage_candidate_files(ctx.analyzer, ctx.target, ctx.cancellation),
-        ))
     }
 
     /// Pre-build persisted Rust usage facts and the Cargo route index.

@@ -154,6 +154,15 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let candidate_files = scan_scope.candidate_files();
+        // Candidate files bound where references may be reported, not which
+        // declarations may participate in receiver typing. A narrow exact-site
+        // query can still reach an interface through embedded structs declared
+        // in other files/packages (#2072), so build resolution facts from the
+        // candidate/target packages and their transitive workspace imports,
+        // while retaining/scanning only the requested candidate trees. The
+        // complete file inventory lets the Go crate discover that dependency
+        // closure without parsing unrelated packages.
+        let resolution_files = analyzed_files_for_language(analyzer, Language::Go);
         union_candidate_usages(overloads, max_usages, |target| {
             // The graph is seeded from the candidate's own file, so a target
             // group holding declarations in different packages (#1779) builds
@@ -161,6 +170,7 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
             let graph = build_go_graph(
                 go_graph_source(self.go),
                 candidate_files,
+                &resolution_files,
                 target.source(),
                 scan_scope.cancellation(),
             );

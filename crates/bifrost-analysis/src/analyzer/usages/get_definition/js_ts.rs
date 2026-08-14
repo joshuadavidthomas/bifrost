@@ -13,6 +13,7 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
     is_export_alias_identifier, js_program_is_external_module, pattern_binder_identifiers, slice,
+    typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -242,6 +243,23 @@ pub(super) fn resolve_js_ts(
             "local_binding",
             format!("`{reference}` is a local JS/TS binding, which is not indexed"),
         );
+    }
+    if language == Language::TypeScript
+        && !reference.contains(['.', ':'])
+        && let Some(candidates) = focused.and_then(|node| {
+            ts_enclosing_enum_initializer_member_candidates(
+                analyzer, support, file, source, node, site, reference,
+            )
+        })
+    {
+        return if candidates.is_empty() {
+            no_definition(
+                "enum_member_not_visible",
+                format!("`{reference}` is not an earlier member of the enclosing TypeScript enum"),
+            )
+        } else {
+            js_ts_candidates_outcome(analyzer, candidates)
+        };
     }
 
     // AST path for an inline construction receiver `new Foo().member` — the
@@ -606,7 +624,12 @@ pub(super) fn resolve_js_ts(
         .collect();
     let binding_ranges =
         lexical_bindings.binding_identifier_ranges_at(reference, site.focus_start_byte);
-    if !binding_ranges.is_empty() {
+    // TypeScript keeps value and type declarations in separate namespaces. A
+    // visible `const Widget` must narrow a value-position `Widget`, but it must
+    // not hide an `interface Widget` or `type Widget` at an annotation site.
+    // The lexical binding index records value binders, so apply its declaration
+    // range filter only in the value namespace (#2114).
+    if value_position && !binding_ranges.is_empty() {
         same_file.retain(|candidate| {
             analyzer.ranges(candidate).iter().any(|declaration_range| {
                 binding_ranges.iter().any(|binding_range| {
@@ -663,6 +686,49 @@ pub(super) fn resolve_js_ts(
     no_definition(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+    )
+}
+
+fn ts_enclosing_enum_initializer_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    focused: Node<'_>,
+    site: &ResolvedReferenceSite,
+    reference: &str,
+) -> Option<Vec<CodeUnit>> {
+    if !matches!(focused.kind(), "identifier" | "property_identifier") {
+        return None;
+    }
+    let (enum_declaration, assignment) = typescript_enclosing_enum_initializer(focused)?;
+    let enum_name = enum_declaration.child_by_field_name("name")?;
+    let enclosing = analyzer.enclosing_code_unit(file, &site.range)?;
+    let owner = if enclosing.is_field() {
+        analyzer.parent_of(&enclosing)?
+    } else {
+        enclosing
+    };
+    if !owner.is_class()
+        || owner.source() != file
+        || owner.terminal_name() != slice(enum_name, source)
+    {
+        return None;
+    }
+
+    let member_fqn = format!("{}.{}", owner.fq_name(), reference);
+    Some(
+        support
+            .fqn(&member_fqn)
+            .into_iter()
+            .filter(|candidate| candidate.is_field() && candidate.source() == file)
+            .filter(|candidate| {
+                analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.end_byte <= assignment.start_byte())
+            })
+            .collect(),
     )
 }
 

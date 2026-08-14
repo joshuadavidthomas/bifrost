@@ -1,4 +1,5 @@
-use crate::analyzer::rust::{usage_binding_seeds, usage_candidate_files_while};
+use crate::analyzer::rust::usage_binding_seeds;
+use crate::analyzer::rust::usage_candidate_files_while;
 mod extractor;
 mod hits;
 mod inverted;
@@ -14,10 +15,11 @@ use crate::analyzer::usages::outcome::{
 use crate::analyzer::usages::rust_graph::extractor::{
     effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
+use crate::analyzer::usages::rust_graph::resolver::infer_graph_seeds_while;
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, infer_graph_seeds_while,
-    is_graph_visible_member_target, is_member_target, local_impl_target_importer_files_while,
-    trait_member_for_impl_member, unresolved_external_frontier_specifiers,
+    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
+    is_member_target, local_impl_target_importer_files_while, trait_member_for_impl_member,
+    unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
@@ -122,12 +124,25 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
 
         union_candidate_usages(&candidates, max_usages, |target| {
             let (hits, unproven_hits) = if is_member_target(rust, target) {
-                let seed_result = infer_graph_seeds(rust, target);
+                let seed_result = {
+                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
+                    infer_graph_seeds(rust, target)
+                };
                 if seed_result.roots.is_empty() {
                     return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
                         .diagnostic(target.fq_name(), RUST_STRATEGY));
                 }
-                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let seeds = {
+                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
+                    usage_binding_seeds(rust, &seed_result.roots)
+                };
+                crate::profiling::note_with(|| {
+                    format!(
+                        "rust_graph seed roots={} candidate_names={}",
+                        seed_result.roots.len(),
+                        seeds.candidate_names().count()
+                    )
+                });
                 let graph_visible = is_graph_visible_member_target(rust, target);
                 let private_authoritative_scope = scan_scope.is_authoritative();
                 if seed_result.kind == RustGraphSeedKind::Export
@@ -158,12 +173,25 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 );
                 (result.hits, result.unproven_hits)
             } else {
-                let seed_result = infer_graph_seeds(rust, target);
+                let seed_result = {
+                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
+                    infer_graph_seeds(rust, target)
+                };
                 if seed_result.roots.is_empty() {
                     return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
                         .diagnostic(target.fq_name(), RUST_STRATEGY));
                 }
-                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let seeds = {
+                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
+                    usage_binding_seeds(rust, &seed_result.roots)
+                };
+                crate::profiling::note_with(|| {
+                    format!(
+                        "rust_graph seed roots={} candidate_names={}",
+                        seed_result.roots.len(),
+                        seeds.candidate_names().count()
+                    )
+                });
                 let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
                 if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                     scan_files.extend(

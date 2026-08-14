@@ -52,7 +52,10 @@ pub struct ModuleBindingEvent {
 
 #[derive(Clone, Debug)]
 pub enum ModuleBindingEventKind {
-    ImportModule(String),
+    ImportModule {
+        module: String,
+        consumed_attributes: usize,
+    },
     FromImport {
         module: String,
         imported_name: String,

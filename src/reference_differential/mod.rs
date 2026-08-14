@@ -2,24 +2,28 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
-    census_membership_identifier_ranges, go_is_declaration_or_import_name,
+    census_membership_identifier_ranges, go_is_declaration_or_import_name, php_is_declaration_name,
     python_deferred_annotation_membership_ranges, reference_candidate_ranges,
-    reference_candidate_requires_point_lookup,
+    reference_candidate_requires_point_lookup, rust_identifier_text, rust_is_declaration_name,
+    rust_is_pattern_binding_name,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
-    is_adjudicated_answer_diagnostic_kind, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND,
+    PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND, is_adjudicated_answer_diagnostic_kind,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range,
-    cpp_is_constructor_or_destructor_declarator_name, rust_is_field_declaration_name,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer,
+    cpp_is_constructor_or_destructor_declarator_name, resolve_analyzer,
+    rust_declaration_is_enum_variant, rust_declaration_matches_reference_namespace,
+    rust_is_field_declaration_name, rust_reference_namespace,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -835,6 +839,7 @@ fn collect_sampled_sites(
         }
         summary.source_bytes = summary.source_bytes.saturating_add(source.len() as u64);
         let context = DeclarationNameRangeContext::new(file, source);
+        let content = context.content();
         let Some(root) = context.root_node() else {
             file_errors.push(file_error(
                 &path,
@@ -867,6 +872,9 @@ fn collect_sampled_sites(
             }
         };
         let declarations = analyzer.declarations(file);
+        let rust = (language == Language::Rust)
+            .then(|| resolve_analyzer::<RustAnalyzer>(analyzer))
+            .flatten();
         let declaration_ranges: HashSet<(usize, usize)> = declarations
             .iter()
             .flat_map(|unit| context.name_ranges(analyzer, unit))
@@ -912,6 +920,41 @@ fn collect_sampled_sites(
                     summary.declaration_sites_excluded.saturating_add(1);
                 continue;
             }
+            if language == Language::Rust
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .filter(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && rust_is_pattern_binding_name(*node)
+                    })
+                    .is_some_and(|node| {
+                        let name = rust_identifier_text(node, content);
+                        rust.is_some_and(|rust| {
+                            !declarations.iter().any(|declaration| {
+                                declaration.identifier() == name
+                                    && rust_declaration_is_enum_variant(rust, declaration)
+                            })
+                        })
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Rust
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && rust_is_declaration_name(node)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
             if language == Language::Go
                 && root
                     .named_descendant_for_byte_range(range.start_byte, range.end_byte)
@@ -919,6 +962,19 @@ fn collect_sampled_sites(
                         node.start_byte() == range.start_byte
                             && node.end_byte() == range.end_byte
                             && go_is_declaration_or_import_name(node)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Php
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && php_is_declaration_name(node)
                     })
             {
                 summary.declaration_sites_excluded =
@@ -1843,6 +1899,66 @@ fn bare_call_reaches_same_file_declaration(
     }
 }
 
+fn rust_same_file_definition_evidence(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    root: Option<tree_sitter::Node<'_>>,
+    source: &str,
+    record: &ReferenceDifferentialSite,
+    declarations: &BTreeSet<CodeUnit>,
+) -> bool {
+    let Some(node) = root
+        .and_then(|root| root.named_descendant_for_byte_range(record.start_byte, record.end_byte))
+        .filter(|node| {
+            node.start_byte() == record.start_byte && node.end_byte() == record.end_byte
+        })
+    else {
+        return false;
+    };
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return false;
+    };
+    let reference_name = rust_identifier_text(node, source);
+    if node
+        .parent()
+        .is_some_and(|parent| matches!(parent.kind(), "token_tree" | "token_repetition"))
+    {
+        return declarations
+            .iter()
+            .any(|candidate| candidate.identifier() == reference_name);
+    }
+    let namespace = rust_reference_namespace(node);
+    let mut candidates = declarations.iter().filter(|candidate| {
+        candidate.identifier() == reference_name
+            && rust_declaration_matches_reference_namespace(rust, candidate, namespace)
+    });
+
+    let Some(scoped) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(node)
+    }) else {
+        return candidates.count() > 0;
+    };
+    let Some(path) = scoped.child_by_field_name("path") else {
+        return false;
+    };
+    let owner_text = &source[path.byte_range()];
+    let references = rust.forward_reference_context_of(file);
+    let Some(owner) = references
+        .resolve_bare(owner_text)
+        .or_else(|| references.resolve_scoped_owner(owner_text))
+    else {
+        return false;
+    };
+    candidates.any(|candidate| {
+        analyzer
+            .parent_of(candidate)
+            .is_some_and(|parent| parent.fq_name() == owner)
+    })
+}
+
 /// Whether a census site is the joint-blindness residue the tier classifier
 /// grades, or an answer the forward resolver already gave.
 ///
@@ -1856,9 +1972,11 @@ fn bare_call_reaches_same_file_declaration(
 /// twitter/util's `class Oneshot(var more: ...)` doubled as the one behind a
 /// `case Cons(fa, more) => more()` pattern binder the resolver had already
 /// proven local (#1858).
-fn census_gap_is_gradable(record: &ReferenceDifferentialSite) -> bool {
+fn census_gap_is_gradable(language: Language, record: &ReferenceDifferentialSite) -> bool {
     record.forward_status != DefinitionLookupStatus::Resolved.as_str()
         && record.forward_status != DefinitionLookupStatus::UnresolvableImportBoundary.as_str()
+        && !(language == Language::Rust
+            && record.forward_status == DefinitionLookupStatus::Ambiguous.as_str())
         && !record
             .diagnostics
             .iter()
@@ -1893,9 +2011,10 @@ fn classify_census_gaps(
     records: &mut [ReferenceDifferentialSite],
 ) {
     use std::collections::BTreeMap;
+    let language = corpus_language(&config.corpus_language).unwrap_or(Language::None);
     let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
-        if census_gap_is_gradable(record) {
+        if census_gap_is_gradable(language, record) {
             by_path.entry(record.path.clone()).or_default().push(index);
         }
     }
@@ -1910,9 +2029,9 @@ fn classify_census_gaps(
         let Some(source) = analyzer.indexed_source(&file) else {
             continue;
         };
-        let same_file_names: HashSet<String> = analyzer
-            .declarations(&file)
-            .into_iter()
+        let same_file_declarations = analyzer.declarations(&file);
+        let same_file_names: HashSet<String> = same_file_declarations
+            .iter()
             .map(|unit| unit.identifier().to_string())
             .collect();
         let context = DeclarationNameRangeContext::new(&file, source);
@@ -1926,14 +2045,30 @@ fn classify_census_gaps(
             let role = root
                 .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
                 .unwrap_or(CensusSiteRole::Other);
-            let same_file_evidence = same_file_names.contains(&name)
-                && (role != CensusSiteRole::BareCall
-                    || bare_call_reaches_same_file_declaration(
-                        language,
-                        bindings.as_ref(),
-                        &name,
-                        record.start_byte,
-                    ));
+            let owner_unresolved_go_label = language == Language::Go
+                && record.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND
+                });
+            let same_file_evidence = if language == Language::Rust {
+                rust_same_file_definition_evidence(
+                    analyzer,
+                    &file,
+                    root,
+                    content,
+                    record,
+                    &same_file_declarations,
+                )
+            } else {
+                !owner_unresolved_go_label
+                    && same_file_names.contains(&name)
+                    && (role != CensusSiteRole::BareCall
+                        || bare_call_reaches_same_file_declaration(
+                            language,
+                            bindings.as_ref(),
+                            &name,
+                            record.start_byte,
+                        ))
+            };
             let tier = if same_file_evidence
                 && matches!(
                     role,

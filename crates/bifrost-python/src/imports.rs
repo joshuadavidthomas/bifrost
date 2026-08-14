@@ -140,6 +140,7 @@ pub struct PythonImportBinding {
     function_scoped: bool,
     pub local_name: String,
     pub qualified_name: String,
+    pub consumed_attributes: usize,
 }
 
 impl PythonImportBinding {
@@ -182,6 +183,11 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                     let details = python_import_details(&import)?;
                     match details {
                         PythonImportDetails::Import { module, alias } => {
+                            let consumed_attributes = if alias.is_some() {
+                                0
+                            } else {
+                                path.segments.len().saturating_sub(1)
+                            };
                             Some(PythonImportBinding {
                                 start_byte: node.start_byte(),
                                 scope_start_byte,
@@ -189,6 +195,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                                 function_scoped,
                                 local_name: alias.or_else(|| path.segments.first().cloned())?,
                                 qualified_name: module,
+                                consumed_attributes,
                             })
                         }
                         PythonImportDetails::FromImport {
@@ -203,6 +210,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                             function_scoped,
                             local_name: alias.unwrap_or(name.clone()),
                             qualified_name: format!("{module}.{name}"),
+                            consumed_attributes: 0,
                         }),
                         PythonImportDetails::FromImport { wildcard: true, .. } => None,
                     }

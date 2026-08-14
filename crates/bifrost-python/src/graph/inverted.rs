@@ -110,7 +110,25 @@ impl<'a> PythonEdgeScan<'a> {
                             &binding.module_specifier,
                         )
                         .unwrap_or_else(|| binding.module_specifier.clone());
-                        named.insert(local.clone(), format!("{module}.{imported}"));
+                        let imported_fqn = if module.ends_with('.') {
+                            format!("{module}{imported}")
+                        } else {
+                            format!("{module}.{imported}")
+                        };
+                        if let Some(imported_module) =
+                            canonical_import_module_fqn(graph, python, file, &imported_fqn)
+                        {
+                            namespace.insert(
+                                local.clone(),
+                                NamespaceBinding {
+                                    module: imported_module,
+                                    workspace_module: true,
+                                    consumed_attributes: 0,
+                                },
+                            );
+                        } else {
+                            named.insert(local.clone(), imported_fqn);
+                        }
                     }
                 }
                 ImportKind::Namespace => {

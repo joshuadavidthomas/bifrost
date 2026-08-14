@@ -198,6 +198,18 @@ To cut a release:
    ```bash
    scripts/pre-push-gate.sh
    cargo build --release --locked --bin bifrost
+   plugin_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-agent-pretag.XXXXXX")"
+   mkdir -p "$plugin_smoke_root/package" "$plugin_smoke_root/extracted"
+   git archive HEAD plugins/bifrost-agent | tar -C "$plugin_smoke_root/package" -xf -
+   cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "$plugin_smoke_root/package/plugins/bifrost-agent/"
+   tar -C "$plugin_smoke_root/package/plugins" -czf "$plugin_smoke_root/bifrost-agent.tar.gz" bifrost-agent
+   tar -C "$plugin_smoke_root/extracted" -xzf "$plugin_smoke_root/bifrost-agent.tar.gz"
+   plugin_smoke_dir="$(cd "$plugin_smoke_root/extracted/bifrost-agent" && pwd -P)"
+   node scripts/smoke-agent-plugin-release.mjs \
+     --plugin-dir "$plugin_smoke_dir" \
+     --cache-dir "$plugin_smoke_root/cache" \
+     --binary-path "$(pwd)/target/release/bifrost"
+   rm -rf "$plugin_smoke_root"
    target/release/bifrost \
      --root . \
      --format sarif \
@@ -205,6 +217,13 @@ To cut a release:
      --fail-on never \
      --policy-pack bifrost.code-smells
    ```
+
+   The staged-agent command reproduces the prepublication plugin boundary: it
+   packages the portable plugin, extracts it away from the checkout, launches
+   that package with the exact optimized binary to be tagged, and exercises
+   both Codex metadata and MCP roots workspace binding plus policy discovery
+   and execution. Do not substitute the plugin unit tests or manifest checks
+   for this end-to-end smoke.
 
    The policy command is a release-artifact smoke test. Existing findings do
    not fail it. An unreliable scan still exits with status 2 and blocks the
