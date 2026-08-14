@@ -17,6 +17,9 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 - [x] (2026-08-14 00:45Z) Rebuilt the release differential runner and obtained a dirty-head precommit serde-json proof: one `From<f32>` target, one exact inverse hit, `consistent=1`, and actionable zero.
 - [x] (2026-08-14 00:49Z) Rebuilt from implementation commit `ca2edcc240eefab6e7d86c34867d57a2a694e364` and preserved a clean exact serde-json replay with consistent/exact inverse recovery and actionable zero.
 - [x] (2026-08-14 00:49Z) Pushed implementation and evidence commits through `8cbd43941` directly to `origin/master` and closed #2035 with the clean replay evidence.
+- [x] (2026-08-14 01:25Z) Reopened #2035 after the Rust target-complete run exposed an inverse regression for enum-variant constructors, restricted applicability to requested trait-implementation members, and added an enum-variant inverse near-miss.
+- [x] (2026-08-14 01:34Z) Revalidated the focused issue tests, neighboring inverse control, all 53 Rust crate tests, formatting, focused Clippy, dependency checks, and exact OpenDAL plus serde-json production witnesses; both exact replays report actionable zero.
+- [ ] Commit and publish the regression correction, rebuild from the clean head, rerun both witnesses, and close #2035 again.
 
 ## Surprises & Discoveries
 
@@ -30,6 +33,8 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
   Evidence: Applying argument applicability before `rust_scope_forward_candidates_to_cargo_target` still returned every `Value.from` implementation in the production replay. Moving applicability after target scoping reduced the result to `From<f32>`.
 - Observation: The inverse graph's same-FQN identity intentionally collapses overload signatures, and its exact-candidate shortcut bypassed applicability for trait implementation methods.
   Evidence: The strengthened integration test initially attributed the `f64`, mutable-reference, and slice-coercion calls to the requested `f32` implementation. Enumerating the owner/member family and requiring exact `CodeUnit` equality after a unique applicability selection separated the overloads while retaining existing identity behavior elsewhere.
+- Observation: Applying the shared inverse selector to every scoped one-argument member rejected enum-variant constructors.
+  Evidence: The clean target-complete run at `f4b0a92d` made `FileState::Writer(writer.into_std_write())` a forward/inverse miss. Enum variants do not publish callable parameter metadata, so the selector returned an empty positive set. Gating the selector to requested trait-implementation members restores the exact inverse hit without changing the serde-json `From<f32>` result.
 
 ## Decision Log
 
@@ -48,10 +53,13 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 - Decision: Share the same applicability selector between forward and inverse analysis, but require a unique positive winner for inverse attribution.
   Rationale: Forward lookup may honestly retain a plural candidate set when evidence is unknown or tied. An inverse query for one exact implementation cannot claim a call unless applicability uniquely selects that same exact `CodeUnit`.
   Date/Author: 2026-08-14, Codex.
+- Decision: Invoke inverse argument applicability only for requested trait-implementation members.
+  Rationale: The discriminator exists to separate same-owner, same-name trait implementations. Inherent methods and enum variants already follow their established exact-owner logic and may lack callable metadata; filtering them creates false negatives without resolving an overload ambiguity.
+  Date/Author: 2026-08-14, Codex.
 
 ## Outcomes & Retrospective
 
-The implementation, validation, clean-head production acceptance, publication, and issue closure are complete. The shared selector now narrows forward definition lookup and inverse usage lookup only when structured argument evidence uniquely proves an implementation; generic and tied cases remain plural or ambiguous. The serde-json witness selects `From<f32>` and round-trips at its exact byte range with zero actionable findings.
+The original implementation, validation, clean-head production acceptance, and publication completed, but the target-complete audit exposed an inverse enum-variant regression and #2035 was reopened. The regression correction and dirty-head production validation are complete; clean-head publication evidence and renewed issue closure remain pending.
 
 ## Context and Orientation
 
@@ -115,3 +123,5 @@ Plan revision, 2026-08-14: Recorded the implemented shared forward/inverse selec
 Plan revision, 2026-08-14: Recorded clean-head replay provenance and checksums for implementation commit `ca2edcc24`. Only publication and issue closure remain.
 
 Plan revision, 2026-08-14: Recorded publication through `8cbd43941` and verified GitHub issue #2035 closed at `2026-08-14T00:49:16Z`.
+
+Plan revision, 2026-08-14: Reopened #2035 after the target-complete Rust audit found the applicability hook rejecting enum-variant constructors. Recorded the trait-implementation-only correction, regression coverage, and dirty-head exact OpenDAL/serde-json acceptance; clean publication proof remains required.

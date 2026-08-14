@@ -106,6 +106,10 @@ fn associated_trait_calls_filter_by_structured_argument_applicability() {
 
 struct Output;
 
+enum FileState {
+    Writer(u32),
+}
+
 impl Convert<f32> for Output {
     fn from(_: f32) -> Self { Output }
 }
@@ -143,6 +147,10 @@ where
     Output: Convert<T>,
 {
     let _ = Output::from(value);
+}
+
+fn enum_variant(value: u32) {
+    let _ = FileState::Writer(value);
 }
 "#;
     let project = InlineTestProject::with_language(Language::Rust)
@@ -194,6 +202,11 @@ where
         .into_iter()
         .next()
         .expect("f64 implementation");
+    let variant_target = exact_definition_after(&project, source, "fn enum_variant", "Writer")
+        .definitions
+        .into_iter()
+        .next()
+        .expect("enum variant");
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
@@ -206,9 +219,14 @@ where
         .find_usages(analyzer, &[f64_target], &candidates, 1000)
         .into_either()
         .expect("f64 inverse lookup");
+    let variant_hits = strategy
+        .find_usages(analyzer, &[variant_target], &candidates, 1000)
+        .into_either()
+        .expect("enum variant inverse lookup");
     let exact_f32 = token_after(source, "fn exact_f32", "from");
     let exact_f64 = token_after(source, "fn exact_f64", "from");
     let generic = token_after(source, "fn generic", "from");
+    let variant = token_after(source, "fn enum_variant", "Writer");
     assert!(
         f32_hits
             .iter()
@@ -232,6 +250,12 @@ where
             .iter()
             .all(|hit| hit.start_offset != exact_f32 && hit.start_offset != generic),
         "f64 inverse hits: {f64_hits:#?}"
+    );
+    assert!(
+        variant_hits
+            .iter()
+            .any(|hit| hit.start_offset == variant && hit.end_offset == variant + 6),
+        "enum variant inverse hits: {variant_hits:#?}"
     );
 }
 

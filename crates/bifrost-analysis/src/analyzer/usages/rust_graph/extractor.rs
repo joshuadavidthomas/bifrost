@@ -3418,24 +3418,28 @@ fn associated_candidates_match_target(
 ) -> bool {
     match outcome {
         ReceiverAnalysisOutcome::Precise(candidates) => {
-            let applicable = owner_node
-                .parent()
-                .filter(|scoped| {
-                    matches!(
-                        scoped.kind(),
-                        "scoped_identifier" | "scoped_type_identifier"
-                    )
+            let applicable = is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target)
+                .then(|| {
+                    owner_node
+                        .parent()
+                        .filter(|scoped| {
+                            matches!(
+                                scoped.kind(),
+                                "scoped_identifier" | "scoped_type_identifier"
+                            )
+                        })
+                        .and_then(|scoped| {
+                            rust_associated_call_applicable_candidates(
+                                ctx.analyzer,
+                                ctx.support,
+                                ctx.source,
+                                ctx.root,
+                                scoped,
+                                candidates.clone(),
+                            )
+                        })
                 })
-                .and_then(|scoped| {
-                    rust_associated_call_applicable_candidates(
-                        ctx.analyzer,
-                        ctx.support,
-                        ctx.source,
-                        ctx.root,
-                        scoped,
-                        candidates.clone(),
-                    )
-                });
+                .flatten();
             if applicable
                 .as_ref()
                 .is_some_and(|applicable| applicable.len() != 1)
