@@ -566,16 +566,30 @@ impl RustUsageWalks<'_> {
         ) else {
             return false;
         };
-        if domain == Domain::Public {
-            return true;
-        }
-        (declaration.source() == caller_file
+        let files_share_visibility_domain = declaration.source() == caller_file
             || self.owners_intersect(declaration.source(), caller_file)
             || analyzer
                 .cargo_routes()
                 .files_share_target(declaration.source(), caller_file)
-                == Some(true))
-            && domain_contains_module_for_file(&domain, analyzer, caller_file, caller_module)
+                == Some(true);
+        let domain_reaches_caller = |effective: &Domain| {
+            *effective == Domain::Public
+                || (files_share_visibility_domain
+                    && domain_contains_module_for_file(
+                        effective,
+                        analyzer,
+                        caller_file,
+                        caller_module,
+                    ))
+        };
+
+        match self.effective_module_domains_of(&owner) {
+            Some(owner_domains) => owner_domains
+                .iter()
+                .filter_map(|owner_domain| domain.intersect(owner_domain))
+                .any(|effective| domain_reaches_caller(&effective)),
+            None => domain_reaches_caller(&domain),
+        }
     }
 
     /// Files that import one of the `seeds` (plus the seed files themselves).
