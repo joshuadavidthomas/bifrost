@@ -11,8 +11,8 @@ When a preprocessor conditional selects an `else if` fragment inside a C functio
 - [x] (2026-08-14) Reduced four libarchive `string_to_size` failures to a statement-fragment conditional and filed self-assigned #2139.
 - [x] (2026-08-14) Recovered the physical reference guard through structured syntax and added positive, unguarded, and contradictory tests.
 - [x] (2026-08-14) Passed the low-level guard test, issue integration, callable-activation controls, C++ crate, formatting, focused Clippy, dependency-boundary, and diff checks; all four dirty-runner production candidates are exact and actionable zero.
-- [ ] Replay the two issue-owned rows from a clean pushed-head runner.
-- [ ] Commit, push, preserve checksummed evidence, and close #2139.
+- [x] (2026-08-14) Replayed the two issue-owned rows from clean integrated head `d0efa72bb` into checksummed final evidence.
+- [x] (2026-08-14) Committed, pushed, preserved checksummed evidence, and closed #2139 at `https://github.com/BrokkAi/bifrost/issues/2139#issuecomment-5291594906`.
 
 ## Surprises & Discoveries
 
@@ -29,7 +29,7 @@ When a preprocessor conditional selects an `else if` fragment inside a C functio
 
 ## Outcomes & Retrospective
 
-The structured pair recovery and regressions are implemented. All four libarchive `string_to_size` calls pass candidate replay as resolved, consistent, inverse-exact, and actionable zero; clean pushed-head evidence remains before closure.
+The structured pair recovery and regressions landed in `6ba7704de` and were pushed at integrated head `d0efa72bb`. Both issue-owned libarchive rows pass from that clean head as resolved, consistent, inverse-exact, and actionable zero. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-d0efa72b/issue-2139-clean-replay-manifest-d0efa72b.jsonl` (SHA-256 `5f38c16718293c900ae66354d68717cf1e0c35328b0f68f32b018b4c5ab93b03`), and its checksum inventory has SHA-256 `179798a8c0bcbea9f26e2cb9f8cabc6d357e69c5651bda26fb9088dc3bb1037c`.
 
 ## Context and Orientation
 
@@ -71,6 +71,8 @@ The two issue-owned raw rows are in `/mnt/optane/tmp/bifrost-fird/final-3643963/
 Plan revision note (2026-08-14): Created after exact replay separated the libarchive target-bound residue into independent guard and overload families.
 
 Plan revision note (2026-08-14): Recorded the exact missing-terminator/structured-`preproc_call` AST pair, implemented recovery, focused validation, and successful candidate replays.
+
+Plan revision note (2026-08-14): Finalized clean-head evidence and closure. The release runner SHA-256 is `692b96a28e54933f80ba41929b36f1096da39af23734c2ad0f632bcb38f149f2`; raw report SHA-256 values are `948a0c7597a8ed57d329ad106f414d05691f6d12928d33f9f7af28c22d31111d` and `1c1e283029b61608f4bbba9033f0c7fb66d735880d92b2b8b8274b6c3468a81d`.
 
 ## Interfaces and Dependencies
 
