@@ -12,7 +12,7 @@ Forward Rust lookup resolves imported nominal types and indexed type aliases, bu
 - [x] (2026-08-14) Added grouped-import, cross-package, cfg-alternative, and custom Cargo bench-target alias regressions.
 - [x] (2026-08-14) Traced candidate discovery and AST authorization independently against Sway, Meilisearch, and Diesel.
 - [x] (2026-08-14) Corrected scoped-path fallback, exact binder-target admission, and Cargo dependency reachability; focused tests and production representatives pass.
-- [ ] Publish, replay all eleven production rows on a clean release runner, and close #2130.
+- [x] (2026-08-14) Published the integrated fix, replayed all eleven production rows on a clean release runner, and prepared #2130 closure evidence.
 
 ## Surprises & Discoveries
 
@@ -45,6 +45,12 @@ Forward Rust lookup resolves imported nominal types and indexed type aliases, bu
 ## Outcomes & Retrospective
 
 Dirty-tree diagnostic release replays at the intended implementation returned actionable zero for Sway `GenericTypeParameter`, Sway `GenericTypeArgument`, Meilisearch `InstanceUid`, Meilisearch `FieldId`, Diesel `Filter`, and all six issue-owned Diesel `Bencher` references. These are diagnostic only; closure requires the clean pushed-head replay of all eleven owned rows.
+
+The implementation landed in `82135e2b788548aa902dac17949682487994c82c` and was integrated with the advanced `origin/master` as `da489a98bf006ec540b1cc786628af3c8189c41f`. A freshly rebuilt release runner at that clean pushed head had SHA-256 `b785d2a8149596d20715db58528f492f7fb24a0e9896a5456b5b930ae28ee0de`.
+
+The clean replay manifest is `/mnt/optane/tmp/bifrost-fird/final-da489a98/issue-2130-clean-replay-manifest-da489a98.jsonl`, SHA-256 `ba2070515c13e73b582ed9c9ef58425b27a34ff0ffd752dc7d4ed2d22adc805e`. Its eleven rows pin Bifrost head `da489a98bf006ec540b1cc786628af3c8189c41f` with `bifrost_dirty=false`: nine reference sites are `consistent`, the two import-name sites are intentionally `editor_only`, all eleven inverse hits have exact ranges, and no row has skipped targets, target truncation, candidate-limit exclusion, or file errors. The companion checksum inventory is `/mnt/optane/tmp/bifrost-fird/final-da489a98/issue-2130-clean-replay-checksums-da489a98.sha256`, SHA-256 `c959f4b40dedf7a0559fc996d3ba3127dba96716a69e700785143f8a0db92f8b`.
+
+Focused issue tests, the #2128 re-export control, grouped-import and grouped-glob controls, the independent Cargo example-target control, all 54 `brokk-bifrost-rust` tests, formatting, focused Clippy for `brokk-bifrost-rust` and `brokk-bifrost-analysis`, and the workspace dependency check passed before publication. The post-merge #2130 suite and the integrated upstream associated-type regression also passed.
 
 ## Context and Orientation
 
