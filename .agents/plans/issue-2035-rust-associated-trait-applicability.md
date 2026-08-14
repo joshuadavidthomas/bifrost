@@ -15,8 +15,8 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 - [x] (2026-08-14 00:31Z) Persisted AST-derived callable parameter type spellings and applied one-argument associated-call applicability after Cargo-target scoping in both forward definition lookup and inverse Rust graph lookup.
 - [x] (2026-08-14 00:44Z) Passed the focused issue tests, neighboring definition and usage controls, all 53 `brokk-bifrost-rust` tests, formatting, focused isolated Clippy, dependency validation, and `git diff --check`.
 - [x] (2026-08-14 00:45Z) Rebuilt the release differential runner and obtained a dirty-head precommit serde-json proof: one `From<f32>` target, one exact inverse hit, `consistent=1`, and actionable zero.
-- [ ] Rebuild from the committed clean head and preserve the final exact serde-json replay evidence.
-- [ ] Commit, push directly to `master`, close #2035 with evidence, and update this plan.
+- [x] (2026-08-14 00:49Z) Rebuilt from implementation commit `ca2edcc240eefab6e7d86c34867d57a2a694e364` and preserved a clean exact serde-json replay with consistent/exact inverse recovery and actionable zero.
+- [ ] Push directly to `master`, close #2035 with evidence, and record publication.
 
 ## Surprises & Discoveries
 
@@ -51,7 +51,7 @@ After this change, public definition lookup uses tree-sitter call, binding, gene
 
 ## Outcomes & Retrospective
 
-The implementation and precommit production acceptance are complete. Final clean-head replay, publication, and issue closure remain pending.
+The implementation, validation, and clean-head production acceptance are complete. Publication and issue closure remain pending.
 
 ## Context and Orientation
 
@@ -106,6 +106,10 @@ No public API or new dependency was added. Declaration extraction in `brokk-bifr
 
 Precommit evidence, 2026-08-14: `/mnt/optane/tmp/bifrost-fird/issue-2035-precommit-final/issue-2035-exact-replay.jsonl` has SHA-256 `51f60ee3b53ff849a5b8e530bc9170a17f7a82c90317710a1f1bfae472eb2f84`. It reports one resolved target, `impl From<f32> for Value::fn from(f: f32) -> Self { ... }`, `classification=consistent`, and an exact inverse hit at `src/value/ser.rs` bytes `4432..4436`; actionable is zero. The release runner SHA-256 is `bc844ddf145f6603774eaec1496f934b018422f061e3119d0e6710ebe127ee8d`. This artifact correctly records `bifrost_dirty=true` and is a precommit proof only.
 
+Clean-head evidence, 2026-08-14: implementation commit `ca2edcc240eefab6e7d86c34867d57a2a694e364`; replay `/mnt/optane/tmp/bifrost-fird/issue-2035-ca2edcc24/issue-2035-exact-replay.jsonl`, SHA-256 `585697e57ee583b5420f5a013cbb20e8cb7049ba1261ae6b8eaa4e48787cf4d6`; runner SHA-256 `4f5d2bb2bd862405cb79ada39b476c096e6332bde1a0111e0c04d6a472646fc7`; immutable issue-row manifest SHA-256 `8e87617f2164348a07fc01a29069eccff9f1b0d053fe0b3b41cf9d9671c8d68b`. Provenance is clean for Bifrost and serde-json at `827a315bf2198558f0325b07bcc1e2cd973aba2f`. The one site resolves only to `impl From<f32> for Value::fn from(f: f32) -> Self { ... }`, is `consistent`, has an exact inverse hit at bytes `4432..4436`, and reports actionable zero.
+
 Plan revision, 2026-08-13: Created the living #2035 plan after confirming issue ownership, exact production evidence, the direct-FQN early return, and the absence of persisted Rust parameter-type metadata. The plan requires positive structured applicability, ambiguity preservation, explicit coercion/generic controls, and clean exact production proof.
 
 Plan revision, 2026-08-14: Recorded the implemented shared forward/inverse selector, the necessary Rust epoch bump, the Cargo-scoping and inverse-identity discoveries, complete focused/static validation, and the successful dirty-head production proof. Clean-head proof and publication remain required.
+
+Plan revision, 2026-08-14: Recorded clean-head replay provenance and checksums for implementation commit `ca2edcc24`. Only publication and issue closure remain.
