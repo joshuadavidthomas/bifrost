@@ -13,8 +13,8 @@ C permits preprocessor branches to select part of a declaration. The C analyzer 
 - [x] (2026-08-14) Reduced tree-sitter's exact split-typedef shape and filed #2134.
 - [x] (2026-08-14) Added a structured split-declaration boundary recovery and positive/near-miss tests.
 - [x] (2026-08-14) Passed the C++ crate suite, focused integration and guard controls, formatting, dependency checks, diff checks, and focused isolated Clippy.
-- [ ] Rebuild the release differential runner and replay all issue-owned production rows with ephemeral caches.
-- [ ] Record clean checksummed evidence, commit, push to master, and close #2134.
+- [x] (2026-08-14) Rebuilt the release differential runner at pushed head `8ed28b1b7` and replayed the issue-owned libarchive row with an ephemeral cache.
+- [x] (2026-08-14) Recorded clean checksummed evidence and pushed the implementation to master. The documentation checkpoint and issue closure are the only remaining administrative steps.
 
 ## Surprises & Discoveries
 
@@ -39,7 +39,9 @@ C permits preprocessor branches to select part of a declaration. The C analyzer 
 
 ## Outcomes & Retrospective
 
-The structured fix and tests are implemented. A candidate-runner exact replay of libarchive `Rescale` now resolves one target, returns the exact inverse hit, and exits with `actionable=0`. The C++ crate's 87 tests, five complete/incomplete guard-family controls, seven callable-activation controls, the new integration test, formatting, workspace dependency check, diff check, and focused isolated Clippy all pass. Completion still requires committing, pushing, rebuilding from the clean commit, and preserving a checksummed clean replay.
+The structured fix is on master through merge head `8ed28b1b7aa8e35970b164c24df2282cdc2b29ff`; its implementation commit is `5714a41ca`. The C++ crate's 87 tests, five complete/incomplete guard-family controls, seven callable-activation controls, the new integration test, formatting, workspace dependency check, diff check, and focused isolated Clippy all pass.
+
+The clean release runner has SHA-256 `4acf6eddc600e715e003a1ea7df11bc513e9ab536a208487bc9465f972427720`. Its exact libarchive `Rescale` replay completed with a clean Bifrost tree and clean repository tree, `forward.resolved=1`, one `consistent` classification, an exact inverse hit at bytes 27178..27185, `inverse_precision_unbacked_hits=0`, no skipped or truncated targets, no candidate-limit overflow, and no file errors. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-8ed28b1b/issue-2134-clean-replay-manifest-8ed28b1b.jsonl` (SHA-256 `89252724483a3bbc108260a6ef81b76d7e9bd4001957b1fd996c1faf0bf6f3c2`). Its checksum file is `/mnt/optane/tmp/bifrost-fird/final-8ed28b1b/issue-2134-clean-replay-checksums-8ed28b1b.sha256` (SHA-256 `d161c8c0edda1324c6b4f043e4e71fa0b69557013f8089b82d2707d5283b43b8`). The purpose is met; remaining C target-bound rows are deliberately not attributed to #2134 until independently reduced.
 
 ## Context and Orientation
 
@@ -91,6 +93,8 @@ The original target-bound C ledger is `/mnt/optane/tmp/bifrost-fird/final-364396
 Plan revision note (2026-08-14): Created after the target-bound C audit proved a distinct split-declaration conditional-boundary mechanism and filed #2134.
 
 Plan revision note (2026-08-14): Updated after implementation and candidate validation. The final predicate requires the structured `typedef` token, multiline declarator recovery, trailing declarator name, and later over-captured children; this was the smallest rule that matched production without weakening ordinary guards.
+
+Plan revision note (2026-08-14): Marked technically complete after implementation commit `5714a41ca` reached master through `8ed28b1b7` and the clean exact replay produced checksummed actionable-zero evidence.
 
 ## Interfaces and Dependencies
 
