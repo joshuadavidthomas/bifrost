@@ -1,8 +1,10 @@
 use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
+#[cfg(test)]
+use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
-    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
     cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
@@ -6997,8 +6999,8 @@ fn preprocessor_conditional_contains_descendant(
     conditional: Node<'_>,
     descendant: Node<'_>,
 ) -> bool {
-    cpp_displaced_preprocessor_terminator(conditional)
-        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
+    cpp_displaced_preprocessor_boundary(conditional)
+        .is_none_or(|boundary| descendant.start_byte() < boundary.end_byte)
 }
 
 pub fn merge_preprocessor_guards(
@@ -11512,6 +11514,28 @@ mod tests {
                 .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
         );
         assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+
+        let split_declaration = "struct Node;\n\ntypedef\n  #ifdef FEATURE_X\n    struct Node *\n  #else\n    UInt32\n  #endif\n  NodeRef;\n\nstatic int target(void) { return 1; }\n#ifdef LATER\nint later;\n#endif\n";
+        let tree = parse(split_declaration);
+        let root = tree.root_node();
+        let conditional = root
+            .named_children(&mut root.walk())
+            .find(|node| node.kind() == "preproc_ifdef" && node.start_position().row == 3)
+            .expect("split declaration conditional");
+        let target = split_declaration
+            .find("static int target")
+            .expect("target byte");
+        let boundary =
+            cpp_displaced_preprocessor_boundary(conditional).expect("split declaration boundary");
+        assert!(boundary.end_byte <= target, "{boundary:?}");
+        assert_eq!(boundary.end_line, 9, "{boundary:?}");
+        let target_node = root
+            .descendant_for_byte_range(target, target + "static".len())
+            .expect("target node");
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            target_node
+        ));
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {

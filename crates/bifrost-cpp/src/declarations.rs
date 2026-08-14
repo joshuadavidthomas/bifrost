@@ -2065,9 +2065,9 @@ impl<'a> CppVisitor<'a> {
                 // recording the openers covers every branch.
                 if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
                     let mut range = cpp_declaration_range(node);
-                    if let Some(terminator) = cpp_displaced_preprocessor_terminator(node) {
-                        range.end_byte = terminator.end_byte();
-                        range.end_line = terminator.end_position().row + 1;
+                    if let Some(boundary) = cpp_displaced_preprocessor_boundary(node) {
+                        range.end_byte = boundary.end_byte;
+                        range.end_line = boundary.end_line;
                     }
                     self.parsed.record_materialization(
                         MaterializationRecord::ConfigurationConditional { range },
@@ -5245,6 +5245,98 @@ pub fn cpp_displaced_preprocessor_terminator<'tree>(
         }
     }
     displaced
+}
+
+/// The effective end of a conditional whose real terminator tree-sitter
+/// displaced into declaration recovery.
+///
+/// Most damaged conditionals retain a concrete `#endif` token below an
+/// `ERROR`; [`cpp_displaced_preprocessor_terminator`] supplies that exact
+/// boundary. A preprocessor family that selects the middle of a declaration
+/// can lose the directive tokens entirely. In that shape tree-sitter leaves
+/// the declaration's `typedef` token as the sole child of the immediately
+/// preceding top-level `ERROR`, and puts a multiline `ERROR` plus the trailing
+/// declarator name inside the conditional's first declaration. The declaration
+/// end is then the smallest structured boundary that contains the whole split
+/// declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CppDisplacedPreprocessorBoundary {
+    pub end_byte: usize,
+    pub end_line: usize,
+}
+
+pub fn cpp_displaced_preprocessor_boundary(
+    conditional: Node<'_>,
+) -> Option<CppDisplacedPreprocessorBoundary> {
+    if let Some(declaration) = displaced_split_declaration(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: declaration.end_byte(),
+            end_line: declaration.end_position().row + 1,
+        });
+    }
+    if let Some(terminator) = cpp_displaced_preprocessor_terminator(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: terminator.end_byte(),
+            end_line: terminator.end_position().row + 1,
+        });
+    }
+    None
+}
+
+fn displaced_split_declaration<'tree>(conditional: Node<'tree>) -> Option<Node<'tree>> {
+    if !conditional.has_error()
+        || conditional.child_by_field_name("alternative").is_some()
+        || conditional
+            .prev_named_sibling()
+            .filter(|sibling| {
+                sibling.kind() == "ERROR"
+                    && sibling.child_count() == 1
+                    && sibling
+                        .child(0)
+                        .is_some_and(|child| child.kind() == "typedef")
+            })
+            .filter(|sibling| sibling.end_position().row + 1 == conditional.start_position().row)
+            .is_none()
+    {
+        return None;
+    }
+    let mut cursor = conditional.walk();
+    let children = conditional.named_children(&mut cursor).collect::<Vec<_>>();
+    let declaration_index = children
+        .iter()
+        .position(|child| child.kind() == "declaration" && child.has_error())?;
+    let declaration = children[declaration_index];
+    if !children
+        .iter()
+        .skip(declaration_index + 1)
+        .any(|child| child.end_byte() > declaration.end_byte())
+    {
+        return None;
+    }
+    let declarator = declaration.child_by_field_name("declarator")?;
+    let mut error_end = None;
+    let mut names = Vec::new();
+    let mut stack = vec![declarator];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "ERROR" && node.end_position().row > node.start_position().row {
+            error_end =
+                Some(error_end.map_or(node.end_byte(), |end: usize| end.max(node.end_byte())));
+            continue;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            names.push(node.start_byte());
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    let error_end = error_end?;
+    names
+        .into_iter()
+        .any(|start| start >= error_end)
+        .then_some(declaration)
 }
 
 fn displaced_fragmented_class_terminator(parent: Node<'_>, error_index: usize) -> bool {

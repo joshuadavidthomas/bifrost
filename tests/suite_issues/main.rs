@@ -109,5 +109,6 @@ mod issue_2129_rust_child_module_type_precedence;
 mod issue_2130_rust_imported_alias_inverse;
 mod issue_2131_rust_scoped_type_inverse;
 mod issue_2132_rust_self_output;
+mod issue_2134_c_split_declaration_guard;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;
