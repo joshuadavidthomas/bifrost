@@ -651,40 +651,33 @@ fn rust_scope_forward_candidates_to_cargo_target(
         return outcome;
     }
     // `Self` resolution already carries the exact enclosing impl identity in
-    // the CodeUnit signature. Same-file declarations can nevertheless share
-    // its analyzer FQN (for example impls for `T` and `&[T]`). Preserve every
-    // exact outcome from those files while still admitting other-file replicas
-    // for the Cargo target router to select between independent roots.
-    let exact_lexical_self_files = if matches!(&scope, RustCargoReferenceScope::LexicalSelf) {
-        outcome
-            .definitions
-            .iter()
-            .map(|definition| definition.source().clone())
-            .collect::<HashSet<_>>()
-    } else {
-        HashSet::default()
-    };
+    // the CodeUnit signature. Expanding that result by FQN can introduce
+    // unrelated associated items from other impls whose analyzer identity is
+    // necessarily the same (for example several `Alias<S>::Output` items).
+    // Keep the lexical result exact and only use Cargo membership to validate
+    // that result below.
+    let preserve_exact_lexical_self = matches!(&scope, RustCargoReferenceScope::LexicalSelf);
     let mut expanded = outcome.definitions.clone();
-    for definition in &outcome.definitions {
-        expanded.extend(
-            support
-                .fqn(&definition.fq_name())
-                .into_iter()
-                .filter(|candidate| {
-                    !exact_lexical_self_files.contains(candidate.source())
-                        && rust_same_declaration_namespace(rust, definition, candidate)
-                }),
-        );
-        expanded.extend(
-            support
-                .file_identifier(file, definition.identifier())
-                .into_iter()
-                .filter(|candidate| {
-                    !exact_lexical_self_files.contains(candidate.source())
-                        && candidate.fq_name() == definition.fq_name()
-                        && rust_same_declaration_namespace(rust, definition, candidate)
-                }),
-        );
+    if !preserve_exact_lexical_self {
+        for definition in &outcome.definitions {
+            expanded.extend(
+                support
+                    .fqn(&definition.fq_name())
+                    .into_iter()
+                    .filter(|candidate| {
+                        rust_same_declaration_namespace(rust, definition, candidate)
+                    }),
+            );
+            expanded.extend(
+                support
+                    .file_identifier(file, definition.identifier())
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.fq_name() == definition.fq_name()
+                            && rust_same_declaration_namespace(rust, definition, candidate)
+                    }),
+            );
+        }
     }
     sort_units(&mut expanded);
     expanded.dedup();
@@ -896,7 +889,7 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(candidates) =
-            rust_self_scoped_associated_type_candidates(analyzer, file, source, tree, site)
+            rust_self_scoped_associated_type_candidates(rust, analyzer, file, source, tree, site)
         && !candidates.is_empty()
     {
         return candidates_outcome(candidates);
@@ -2924,6 +2917,7 @@ fn rust_enclosing_named_associated_type(
 }
 
 fn rust_self_scoped_associated_type_candidates(
+    rust: &RustAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -2945,6 +2939,35 @@ fn rust_self_scoped_associated_type_candidates(
     }
     let name = scoped.child_by_field_name("name")?;
     let name = rust_node_text(name, source).trim();
+    let Some(impl_item) = rust_enclosing_ancestor(scoped, "impl_item") else {
+        return resolve_in_enclosing_scopes(
+            analyzer,
+            file,
+            name,
+            site.focus_start_byte,
+            CodeUnit::is_field,
+        )
+        .map(|candidate| vec![candidate]);
+    };
+    if let Some(body) = impl_item.child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for item in body.named_children(&mut cursor) {
+            if !matches!(item.kind(), "associated_type" | "type_item") {
+                continue;
+            }
+            let Some(item_name) = item.child_by_field_name("name") else {
+                continue;
+            };
+            if rust_node_text(item_name, source).trim() != name {
+                continue;
+            }
+            if let Some(candidate) =
+                rust_associated_type_declaration_for_exact_node(rust, file, item, name)
+            {
+                return Some(vec![candidate]);
+            }
+        }
+    }
     let candidate = resolve_in_enclosing_scopes(
         analyzer,
         file,
@@ -2952,9 +2975,6 @@ fn rust_self_scoped_associated_type_candidates(
         site.focus_start_byte,
         CodeUnit::is_field,
     );
-    let Some(impl_item) = rust_enclosing_ancestor(scoped, "impl_item") else {
-        return candidate.map(|candidate| vec![candidate]);
-    };
     let candidate_is_in_impl = candidate.as_ref().is_some_and(|candidate| {
         candidate.source() == file
             && analyzer.ranges(candidate).iter().any(|range| {
