@@ -11,8 +11,8 @@ Plain-C identifiers that collide with C++ keywords must remain usable as call ar
 - [x] (2026-08-14) Reduced libarchive `__archive_mktempx` bytes 10026..10043, traced call arity 1 versus candidate arity 2, searched open issues, and filed self-assigned #2144.
 - [x] (2026-08-14) Added C-only structured displaced-parameter argument recovery to exact and macro-aware call arity.
 - [x] (2026-08-14) Added low-level and InlineTestProject positive/near-miss coverage for bound, unbound, and C++ keyword uses.
-- [ ] Run focused and broad gates and replay the production row from a clean pushed-head runner. Dirty-head focused tests, all 91 C/C++ crate tests, all seven callable-activation controls, formatting, focused Clippy, dependency validation, and the exact production replay pass; clean pushed-head evidence remains.
-- [ ] Commit, push, preserve checksummed evidence, and close #2144.
+- [x] (2026-08-14) Ran focused and broad gates and replayed the production row from the clean pushed head. Focused tests, all 91 C/C++ crate tests, all seven callable-activation controls, formatting, focused Clippy, dependency validation, and the exact production replay pass.
+- [x] (2026-08-14) Committed and pushed implementation commit `15e5ef579`; preserved compact checksummed clean-head evidence. Issue closure follows the evidence-plan commit.
 
 ## Surprises & Discoveries
 
@@ -29,7 +29,7 @@ Plain-C identifiers that collide with C++ keywords must remain usable as call ar
 
 ## Outcomes & Retrospective
 
-Implementation is pending. Acceptance requires the exact libarchive row to resolve consistently with an exact inverse hit and actionable zero.
+Implementation commit `15e5ef579` is pushed to `origin/master`. The clean release runner SHA-256 is `96505cf30fca9f949263c300d285ebe32452a790f7698c26e0eb3580f85945df`. The exact libarchive row completed as resolved and consistent with an exact inverse hit, actionable zero, no skipped or truncated targets, no candidate-limit overflow, no inverse-precision findings, and no file errors. The compact manifest is `/mnt/optane/tmp/bifrost-fird/final-15e5ef57/issue-2144-clean-replay-manifest-15e5ef57.jsonl` (SHA-256 `b1b7379360da271dd1d6e2a18cac243b30cef13dc25ece08a0d61c6dca590376`); its checksum inventory has SHA-256 `dbde2dcecc710c510b26ab482d85aa5db6794beca9e878e62856955da8df1591`. The purpose is met.
 
 ## Context and Orientation
 
@@ -69,6 +69,8 @@ Tests are read-only and replays use ephemeral caches. Preserve raw outputs until
 The current exact failure is `/tmp/fird-libarchive-mktempx-current.jsonl`; the current-head confirmation is `/tmp/issue-mktempx-second-5a115bd8.jsonl`. The successful first-call control is `/tmp/issue-mktempx-first-5a115bd8.jsonl`.
 
 Plan revision note (2026-08-14): Created after closing #2142 and tracing the last remaining libarchive tier-1 row.
+
+Plan revision note (2026-08-14): Recorded implementation commit, complete local gates, and checksummed clean pushed-head production evidence.
 
 ## Interfaces and Dependencies
 
