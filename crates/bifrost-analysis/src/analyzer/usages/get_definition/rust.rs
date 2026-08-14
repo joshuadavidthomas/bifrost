@@ -817,6 +817,24 @@ fn resolve_rust_unscoped(
     {
         return outcome;
     }
+    // An impl associated type is both a declaration site and a navigation
+    // source: declaration jumps to the trait contract, while definition stays
+    // on the concrete impl item. Handle that exact structured shape before the
+    // generic declaration-name guard rejects it as a non-reference.
+    if let Some(operation) = operation
+        && let Some(tree) = tree
+        && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
+            rust,
+            support,
+            file,
+            source,
+            tree,
+            site,
+            Some(operation),
+        )
+    {
+        return outcome;
+    }
     if let Some(tree) = tree
         && let Some(outcome) =
             rust_exact_reference_role_outcome(analyzer, support, file, source, tree, site)
@@ -865,13 +883,6 @@ fn resolve_rust_unscoped(
         && let Some(operation) = operation
         && let Some(outcome) = rust_qualified_associated_type_navigation_outcome(
             rust, analyzer, support, file, source, tree, site, operation,
-        )
-    {
-        return outcome;
-    }
-    if let Some(tree) = tree
-        && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
-            rust, support, file, source, tree, site, operation,
         )
     {
         return outcome;

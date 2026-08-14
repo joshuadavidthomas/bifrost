@@ -2247,6 +2247,32 @@ pub type Selected = <LocalRunner as Runner>::Output;
 }
 
 #[test]
+fn rust_rootless_associated_type_navigation_uses_trait_contract() {
+    let source = r#"trait RustRunner { type Output; }
+struct LocalRustRunner;
+impl RustRunner for LocalRustRunner { type Output = String; }
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let impl_item = source.find("type Output =").expect("impl associated type") + 5;
+    let declaration = lookup_declaration(
+        project.root(),
+        &location_reference("lib.rs", source, impl_item),
+    );
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["fqn"], "RustRunner.Output",
+        "{declaration}"
+    );
+}
+
+#[test]
 fn java_declaration_navigation_uses_interface_receiver_contract() {
     let source = r#"
 interface Runner { void run(); }
